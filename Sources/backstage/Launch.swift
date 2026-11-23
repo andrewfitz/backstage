@@ -204,9 +204,10 @@ private func launchResolved(_ url: URL, bareExecutable: URL?, args: Args, info: 
         return current
     }
     do {
+        let launcher = launchingAgent()
         try AppStore.add(ManagedApp(pid: pid, name: name, bundleID: bid, path: url.path,
                                     launchedAt: Date().timeIntervalSince1970, stdout: logURL.path,
-                                    processStart: birth))
+                                    processStart: birth, agent: launcher?.name, agentPID: launcher?.pid))
     } catch {
         if let current = currentApp() { _ = current.forceTerminate() }
         else if stillRunning() { _ = kill(pid, SIGTERM) }
@@ -256,4 +257,27 @@ private func launchResolved(_ url: URL, bareExecutable: URL?, args: Args, info: 
         result["note"] = "focus changed during launch; daemon will hand it back"
     }
     return result
+}
+
+/// The agent that ran this command: walk up parent processes past shells and wrappers.
+/// Known agent CLIs win; otherwise the first non-shell ancestor. Used for "how many agents" stats.
+func launchingAgent() -> (name: String, pid: Int32)? {
+    let known = ["claude", "codex", "grok", "cursor-agent", "gemini", "opencode", "aider", "amp", "goose"]
+    let skip: Set<String> = ["zsh", "bash", "sh", "fish", "dash", "env", "sudo", "login", "nohup", "timeout", "xargs",
+                             "make", "gmake", "script", "tmux", "screen", "backstage", "herdr-zsh"]
+    var pid = getppid()
+    var firstOther: (String, Int32)?
+    for _ in 0..<16 {
+        guard pid > 1 else { break }
+        var info = proc_bsdinfo()
+        let size = Int32(MemoryLayout.size(ofValue: info))
+        guard proc_pidinfo(pid, PROC_PIDTBSDINFO, 0, &info, size) == size else { break }
+        let name = withUnsafeBytes(of: info.pbi_name) { String(decoding: $0.prefix { $0 != 0 }, as: UTF8.self) }
+        let comm = withUnsafeBytes(of: info.pbi_comm) { String(decoding: $0.prefix { $0 != 0 }, as: UTF8.self) }
+        let n = (name.isEmpty ? comm : name).lowercased()
+        if let k = known.first(where: { n == $0 || n.hasPrefix($0 + "-") || n.hasPrefix($0 + ".") }) { return (k, pid) }
+        if firstOther == nil, !skip.contains(n), !n.hasPrefix("-") { firstOther = (n, pid) }
+        pid = pid_t(info.pbi_ppid)
+    }
+    return firstOther.map { (name: $0.0, pid: $0.1) }
 }

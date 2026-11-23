@@ -66,6 +66,21 @@ The full command reference is in **[docs/USAGE.md](docs/USAGE.md)**, or run `bac
 | Input | AX actions (press/set/focus/menus), plus keyboard and mouse events posted straight to the app's process (`CGEventPostToPid`). Mouse events get window-local coordinates. A private "you are active" event goes to the app only, so AppKit doesn't swallow the click as a focus click. Nothing goes through the HID system, so your real cursor and keyboard are never touched. |
 | Teardown | `backstage stop` (or the daemon getting SIGTERM/SIGINT/SIGHUP) quits the agent's apps *before* removing the display, so nothing lands on your screen. After 30 min with no managed apps, the daemon exits by itself. |
 
+## Menu bar indicator
+
+While agents have apps running, a menu bar icon shows how many apps are running. It
+disappears when nothing is running, and goes away entirely when the daemon exits. The menu
+shows:
+
+- a **live thumbnail** of each hidden agent display, refreshed every second while the menu is open
+- **stats:** agents, apps, windows, and how long Backstage has been running
+- **each app**, with the agent that launched it (claude, codex, grok…) and its age. Its submenu
+  has **Show on My Screen** (the same as `backstage show`) and **Quit**
+- **Open Screenshots & Logs Folder**, and **Quit All Agent Apps**
+
+The daemon runs as a menu-bar-only app: no Dock icon, and it never takes focus. Set
+`BACKSTAGE_MENUBAR=off` to run without the icon.
+
 ## Installing into Claude Code, Codex and Grok
 
 ```
@@ -133,7 +148,8 @@ backstage quit
   `windows`, `status`, `stop`.
 
 Settings (environment for the daemon): `BACKSTAGE_WIDTH`/`BACKSTAGE_HEIGHT` (default 1920×1200),
-`BACKSTAGE_IDLE_TIMEOUT` (seconds, default 1800), `BACKSTAGE_HOME` (default `~/.backstage`).
+`BACKSTAGE_IDLE_TIMEOUT` (seconds, default 1800), `BACKSTAGE_HOME` (default `~/.backstage`),
+`BACKSTAGE_MENUBAR=off` (no menu bar icon).
 
 ## Limits (read these)
 

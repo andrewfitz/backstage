@@ -137,9 +137,17 @@ func cmdShow(_ args: Args) throws -> [String: Any] {
     }
 
     // Hand a managed (hidden) app over to the user: stop managing it, move it, bring it forward.
-    let session = try StateLock("session.lock")
-    defer { withExtendedLifetime(session) {} }
     let pid = try managedPid(args)
+    try handOver(pid: pid)
+    return ["ok": true, "pid": pid, "note": "app is now on the user's screen and no longer managed by backstage"]
+}
+
+/// Move a managed app onto the user's screen and stop managing it (used by `show` and the menu bar).
+/// `wait: false` (the daemon's menu) never blocks the daemon's main thread on a CLI that holds the lock.
+func handOver(pid: pid_t, wait: Bool = true) throws {
+    let session = try StateLock("session.lock", nonblocking: !wait)
+    defer { withExtendedLifetime(session) {} }
+    guard AppStore.load().contains(where: { $0.pid == pid }) else { throw CLIError("pid \(pid) is not a live managed app") }
     guard let target = userDisplayBounds().first else { throw CLIError("no user display available for handoff") }
     guard let app = NSRunningApplication(processIdentifier: pid) else { throw CLIError("app \(pid) is gone") }
     try AppStore.remove(pid)
@@ -154,7 +162,6 @@ func cmdShow(_ args: Args) throws -> [String: Any] {
     if !app.isActive { app.activate() }
     pump(0.3)
     logShown("handed over pid \(pid) (\(app.localizedName ?? "?"))")
-    return ["ok": true, "pid": pid, "note": "app is now on the user's screen and no longer managed by backstage"]
 }
 
 private func logShown(_ s: String) {

@@ -57,6 +57,9 @@ struct ManagedApp: Codable {
     var launchedAt: Double
     var stdout: String?
     var processStart: UInt64? = nil
+    /// The agent process (e.g. claude, codex, grok) that ran `launch`, for the menu bar stats.
+    var agent: String? = nil
+    var agentPID: Int32? = nil
 
     /// LaunchServices may have no application object for a wrapped executable.
     func requestTermination(force: Bool) throws {

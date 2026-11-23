@@ -59,6 +59,8 @@ final class Daemon {
     let idleTimeout: Double
     var stopping = false
     var signalSources: [DispatchSourceSignal] = []
+    var statusMenu: StatusMenu?
+    var nextMenuUpdate = 0.0
 
     init() throws {
         owner = try StateLock("daemon.lock", nonblocking: true)
@@ -115,10 +117,16 @@ final class Daemon {
 
         try writeInfo()
         log("daemon up pid=\(getpid()) display=\(display.id) bounds=\(display.bounds)")
-        Timer.scheduledTimer(withTimeInterval: 0.05, repeats: true) { [weak self] _ in
+        // Menu bar indicator: the daemon runs as an accessory app (no Dock icon, never activates).
+        if ProcessInfo.processInfo.environment["BACKSTAGE_MENUBAR"] != "off" {
+            NSApplication.shared.setActivationPolicy(.accessory)
+            statusMenu = StatusMenu(daemon: self)
+        }
+        let timer = Timer(timeInterval: 0.05, repeats: true) { [weak self] _ in
             autoreleasepool { self?.tick() }
         }
-        RunLoop.main.run()
+        RunLoop.main.add(timer, forMode: .common)   // keep guarding windows while a menu is open
+        if statusMenu != nil { NSApplication.shared.run() } else { RunLoop.main.run() }
         exit(0)
     }
 
@@ -236,6 +244,10 @@ final class Daemon {
         let now = ProcessInfo.processInfo.systemUptime
         if let reason = pendingShutdown { shutdown(reason: reason); return }
         reloadManaged(now: now)
+        if let m = statusMenu, now >= nextMenuUpdate {
+            nextMenuUpdate = now + 0.5
+            m.update(apps: managed.count)
+        }
         let b = display.bounds
 
         // 1. Keep managed windows off the user's screens.

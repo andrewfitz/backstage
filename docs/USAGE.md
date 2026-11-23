@@ -178,5 +178,6 @@ Two environment variables change it:
 | `BACKSTAGE_HOME` | `~/.backstage` | State, logs, screenshots |
 | `BACKSTAGE_WIDTH` / `BACKSTAGE_HEIGHT` | 1920 / 1200 | Agent display size (set before the daemon starts) |
 | `BACKSTAGE_IDLE_TIMEOUT` | 1800 | Seconds with no managed apps before the daemon exits |
+| `BACKSTAGE_MENUBAR` | on | `off` hides the menu bar indicator (set before the daemon starts) |
 | `BACKSTAGE_HOOK` | on | `off` disables the hook |
 | `BACKSTAGE_SHOW` | — | `1` as a command prefix lets that command past the hook |
