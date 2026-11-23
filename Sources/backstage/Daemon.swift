@@ -81,6 +81,8 @@ final class Daemon {
     var stopping = false
     var signalSources: [DispatchSourceSignal] = []
     var statusMenu: StatusMenu?
+    /// Per-app audio levels for the menu bar meter (set by the tap manager; read by StatusMenu).
+    var audioLevels: AudioLevelSource?
     var nextMenuUpdate = 0.0
     let sizeSource: String
     let inputGuard = InputGuard()

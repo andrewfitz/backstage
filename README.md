@@ -71,13 +71,16 @@ The full command reference is in **[docs/USAGE.md](docs/USAGE.md)**, or run `bac
 ## Menu bar indicator
 
 While agents have apps running, a menu bar icon shows how many apps are running. It
-disappears when nothing is running, and goes away entirely when the daemon exits. The menu
-shows:
+disappears when nothing is running, and goes away entirely when the daemon exits. While an
+agent's app is making sound (muted, so you don't hear it), the icon turns into a small level
+meter, five bars of the loudest app's recent level; with Reduce Motion on, it shows a still
+waveform instead. The item's width never changes. The menu shows:
 
 - a **live thumbnail** of each hidden agent display, refreshed every second while the menu is open
 - **stats:** agent sessions, apps, windows, and how long Backstage has been running
-- **each app**, with the agent that launched it (claude, codex, grok…) and its age. Its submenu
-  has **Show on My Screen** (the same as `backstage show`) and **Quit**
+- **each app**, with the agent that launched it (claude, codex, grok…), its age, and whether it's
+  playing audio or silent. Its submenu has **Show on My Screen** (the same as `backstage show`)
+  and **Quit**
 - **Open Screenshots & Logs Folder**, and **Quit All Agent Apps**
 
 The daemon runs as a menu-bar-only app: no Dock icon, and it never takes focus. Set

@@ -19,17 +19,31 @@ final class StatusMenu: NSObject, NSMenuDelegate {
         return max(0, screen.frame.maxY - screen.visibleFrame.maxY)
     }
 
+    static let defaultToolTip = "Backstage: agents are using apps on a hidden display"
+    private var meter: AudioMeter?
+    /// TEST ONLY (BACKSTAGE_FAKE_AUDIO): a synthetic level source that wins over the real one.
+    private var fakeAudio: AudioLevelSource?
+    private var appCount = 0
+
     init(daemon: Daemon) {
         self.daemon = daemon
         item = NSStatusBar.system.statusItem(withLength: NSStatusItem.variableLength)
         super.init()
         item.isVisible = false
+        fakeAudio = FakeAudioSource(daemon: daemon, spec: ProcessInfo.processInfo.environment["BACKSTAGE_FAKE_AUDIO"])
+        if fakeAudio != nil { daemon.log("audio meter: using the test-only fake audio source (BACKSTAGE_FAKE_AUDIO)") }
         if let button = item.button {
-            let img = NSImage(systemSymbolName: "rectangle.on.rectangle", accessibilityDescription: "Backstage")
-            img?.isTemplate = true
+            // Drawn into a plain image, like every meter frame, so the item's width never changes.
+            let img = AudioMeter.symbolImage("rectangle.on.rectangle", description: "Backstage")
             button.image = img
             button.imagePosition = .imageLeading
-            button.toolTip = "Backstage: agents are using apps on a hidden display"
+            button.toolTip = Self.defaultToolTip
+            if let img {
+                // Read the source on every poll: the tap manager may set it after we're created.
+                meter = AudioMeter(button: button, icon: img, source: { [weak self] in self?.fakeAudio ?? self?.daemon?.audioLevels },
+                                   log: { [weak daemon] in daemon?.log($0) })
+                meter?.onChange = { [weak self] in self?.updateLabel() }
+            }
         }
         menu.delegate = self
         menu.autoenablesItems = false
@@ -41,6 +55,21 @@ final class StatusMenu: NSObject, NSMenuDelegate {
         let visible = apps > 0
         if item.isVisible != visible { item.isVisible = visible }
         if visible { item.button?.title = " \(apps)" }
+        meter?.setActive(visible)
+        if apps != appCount { appCount = apps; updateLabel() }
+    }
+
+    /// VoiceOver label and tooltip; changed only when the app count or audio state changes.
+    private func updateLabel() {
+        guard let button = item.button else { return }
+        var label = "Backstage, \(appCount) app\(appCount == 1 ? "" : "s")"
+        var tip = Self.defaultToolTip
+        if let name = meter?.playingApp {
+            label += ", playing audio, muted"
+            tip = "Backstage: \(name) is playing audio (muted, you can't hear it)"
+        }
+        if button.accessibilityLabel() != label { button.setAccessibilityLabel(label) }
+        if button.toolTip != tip { button.toolTip = tip }
     }
 
     // MARK: menu
@@ -52,6 +81,7 @@ final class StatusMenu: NSObject, NSMenuDelegate {
         let t = Timer(timeInterval: 1.0, repeats: true) { [weak self] _ in
             self?.refreshThumbnails()
             self?.refreshStatsLine()
+            self?.refreshAudioLines()
         }
         RunLoop.main.add(t, forMode: .common)   // keeps firing while the menu is tracking
         refreshTimer = t
@@ -64,9 +94,13 @@ final class StatusMenu: NSObject, NSMenuDelegate {
 
     private var statsItem: NSMenuItem?
 
+    /// Each app's menu line and its text without the audio part, for the 1 s refresh.
+    private var appLines: [pid_t: (item: NSMenuItem, text: String)] = [:]
+
     private func rebuild() {
         menu.removeAllItems()
         thumbViews.removeAll()
+        appLines.removeAll()
         guard let d = daemon else { return }
         let apps = d.registry.filter { $0.matchesProcess }
 
@@ -119,7 +153,9 @@ final class StatusMenu: NSObject, NSMenuDelegate {
             sub.addItem(show); sub.addItem(quit); sub.addItem(.separator()); sub.addItem(info)
             mi.submenu = sub
             menu.addItem(mi)
+            appLines[a.pid] = (mi, mi.title)
         }
+        refreshAudioLines()
         menu.addItem(.separator())
         let folder = NSMenuItem(title: "Open Screenshots & Logs Folder", action: #selector(openFolder), keyEquivalent: "")
         folder.target = self
@@ -147,6 +183,30 @@ final class StatusMenu: NSObject, NSMenuDelegate {
     }
 
     private func refreshStatsLine() { statsItem?.title = statsText() }
+
+    /// Appends a speaker symbol and "playing" or "silent" to each app's line. Without an audio
+    /// source (no taps), the lines stay as they are.
+    private func refreshAudioLines() {
+        guard !appLines.isEmpty, let samples = meter?.samples() else { return }
+        let playing = Set(samples.filter { $0.playing }.map { $0.pid })
+        let font = NSFont.menuFont(ofSize: 0)
+        for (pid, line) in appLines {
+            let on = playing.contains(pid)
+            let text = NSMutableAttributedString(string: line.text + " · ", attributes: [.font: font])
+            let symbol = NSImage(systemSymbolName: on ? "speaker.wave.2.fill" : "speaker.fill",
+                                 accessibilityDescription: nil)?
+                .withSymbolConfiguration(NSImage.SymbolConfiguration(pointSize: font.pointSize, weight: .regular))
+            if let symbol {
+                let attachment = NSTextAttachment()
+                attachment.image = symbol
+                // Sit the symbol on the text's baseline like a glyph.
+                attachment.bounds = NSRect(x: 0, y: font.descender / 2, width: symbol.size.width, height: symbol.size.height)
+                text.append(NSAttributedString(attachment: attachment))
+            }
+            text.append(NSAttributedString(string: on ? " playing" : " silent", attributes: [.font: font]))
+            if line.item.attributedTitle != text { line.item.attributedTitle = text }
+        }
+    }
 
     private func ago(_ t: Double, suffix: Bool = true) -> String {
         let s = max(0, Int(Date().timeIntervalSince1970 - t))
