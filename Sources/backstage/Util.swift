@@ -57,7 +57,7 @@ struct Args {
     var passthrough: [String] = []
 
     init(_ raw: [String], command: String) throws {
-        let flags: Set<String> = ["help", "json", "force", "double", "right", "raw", "gone", "full", "claude", "codex", "grok", "hooks"]
+        let flags: Set<String> = ["help", "json", "force", "double", "right", "raw", "gone", "full", "claude", "codex", "grok", "hooks", "all"]
         let values: Set<String> = ["pid", "app", "env", "timeout", "lines", "scale", "o", "out",
                                    "window", "depth", "role", "text", "ref", "steps", "dx", "dy"]
         var i = 0
@@ -107,6 +107,7 @@ struct Args {
                 }
             }
         case "quit", "kill": allowed = target + ["force"]; arity = 0...0
+        case "stop", "list", "ps": allowed = ["all"]; arity = 0...0
         case "logs": allowed = target + ["lines"]; arity = 0...0
         case "windows": allowed = target; arity = 0...0
         case "screenshot", "shot":

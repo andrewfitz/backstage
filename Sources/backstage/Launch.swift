@@ -76,9 +76,12 @@ func launch(_ args: Args) throws -> [String: Any] {
     guard AXIsProcessTrusted() else {
         throw CLIError("launch requires Accessibility permission for the terminal or agent host in System Settings > Privacy & Security > Accessibility")
     }
-    return try withLaunchSession { info in
-        try launchResolved(url, bareExecutable: bareExecutable, args: args, info: info, timeout: timeout)
-    }
+    let session = try Session.current()
+    let started = Date().timeIntervalSince1970
+    let (info, lifecycle) = try beginLaunch()
+    defer { lifecycle.release() }
+    return try launchResolved(url, bareExecutable: bareExecutable, args: args, info: info, timeout: timeout,
+                              session: session, started: started, lifecycle: lifecycle)
 }
 
 // Darwin returns argc, the executable path, alignment padding, argv, then the environment.
@@ -105,7 +108,8 @@ private func hasLaunchToken(_ pid: pid_t, assignment: String) -> Bool {
     return false
 }
 
-private func launchResolved(_ url: URL, bareExecutable: URL?, args: Args, info: DaemonInfo, timeout: Double) throws -> [String: Any] {
+private func launchResolved(_ url: URL, bareExecutable: URL?, args: Args, info: DaemonInfo, timeout: Double,
+                            session: Session, started: Double, lifecycle: StateLock) throws -> [String: Any] {
     let vd = info.bounds
     let bundle = Bundle(url: url)
     let bid = bundle?.bundleIdentifier
@@ -205,14 +209,22 @@ private func launchResolved(_ url: URL, bareExecutable: URL?, args: Args, info: 
     }
     do {
         let launcher = launchingAgent()
+        let owner = try Locks.session(session.id)
+        defer { owner.release() }
+        if let stopped = owner.stamp, stopped >= started {
+            throw CLIError("`backstage stop` ran in this session during the launch, so the app was quit")
+        }
         try AppStore.add(ManagedApp(pid: pid, name: name, bundleID: bid, path: url.path,
                                     launchedAt: Date().timeIntervalSince1970, stdout: logURL.path,
-                                    processStart: birth, agent: launcher?.name, agentPID: launcher?.pid))
+                                    processStart: birth, agent: launcher?.name, agentPID: launcher?.pid,
+                                    session: session.id))
     } catch {
         if let current = currentApp() { _ = current.forceTerminate() }
         else if stillRunning() { _ = kill(pid, SIGTERM) }
         throw error
     }
+    // Registered: the daemon now guards the app and would quit it on shutdown. Wait for windows unlocked.
+    lifecycle.release()
 
     let gotWindow = waitFor(timeout: timeout) {
         if !stillRunning() { return false }
@@ -259,25 +271,10 @@ private func launchResolved(_ url: URL, bareExecutable: URL?, args: Args, info: 
     return result
 }
 
-/// The agent that ran this command: walk up parent processes past shells and wrappers.
-/// Known agent CLIs win; otherwise the first non-shell ancestor. Used for "how many agents" stats.
+/// The agent that ran this command (known agent CLIs first, else the first non-shell ancestor),
+/// for the menu bar's per-app label.
 func launchingAgent() -> (name: String, pid: Int32)? {
-    let known = ["claude", "codex", "grok", "cursor-agent", "gemini", "opencode", "aider", "amp", "goose"]
-    let skip: Set<String> = ["zsh", "bash", "sh", "fish", "dash", "env", "sudo", "login", "nohup", "timeout", "xargs",
-                             "make", "gmake", "script", "tmux", "screen", "backstage", "herdr-zsh"]
-    var pid = getppid()
-    var firstOther: (String, Int32)?
-    for _ in 0..<16 {
-        guard pid > 1 else { break }
-        var info = proc_bsdinfo()
-        let size = Int32(MemoryLayout.size(ofValue: info))
-        guard proc_pidinfo(pid, PROC_PIDTBSDINFO, 0, &info, size) == size else { break }
-        let name = withUnsafeBytes(of: info.pbi_name) { String(decoding: $0.prefix { $0 != 0 }, as: UTF8.self) }
-        let comm = withUnsafeBytes(of: info.pbi_comm) { String(decoding: $0.prefix { $0 != 0 }, as: UTF8.self) }
-        let n = (name.isEmpty ? comm : name).lowercased()
-        if let k = known.first(where: { n == $0 || n.hasPrefix($0 + "-") || n.hasPrefix($0 + ".") }) { return (k, pid) }
-        if firstOther == nil, !skip.contains(n), !n.hasPrefix("-") { firstOther = (n, pid) }
-        pid = pid_t(info.pbi_ppid)
-    }
-    return firstOther.map { (name: $0.0, pid: $0.1) }
+    let chain = Session.ancestors()
+    if let a = chain.first(where: { $0.agent != nil }), let name = a.agent { return (name, a.pid) }
+    return chain.first(where: { !$0.skipped }).map { (name: $0.name, pid: $0.pid) }
 }

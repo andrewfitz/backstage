@@ -129,7 +129,7 @@ final class StatusMenu: NSObject, NSMenuDelegate {
     private func statsText() -> String {
         guard let d = daemon else { return "" }
         let apps = d.registry.filter { $0.matchesProcess }
-        let agents = Set(apps.map { $0.agentPID.map { "\($0)" } ?? "manual" }).count
+        let sessions = Set(apps.map { $0.owner }).count
         let ours = activeDisplays().filter(isOurDisplay).map { CGDisplayBounds($0) }
         let pids = Set(apps.map { $0.pid })
         let windows = onscreenWindows().filter {
@@ -139,7 +139,7 @@ final class StatusMenu: NSObject, NSMenuDelegate {
             return ours.contains { $0.intersects(b) }
         }.count
         func plural(_ n: Int, _ w: String) -> String { "\(n) \(w)\(n == 1 ? "" : "s")" }
-        return "\(plural(agents, "agent")) · \(plural(apps.count, "app")) · \(plural(windows, "window")) · up \(ago(d.startedAt, suffix: false))"
+        return "\(plural(sessions, "session")) · \(plural(apps.count, "app")) · \(plural(windows, "window")) · up \(ago(d.startedAt, suffix: false))"
     }
 
     private func refreshStatsLine() { statsItem?.title = statsText() }

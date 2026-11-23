@@ -1,7 +1,7 @@
 PREFIX ?= /opt/homebrew
 BIN = $(shell swift build -c release --show-bin-path)/backstage
 
-.PHONY: build install uninstall dist test test-cli test-agents
+.PHONY: build install uninstall dist test test-cli test-agents test-multi
 
 build:
 	swift build -c release
@@ -12,7 +12,7 @@ install: build
 
 uninstall:
 	@if [ -L "$(PREFIX)/bin/backstage" ] && [ "$(PREFIX)/bin/backstage" -ef "$(BIN)" ]; then \
-		"$(BIN)" stop && rm "$(PREFIX)/bin/backstage"; \
+		"$(BIN)" stop --all && rm "$(PREFIX)/bin/backstage"; \
 	fi
 
 # The skill's source of truth is Sources/backstage/Skill.swift; dist/ is generated for packaging.
@@ -27,5 +27,9 @@ test-agents: build
 	BACKSTAGE_BIN="$(BIN)" bash tests/agents.sh
 	bash tests/agent-config.sh "$(BIN)"
 
+test-multi: build
+	BACKSTAGE_BIN="$(BIN)" tests/multi.sh
+
 test: test-cli test-agents
 	BACKSTAGE_BIN="$(BIN)" tests/e2e.sh
+	BACKSTAGE_BIN="$(BIN)" tests/multi.sh

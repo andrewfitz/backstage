@@ -32,9 +32,11 @@ func capture(_ target: CaptureTarget, to url: URL, scale: Double) throws -> CGSi
             cfg.ignoreShadowsSingleWindow = true
         case .app(let pid, let did, let crop):
             guard let d = content.displays.first(where: { $0.displayID == did }) else { throw CLIError("display \(did) not found") }
-            let apps = content.applications.filter { $0.processID == pid }
-            guard !apps.isEmpty else { throw CLIError("app \(pid) is no longer capturable") }
-            filter = SCContentFilter(display: d, including: apps, exceptingWindows: [])
+            // Filter by this process's windows, not by application: an application filter also
+            // captures other instances of the same bundle (another session's copy of the app).
+            let windows = content.windows.filter { $0.owningApplication?.processID == pid }
+            guard !windows.isEmpty else { throw CLIError("app \(pid) is no longer capturable") }
+            filter = SCContentFilter(display: d, including: windows)
             let db = CGDisplayBounds(d.displayID)
             let local = crop.intersection(db).offsetBy(dx: -db.minX, dy: -db.minY)
             guard !local.isEmpty else { throw CLIError("screenshot crop is outside the display") }

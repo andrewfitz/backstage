@@ -15,8 +15,43 @@ agent display. A default `screenshot` is cropped starting at `(0,0)`, so a pixel
 the image is exactly the point to pass to `click x y`. If you captured with `--scale S`,
 pass the same `--scale S` to `click`/`drag`/`scroll`/`hover`, or divide by S yourself.
 
+**Sessions.** Several agents can use backstage at once. Each command runs in a *session*,
+and a session owns the apps it launches: its default target, `list`, `logs`, screenshots and
+`stop` only ever see its own apps. Naming another session's app by `--pid` or element ref is an
+error. Sessions keep cooperating agents out of each other's way; they aren't a security
+boundary. The session is worked out per command, first match wins:
+
+1. `BACKSTAGE_SESSION=<name>`, if set and non-empty. `legacy` is reserved.
+2. The nearest agent process above the command (claude, codex, grok, cursor-agent, gemini,
+   opencode, aider, amp, goose), using that agent's own session variable if it sets one in
+   its shells: `CLAUDE_CODE_SESSION_ID` (Claude Code; checked against `CLAUDE_PID`),
+   `CODEX_THREAD_ID` (Codex), `GROK_SESSION_ID` (Grok). A variable only counts for the
+   nearest agent, so an agent started from another agent's shell gets its own session.
+3. Otherwise that agent process itself: its name, PID and start time.
+4. Otherwise the nearest ancestor that isn't a shell or wrapper (`zsh`, `bash`, `make`,
+   `env`, `tmux`…), by PID and start time. For a person in a terminal that's usually the
+   terminal app.
+5. Otherwise the outermost shell above the command: a private session, never a shared default.
+
+`backstage status` shows the current session and where it came from.
+
+**Subagents share their parent's session.** Claude Code runs subagents inside the parent's
+process and gives their shells the parent's `CLAUDE_CODE_SESSION_ID`, so nothing tells them
+apart automatically. A subagent that launches its own apps should prefix each command, for
+example `BACKSTAGE_SESSION=review-1 backstage launch …`. Agents run every shell command in a
+fresh shell, so an `export` doesn't carry over to the next command; use the prefix every time.
+(`CODEX_THREAD_ID` should separate Codex subagents, which run as their own threads, and
+`GROK_SESSION_ID` Grok sessions. Both were found in those CLIs' binaries but not yet checked
+in a live session; if a CLI doesn't set them, its process is used instead.)
+
+**Apps from before sessions** (registry records without an owner) belong to the `legacy`
+session. They're never a default target and plain `stop` leaves them alone. `list --all` shows
+them, `stop --all` quits them, and an explicit `--pid` still reaches them, since no session
+owns them.
+
 **App selection.** Commands that act on an app take `--pid P` or `--app NAME` (a managed
-app's name or bundle id). With neither, they target the most recently launched managed app.
+app's name or bundle id), within your session. With neither, they target your session's most
+recently launched app.
 
 **Element refs.** `tree` and `find` label elements like `w8432.0.3`: the window ID, then
 child indices. Refs survive windows being reordered, but not UI changes inside the window,
@@ -42,8 +77,9 @@ copy of the app is never touched.
 launches; you get a `warning`, and any window it opens later is still pulled onto the agent
 display.
 
-### `list`
-Managed apps with their windows.
+### `list [--all]`
+Your session's apps with their windows. `--all` lists every session's apps; each entry has a
+`session` field (`legacy` for apps from before sessions).
 
 ### `quit [--force]`
 Quits the app. If it refuses, for example because of a "Save changes?" sheet, you get
@@ -54,20 +90,30 @@ Quits the app. If it refuses, for example because of a "Save changes?" sheet, yo
 The last N lines (default 100) of the app's stdout and stderr.
 
 ### `status` / `doctor`
-Shows the permissions (Accessibility, Screen Recording), the daemon and display, and the
-managed apps. When something's missing, `problems` lists what to grant and where.
+Shows the permissions (Accessibility, Screen Recording), the daemon and display, the current
+session (`id`, and `from`: which rule above produced it), and every session's managed apps.
+When something's missing, `problems` lists what to grant and where.
 
-### `start` / `stop`
-Start or stop the daemon. `stop` quits managed apps (forcing them after 3 s) *before*
-removing the display, so nothing falls onto your screen. The daemon also exits by itself
-after `BACKSTAGE_IDLE_TIMEOUT` seconds (default 1800) with no managed apps, or when no
-physical display is left.
+### `start` / `stop` / `stop --all`
+`start` starts the daemon. `stop` quits **your session's** apps (forcing them after 3 s).
+Other sessions' apps and `legacy` apps are left alone. If no app is left in any session, `stop`
+also stops the daemon. If other sessions still have apps, the daemon keeps running, and the
+result's `daemon` field says so. A launch your session started before the `stop` is cancelled
+rather than registered.
+
+`stop --all` is the admin form. It quits every app in every session, `legacy` included, and
+stops the daemon. Both forms are safe to run twice.
+
+Apps are always quit *before* the display is removed, so nothing falls onto your screen. The
+daemon also exits by itself after `BACKSTAGE_IDLE_TIMEOUT` seconds (default 1800) once no
+session has managed apps, or when no physical display is left.
 
 ## Hidden or shown
 
 ### `show --pid P` / `show --app NAME` / `show` (most recent)
-Hands a hidden app over to the user. Its windows move to the centre of the main display,
-the app comes to the front, and backstage stops managing it. Its state is kept: no relaunch.
+Hands one of your session's hidden apps over to the user. Its windows move to the centre of
+the main display, the app comes to the front, and backstage stops managing it, so it leaves
+your session. Its state is kept: no relaunch.
 
 ### `show <app|file|url>`
 Opens anything on the user's screen, the way `open` would.
@@ -82,12 +128,13 @@ Use `show` only when the user asked to see something. Each use is logged to
   display origin, so image pixel = click point.
 - **`--window I`:** one window only. The JSON's `origin` is that window's position:
   `point = origin + pixel / scale`.
-- **`--full`:** the whole agent display.
+- **`--full`:** the whole agent display. The display is shared, so this is refused while
+  another session has windows on it.
 - **Format:** a `.jpg`/`.jpeg` output path gives JPEG; anything else gives PNG. Without
-  `-o`, files go to `~/.backstage/shots/`.
+  `-o`, files go to a per-session folder, `~/.backstage/shots/<session>/`.
 
 ```json
-{"path": "~/.backstage/shots/shot-1795452686123.png", "width": 460, "height": 392, "origin": {"x": 0, "y": 0}, "scale": 1, "pid": 64304}
+{"path": "~/.backstage/shots/claude_3503a10a-…-1f2e3d4c5b6a/shot-….png", "width": 460, "height": 392, "origin": {"x": 0, "y": 0}, "scale": 1, "pid": 64304}
 ```
 
 ### `tree [--window I] [--depth N] [--json]`
@@ -115,7 +162,9 @@ Polls until a matching element appears (or, with `--gone`, disappears). Default 
 ## Act
 
 Everything is delivered to the app's process directly. Your cursor, keyboard and frontmost
-app are never touched.
+app are never touched. Each command holds a lock on its target app from the first focus change
+to the last event. If two commands drive the same app at once, one waits for the other, so
+typing never interleaves. Commands on different apps don't wait for each other.
 
 | Command | What it does |
 |---|---|
@@ -176,6 +225,7 @@ Two environment variables change it:
 | Variable | Default | Effect |
 |---|---|---|
 | `BACKSTAGE_HOME` | `~/.backstage` | State, logs, screenshots |
+| `BACKSTAGE_SESSION` | derived | The session this command belongs to (see Sessions); `legacy` is reserved |
 | `BACKSTAGE_WIDTH` / `BACKSTAGE_HEIGHT` | 1920 / 1200 | Agent display size (set before the daemon starts) |
 | `BACKSTAGE_IDLE_TIMEOUT` | 1800 | Seconds with no managed apps before the daemon exits |
 | `BACKSTAGE_MENUBAR` | on | `off` hides the menu bar indicator (set before the daemon starts) |

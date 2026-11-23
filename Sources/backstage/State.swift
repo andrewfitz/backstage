@@ -60,6 +60,10 @@ struct ManagedApp: Codable {
     /// The agent process (e.g. claude, codex, grok) that ran `launch`, for the menu bar stats.
     var agent: String? = nil
     var agentPID: Int32? = nil
+    /// The session that launched the app (see Session). nil for records from before sessions.
+    var session: String? = nil
+
+    var owner: String { session ?? Session.legacy }
 
     /// LaunchServices may have no application object for a wrapped executable.
     func requestTermination(force: Bool) throws {
@@ -106,15 +110,17 @@ private func isDaemonCommand(_ pid: pid_t) -> Bool {
         && URL(fileURLWithPath: String(decoding: args[0], as: UTF8.self)).lastPathComponent == "backstage"
 }
 
+/// An flock in BACKSTAGE_HOME, held until `release()` or deinit. See `Locks` for the order.
 final class StateLock {
-    let fd: Int32
+    private(set) var fd: Int32
 
-    init(_ name: String, nonblocking: Bool = false) throws {
-        try Paths.ensureDirectory(Paths.dir)
-        let path = Paths.dir.appendingPathComponent(name).path
+    init(_ name: String, nonblocking: Bool = false, shared: Bool = false) throws {
+        let url = Paths.dir.appendingPathComponent(name)
+        try Paths.ensureDirectory(url.deletingLastPathComponent())
+        let path = url.path
         let descriptor = open(path, O_CREAT | O_RDWR | O_CLOEXEC, 0o600)
         guard descriptor >= 0 else { throw CLIError("cannot open lock at " + path) }
-        while flock(descriptor, LOCK_EX | (nonblocking ? LOCK_NB : 0)) != 0 {
+        while flock(descriptor, (shared ? LOCK_SH : LOCK_EX) | (nonblocking ? LOCK_NB : 0)) != 0 {
             if errno == EINTR { continue }
             let error = errno
             close(descriptor)
@@ -123,7 +129,26 @@ final class StateLock {
         fd = descriptor
     }
 
-    deinit { close(fd) }
+    func release() {
+        if fd >= 0 { close(fd); fd = -1 }
+    }
+
+    /// A timestamp kept in the lock file (a session's last `stop`), read and written under the lock.
+    var stamp: Double? {
+        get {
+            var buffer = [UInt8](repeating: 0, count: 64)
+            let n = pread(fd, &buffer, buffer.count, 0)
+            guard n > 0 else { return nil }
+            return Double(String(decoding: buffer[0..<n], as: UTF8.self).trimmingCharacters(in: .whitespacesAndNewlines))
+        }
+        set {
+            let text = Array((newValue.map { String($0) } ?? "").utf8)
+            _ = ftruncate(fd, 0)
+            _ = text.withUnsafeBytes { pwrite(fd, $0.baseAddress, $0.count, 0) }
+        }
+    }
+
+    deinit { release() }
 }
 
 func readJSON<T: Decodable>(_ url: URL, _ type: T.Type) -> T? {

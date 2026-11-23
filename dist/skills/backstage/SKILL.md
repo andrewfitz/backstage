@@ -47,7 +47,7 @@ backstage key cmd+s
 backstage menu "File > Export…"
 backstage wait --text "Saved" --timeout 10
 backstage logs                          # the app's stdout/stderr
-backstage quit                          # always clean up; `backstage stop` quits everything
+backstage quit                          # always clean up; `backstage stop` quits all your apps
 ```
 
 - **Building first:** build as usual (`xcodebuild`, `swift build`, `make`…), then `backstage
@@ -57,8 +57,16 @@ backstage quit                          # always clean up; `backstage stop` quit
   Re-run `tree`/`find` after the UI changes, because refs can go stale.
 - **Acting:** `press`/`set`/`menu` are the most reliable. Use coordinate `click`/`drag`/`scroll`
   for custom-drawn views. `hover` is best-effort: tooltips won't appear.
-- **Several apps:** commands target the most recent launch. Pass `--pid P` (from
+- **Several apps:** commands target your most recent launch. Pass `--pid P` (from
   `launch`/`list`) to be explicit.
+- **Other agents share the hidden display.** Each agent session only sees and drives the
+  apps it launched (its own `list`, default target, logs and screenshots). Another
+  session's PID or ref is an error, and `backstage stop` only quits your own apps. Never use
+  `stop --all` unless the user asks: it quits every agent's apps.
+- **Subagents:** Claude Code subagents share their parent's session. If you're a subagent
+  launching your own apps, or you start subagents that do, give each its own session by
+  prefixing every command: `BACKSTAGE_SESSION=<unique-name> backstage …`. Use the prefix on
+  every call; `export` doesn't carry over to the next command.
 - **Output** is JSON on stdout. Errors come back as `{"ok": false, "error": …}` with exit status 1
   and say what to do next.
 

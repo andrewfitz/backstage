@@ -10,15 +10,21 @@ COORDINATES: everything uses agent-display points with (0,0) at the display's to
 A default `screenshot` is cropped from (0,0), so image pixel (x,y) == click point (x,y)
 (divide by --scale if you passed one).
 
-APP SELECTION: --pid P, or --app NAME (managed app name/bundle id). Default: the most
-recently launched managed app.
+SESSIONS: each agent session sees and drives only the apps it launched. The session is
+worked out automatically (the agent's own session ID, or its process); set BACKSTAGE_SESSION=name
+to choose one, e.g. one per subagent. `status` shows the current session.
+
+APP SELECTION: --pid P, or --app NAME (managed app name/bundle id), within your session.
+Default: your session's most recently launched app.
 
 LIFECYCLE
   launch <App.app|bundle.id|Name|/path/to/executable> [--env K=V]... [--timeout S] [-- args…]
-  list                              managed apps + their windows
+  list [--all]                      your session's apps + their windows (--all: every session)
   quit [--pid P] [--force]          quit a managed app
   status | doctor                   daemon/display/permission status
-  start | stop                      start/stop the daemon (stop quits managed apps first)
+  start                             start the daemon
+  stop                              quit your session's apps (and the daemon, if no apps are left)
+  stop --all                        quit every session's apps and stop the daemon
   logs [--pid P] [--lines N]        tail the app's stdout/stderr
 
 HIDDEN OR SHOWN? Use launch for your own work (build checks, tests, debugging, screenshots).
@@ -36,6 +42,7 @@ AGENT INTEGRATION
 
 SEE
   screenshot [-o out.png] [--window I] [--full] [--scale S]
+                                    (--full: whole display; refused while other sessions have windows)
   tree [--window I] [--depth N] [--json]           accessibility tree with element refs
   find [--role R] [--text T] [--window I]          find elements (text matches title/value/desc/id)
   windows                                           window list with frames
@@ -59,23 +66,36 @@ Refs look like w8432.3.1 (window ID, then child indices). Re-run tree/find after
 --window takes a window ref (w8432) or a front-to-back index (0 = frontmost).
 """
 
-func managedPid(_ args: Args) throws -> pid_t {
+/// The app a command targets, within the calling session: `--pid`, `--app`, or the session's
+/// most recent launch. Every app-targeting command goes through here, so this is the one
+/// ownership check. Element refs resolve inside the selected app, so they're covered too.
+func managedApp(_ args: Args) throws -> ManagedApp {
     let apps = try AppStore.read()
+    let me = try Session.current().id
+    let mine = apps.filter { $0.session == me }
     if let p = args.int("pid") {
-        guard apps.contains(where: { $0.pid == p }) else { throw CLIError("pid \(p) is not a live managed app") }
-        return pid_t(p)
+        guard let a = apps.first(where: { $0.pid == p }) else { throw CLIError("pid \(p) is not a live managed app") }
+        // Legacy records (from before sessions) have no owner, so an explicit PID still reaches them.
+        guard a.session == me || a.session == nil else {
+            throw CLIError("pid \(p) belongs to another backstage session; a session can only use apps it launched (see `backstage list`)")
+        }
+        return a
     }
     if let name = args.opt("app") {
         let n = name.lowercased()
-        guard let a = apps.last(where: { $0.name.lowercased() == n || $0.bundleID?.lowercased() == n })
-                ?? apps.last(where: { $0.name.lowercased().contains(n) }) else {
-            throw CLIError("no managed app matching '\(name)'. Managed: \(apps.map { "\($0.name)(\($0.pid))" }.joined(separator: ", "))")
+        guard let a = mine.last(where: { $0.name.lowercased() == n || $0.bundleID?.lowercased() == n })
+                ?? mine.last(where: { $0.name.lowercased().contains(n) }) else {
+            throw CLIError("no managed app matching '\(name)' in this session. Yours: \(mine.map { "\($0.name)(\($0.pid))" }.joined(separator: ", "))")
         }
-        return a.pid
+        return a
     }
-    guard let last = apps.max(by: { $0.launchedAt < $1.launchedAt }) else { throw CLIError("no managed apps; run `backstage launch <app>` first") }
-    return last.pid
+    guard let last = mine.max(by: { $0.launchedAt < $1.launchedAt }) else {
+        throw CLIError("no managed apps in this session; run `backstage launch <app>` first")
+    }
+    return last
 }
+
+func managedPid(_ args: Args) throws -> pid_t { try managedApp(args).pid }
 
 func requireDaemon() throws -> DaemonInfo {
     guard let d = liveDaemon() else { throw CLIError("daemon not running (run `backstage launch …` or `backstage start`)") }
@@ -134,9 +154,25 @@ func cmdScreenshot(_ args: Args) throws -> [String: Any] {
     let d = try requireDaemon()
     let vd = d.bounds
     let scale = args.double("scale") ?? 1
-    let outArg: String = args.opt("o") ?? args.opt("out") ?? Paths.shots.appendingPathComponent("shot-\(UUID().uuidString).png").path
+    let me = try Session.current().id
+    let outArg: String
+    if let given = args.opt("o") ?? args.opt("out") {
+        outArg = given
+    } else {
+        let folder = Paths.shots.appendingPathComponent(Session.fileKey(me))
+        try Paths.ensureDirectory(folder)
+        outArg = folder.appendingPathComponent("shot-\(UUID().uuidString).png").path
+    }
     let out = URL(fileURLWithPath: (outArg as NSString).expandingTildeInPath)
     if args.has("full") {
+        // The display is shared: a whole-display capture would include other sessions' apps.
+        let others = Set(try AppStore.read().filter { $0.session != me }.map { $0.pid })
+        if onscreenWindows().contains(where: {
+            guard let pid = $0[kCGWindowOwnerPID as String] as? pid_t else { return false }
+            return others.contains(pid) && vd.intersects(cgBounds($0))
+        }) {
+            throw CLIError("--full is unavailable while other sessions have windows on the shared agent display; capture your app (omit --full) or a --window")
+        }
         let size = try capture(.display(d.displayID, crop: nil), to: out, scale: scale)
         return ["path": out.path, "width": Int(size.width), "height": Int(size.height), "origin": ["x": 0, "y": 0], "scale": scale]
     }
@@ -217,15 +253,17 @@ func cmdWait(_ args: Args) throws -> [String: Any] {
     return ["ok": true, "element": found, "seconds": (Date().timeIntervalSince(t0) * 100).rounded() / 100]
 }
 
-func cmdList() throws -> [String: Any] {
+func cmdList(_ args: Args) throws -> [String: Any] {
     let origin = liveDaemon()?.bounds.origin ?? .zero
-    let apps = try AppStore.read().map { a -> [String: Any] in
-        var d: [String: Any] = ["pid": a.pid, "name": a.name, "path": a.path, "windows": axWindowsSummary(a.pid, origin: origin)]
+    let me = try Session.current().id
+    let apps = try AppStore.read().filter { args.has("all") || $0.session == me }.map { a -> [String: Any] in
+        var d: [String: Any] = ["pid": a.pid, "name": a.name, "path": a.path, "session": a.owner,
+                                "windows": axWindowsSummary(a.pid, origin: origin)]
         if let b = a.bundleID { d["bundleID"] = b }
         if let s = a.stdout { d["log"] = s }
         return d
     }
-    return ["apps": apps]
+    return ["session": me, "apps": apps]
 }
 
 func cmdStatus() throws -> [String: Any] {
@@ -242,7 +280,9 @@ func cmdStatus() throws -> [String: Any] {
     } else {
         s["daemon"] = NSNull()
     }
-    s["managedApps"] = try AppStore.read().map { ["pid": $0.pid, "name": $0.name] }
+    let session = try Session.current()
+    s["session"] = ["id": session.id, "from": session.source]
+    s["managedApps"] = try AppStore.read().map { ["pid": $0.pid, "name": $0.name, "session": $0.owner] }
     var problems: [String] = []
     if !accessibility { problems.append("Accessibility not granted: System Settings > Privacy & Security > Accessibility — enable the app that runs this CLI (your terminal / agent host).") }
     if !recording { problems.append("Screen Recording not granted: System Settings > Privacy & Security > Screen & System Audio Recording — enable the terminal / agent host, then restart it.") }
@@ -252,8 +292,11 @@ func cmdStatus() throws -> [String: Any] {
 }
 
 func cmdQuit(_ args: Args) throws -> [String: Any] {
-    let pid = try managedPid(args)
-    guard let record = try AppStore.read().first(where: { $0.pid == pid }) else {
+    let target = try managedApp(args)
+    let pid = target.pid
+    let lock = try Locks.session(target.owner)
+    defer { lock.release() }
+    guard let record = try AppStore.read().first(where: { $0.pid == pid && $0.processStart == target.processStart }) else {
         return ["ok": true, "note": "already gone"]
     }
     let force = args.has("force")
@@ -317,6 +360,16 @@ func run() throws {
     let args = try Args(argv, command: cmd)
     if args.has("help") { print(usage); return }
 
+    // Input commands hold the target app's lock from focus through the last event, so two
+    // clients typing into one app can't interleave. Other apps are unaffected.
+    var input: (pid: pid_t, lock: StateLock)?
+    if ["press", "focus", "action", "set", "click", "hover", "drag", "scroll", "type", "key", "menu"].contains(cmd) {
+        let app = try managedApp(args)
+        input = (app.pid, try Locks.app(app))
+    }
+    defer { input?.lock.release() }
+    func inputTarget() throws -> pid_t { try input?.pid ?? managedPid(args) }
+
     switch cmd {
     case "__daemon":
         try Paths.ensure()
@@ -325,10 +378,13 @@ func run() throws {
         try d.run()
     case "help", "-h", "--help": print(usage)
     case "start": let d = try ensureDaemon(); emit(["ok": true, "pid": d.pid, "displayID": d.displayID])
-    case "stop": emit(try stopDaemon())
+    case "stop":
+        let result = try args.has("all") ? stopAll() : stopSession()
+        emit(result)
+        if result["ok"] as? Bool == false { exit(1) }
     case "status", "doctor": emit(try cmdStatus())
     case "launch", "open": emit(try launch(args))
-    case "list", "ps": emit(try cmdList())
+    case "list", "ps": emit(try cmdList(args))
     case "show": emit(try cmdShow(args))
     case "install": emit(try cmdInstall(args))
     case "uninstall": emit(try cmdUninstall(args))
@@ -349,7 +405,7 @@ func run() throws {
     case "find": emit(try cmdFind(args))
     case "wait": emit(try cmdWait(args))
     case "press", "focus", "action", "set":
-        let pid = try managedPid(args)
+        let pid = try inputTarget()
         guard let ref = args.pos(0) else { throw CLIError("usage: backstage \(cmd) <ref>") }
         let e = try resolveRef(pid, ref)
         let rc: AXError
@@ -371,7 +427,7 @@ func run() throws {
         pump(0.15)
         emit(["ok": true])
     case "click":
-        let d = try requireDaemon(); let pid = try managedPid(args)
+        let d = try requireDaemon(); let pid = try inputTarget()
         var res: [String: Any]
         var location: CGPoint?
         if let ref = args.opt("ref") {
@@ -394,7 +450,7 @@ func run() throws {
         pump(0.15)
         emit(res)
     case "hover":
-        let d = try requireDaemon(); let pid = try managedPid(args)
+        let d = try requireDaemon(); let pid = try inputTarget()
         let p = try point(args, 0, d.bounds)
         guard let hit = hitTest(p, pids: [pid]) else { throw CLIError("no window of pid \(pid) at that point") }
         if let w = axApp(pid).windows.first(where: { $0.windowID == hit.windowID }), (w.attr(kAXMainAttribute) as? Bool) != true {
@@ -407,28 +463,28 @@ func run() throws {
         }
         pump(0.1); emit(["ok": true])
     case "drag":
-        let d = try requireDaemon(); let pid = try managedPid(args)
+        let d = try requireDaemon(); let pid = try inputTarget()
         let a = try point(args, 0, d.bounds), b = try point(args, 2, d.bounds)
         guard let hit = hitTest(a, pids: [pid]) else { throw CLIError("no window of pid \(pid) at start point") }
         postDrag(from: a, to: b, hit: hit, steps: args.int("steps") ?? 20); pump(0.15); emit(["ok": true])
     case "scroll":
-        let d = try requireDaemon(); let pid = try managedPid(args)
+        let d = try requireDaemon(); let pid = try inputTarget()
         let p = try point(args, 0, d.bounds)
         guard let hit = hitTest(p, pids: [pid]) else { throw CLIError("no window of pid \(pid) at that point") }
         postScroll(at: p, hit: hit, dx: Int32(args.int("dx") ?? 0), dy: Int32(args.int("dy") ?? -100)); pump(0.15); emit(["ok": true])
     case "type":
-        let pid = try managedPid(args)
+        let pid = try inputTarget()
         guard let text = args.pos(0) else { throw CLIError("usage: backstage type <text> [--ref R]") }
         try focusRef(args.opt("ref"), pid: pid)
         postText(pid: pid, text: text); pump(0.1); emit(["ok": true, "chars": text.count])
     case "key":
-        let pid = try managedPid(args)
+        let pid = try inputTarget()
         let keys = try args.positional.map(parseCombo)
         try focusRef(args.opt("ref"), pid: pid)
         for key in keys { postKey(pid: pid, key: key) }
         pump(0.1); emit(["ok": true])
     case "menu":
-        let pid = try managedPid(args)
+        let pid = try inputTarget()
         guard let path = args.pos(0) else { throw CLIError("usage: backstage menu \"File > Save\"") }
         try pressMenu(pid: pid, path: path); pump(0.2); emit(["ok": true])
     default:

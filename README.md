@@ -49,7 +49,7 @@ backstage type "12+30="
 backstage screenshot                  # {"path": "~/.backstage/shots/shot-….png", ...}
 backstage tree                        # accessibility tree with refs
 backstage click 127 215               # screenshot pixel == click point
-backstage quit                        # or `backstage stop` to quit everything
+backstage quit                        # or `backstage stop` to quit all of this session's apps
 ```
 
 The full command reference is in **[docs/USAGE.md](docs/USAGE.md)**, or run `backstage help`.
@@ -64,7 +64,8 @@ The full command reference is in **[docs/USAGE.md](docs/USAGE.md)**, or run `bac
 | Focus stealing | The app is never activated. If it activates itself, the daemon hands focus back to your app. |
 | Screenshots | ScreenCaptureKit, filtered to that app's windows (menus, sheets and popovers included). |
 | Input | AX actions (press/set/focus/menus), plus keyboard and mouse events posted straight to the app's process (`CGEventPostToPid`). Mouse events get window-local coordinates. A private "you are active" event goes to the app only, so AppKit doesn't swallow the click as a focus click. Nothing goes through the HID system, so your real cursor and keyboard are never touched. |
-| Teardown | `backstage stop` (or the daemon getting SIGTERM/SIGINT/SIGHUP) quits the agent's apps *before* removing the display, so nothing lands on your screen. After 30 min with no managed apps, the daemon exits by itself. |
+| Teardown | `backstage stop` quits the calling session's apps, and stops the daemon when no session has apps left. `backstage stop --all` (or the daemon getting SIGTERM/SIGINT/SIGHUP) quits every app *before* removing the display, so nothing lands on your screen. After 30 min with no managed apps in any session, the daemon exits by itself. |
+| Several agents | Each agent session owns the apps it launches, so concurrent agents never pick up, type into, screenshot or stop each other's apps. Commands on one app are serialized with a per-app lock. See [Sessions](docs/USAGE.md#concepts). |
 
 ## Menu bar indicator
 
@@ -73,7 +74,7 @@ disappears when nothing is running, and goes away entirely when the daemon exits
 shows:
 
 - a **live thumbnail** of each hidden agent display, refreshed every second while the menu is open
-- **stats:** agents, apps, windows, and how long Backstage has been running
+- **stats:** agent sessions, apps, windows, and how long Backstage has been running
 - **each app**, with the agent that launched it (claude, codex, grok…) and its age. Its submenu
   has **Show on My Screen** (the same as `backstage show`) and **Quit**
 - **Open Screenshots & Logs Folder**, and **Quit All Agent Apps**
@@ -140,16 +141,17 @@ backstage quit
 - Coordinates are agent-display points, with (0,0) at the top-left of the virtual display. A
   default `screenshot` is cropped starting at (0,0), so a pixel in the image is the same as
   the point you click. `--scale 0.5` gives smaller images; divide the pixel by the scale before clicking.
-- With no `--pid` or `--app`, commands target the most recently launched managed app. An explicit PID must belong to a live managed launch.
+- Each agent session sees only the apps it launched. With no `--pid` or `--app`, commands target your session's most recently launched app. An explicit PID must belong to a live managed launch of your session.
+- The session comes from the agent automatically (Claude Code's session ID, Codex's thread ID, or the agent process). Subagents of one Claude Code session share it, so give each its own with a prefix: `BACKSTAGE_SESSION=sub1 backstage launch …`. Details in [docs/USAGE.md](docs/USAGE.md#concepts).
 - Screenshots use PNG by default. Choose a `.jpg` or `.jpeg` output path for JPEG. The maximum output area is 67,108,864 pixels.
 - Element refs (`w<windowID>.<child>.<child>…`) survive window reordering. Re-run `tree`/`find`
   after the UI changes.
 - Run `backstage help` for everything: `drag`, `scroll`, `hover`, `set`, `action`, `list`,
-  `windows`, `status`, `stop`.
+  `windows`, `status`, `stop`, `stop --all`.
 
 Settings (environment for the daemon): `BACKSTAGE_WIDTH`/`BACKSTAGE_HEIGHT` (default 1920×1200),
 `BACKSTAGE_IDLE_TIMEOUT` (seconds, default 1800), `BACKSTAGE_HOME` (default `~/.backstage`),
-`BACKSTAGE_MENUBAR=off` (no menu bar icon).
+`BACKSTAGE_MENUBAR=off` (no menu bar icon). Per command: `BACKSTAGE_SESSION=<name>` picks the session.
 
 ## Limits (read these)
 
@@ -192,7 +194,8 @@ make build          # swift build -c release
 make test-cli       # offline CLI / process-ownership regression tests
 make test-agents    # hook decisions + install/uninstall in a throwaway HOME + dist skill sync
 make test           # all of the above, then a GUI fixture app driven through every command
-                    # while a watchdog (~1.5 ms sampling) checks nothing reaches your screen
+                    # while a watchdog (~1.5 ms sampling) checks nothing reaches your screen,
+                    # then the two-session test (tests/multi.sh; also `make test-multi`)
 make dist           # regenerate dist/skills/backstage/SKILL.md from Sources/backstage/Skill.swift
 ```
 

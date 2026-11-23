@@ -280,8 +280,9 @@ final class Daemon {
 
     func shutdown(reason: String) {
         guard !stopping else { return }
-        guard let session = try? StateLock("session.lock", nonblocking: true) else { pendingShutdown = reason; return }
-        defer { withExtendedLifetime(session) {} }
+        // A launch holds lifecycle.lock (shared) until its app is registered; never tear down under one.
+        guard let lifecycle = try? StateLock("lifecycle.lock", nonblocking: true) else { pendingShutdown = reason; return }
+        defer { withExtendedLifetime(lifecycle) {} }
         pendingShutdown = nil
         let records: [ManagedApp]
         do {
@@ -327,13 +328,19 @@ final class Daemon {
 /// Start the daemon in the background (new session, survives the terminal) if not running.
 @discardableResult
 func ensureDaemon() throws -> DaemonInfo {
-    try withLaunchSession { $0 }
+    let (info, lifecycle) = try beginLaunch()
+    lifecycle.release()
+    return info
 }
 
-func withLaunchSession<T>(_ body: (DaemonInfo) throws -> T) throws -> T {
-    try withExtendedLifetime(try StateLock("client.lock")) {
-        try withExtendedLifetime(try StateLock("session.lock")) { try body(startDaemon()) }
-    }
+/// Start the daemon if needed and return it with lifecycle.lock held shared. A launch keeps the
+/// lock until its app is registered, so the daemon can't shut down around an app it can't see
+/// yet. Shared, so launches in different sessions don't wait for each other.
+func beginLaunch() throws -> (info: DaemonInfo, lifecycle: StateLock) {
+    let client = try StateLock("client.lock")
+    defer { client.release() }
+    let lifecycle = try StateLock("lifecycle.lock", shared: true)
+    return (try startDaemon(), lifecycle)
 }
 
 private func startDaemon() throws -> DaemonInfo {
@@ -374,17 +381,88 @@ private func startDaemon() throws -> DaemonInfo {
     throw CLIError("daemon did not come up; see \(Paths.log.path)")
 }
 
-func stopDaemon() throws -> [String: Any] {
-    let client = try StateLock("client.lock")
-    defer { withExtendedLifetime(client) {} }
-    let daemon: DaemonInfo? = try withExtendedLifetime(try StateLock("session.lock")) {
-        guard let d = readJSON(Paths.daemon, DaemonInfo.self), d.matchesProcess else { return nil }
-        guard kill(d.pid, SIGTERM) == 0 || errno == ESRCH else { throw CLIError("failed to signal daemon") }
-        return d
+/// Quit apps gracefully, then forcefully. True once all of them are gone.
+@discardableResult
+func quitApps(_ records: [ManagedApp]) -> Bool {
+    for record in records { try? record.requestTermination(force: false) }
+    _ = waitFor(timeout: 3) { records.contains { $0.matchesProcess } ? nil : true }
+    for record in records where record.matchesProcess { try? record.requestTermination(force: true) }
+    return waitFor(timeout: 2) { records.contains { $0.matchesProcess } ? nil : true } != nil
+}
+
+/// `stop`: quit the calling session's apps. Then, if no session has apps left, stop the daemon
+/// too, as a single agent would expect. Other sessions' and legacy apps are never touched.
+func stopSession() throws -> [String: Any] {
+    let session = try Session.current()
+    var quit: [Int32] = []
+    var allGone = true
+    do {
+        let lock = try Locks.session(session.id)
+        defer { lock.release() }
+        // A launch in this session that started before now gives up instead of registering.
+        lock.stamp = Date().timeIntervalSince1970
+        let mine = try AppStore.read().filter { $0.session == session.id }
+        quit = mine.map { $0.pid }
+        allGone = quitApps(mine)
+        try AppStore.update { _ in }   // prune by process identity
     }
-    guard let daemon else { return ["ok": true, "note": "daemon not running"] }
+    Locks.pruneAppLocks()
+    var result: [String: Any] = ["ok": allGone, "session": session.id, "quit": quit]
+    if !allGone { result["error"] = "some of this session's apps did not quit" }
+    result["daemon"] = try stopDaemonIfIdle()
+    return result
+}
+
+private func stopDaemonIfIdle() throws -> String {
+    let client = try StateLock("client.lock")
+    defer { client.release() }
+    let daemon: DaemonInfo
+    do {
+        // Exclusive: wait out launches that haven't registered their app yet. New launches
+        // can't start while client.lock is held, so the emptiness check stays true.
+        let lifecycle = try StateLock("lifecycle.lock")
+        defer { lifecycle.release() }
+        let remaining = try AppStore.read()
+        if !remaining.isEmpty {
+            return "running (\(remaining.count) app\(remaining.count == 1 ? "" : "s") in other sessions)"
+        }
+        guard let d = readJSON(Paths.daemon, DaemonInfo.self), d.matchesProcess else { return "not running" }
+        guard kill(d.pid, SIGTERM) == 0 || errno == ESRCH else { throw CLIError("failed to signal daemon") }
+        daemon = d
+    }
     guard waitFor(timeout: 8, { daemon.matchesProcess ? nil : true }) != nil else {
         throw CLIError("daemon did not stop within 8 seconds; see \(Paths.log.path)")
     }
-    return ["ok": true]
+    return "stopped"
+}
+
+/// `stop --all`: the admin form. Quit every managed app in every session (legacy included) and
+/// stop the daemon.
+func stopAll() throws -> [String: Any] {
+    let client = try StateLock("client.lock")
+    defer { client.release() }
+    var daemon: DaemonInfo?
+    var quit: [Int32] = []
+    do {
+        let lifecycle = try StateLock("lifecycle.lock")
+        defer { lifecycle.release() }
+        if let d = readJSON(Paths.daemon, DaemonInfo.self), d.matchesProcess {
+            // The daemon quits every app before it removes the display.
+            guard kill(d.pid, SIGTERM) == 0 || errno == ESRCH else { throw CLIError("failed to signal daemon") }
+            daemon = d
+        } else {
+            let records = try AppStore.read()
+            quit = records.map { $0.pid }
+            guard quitApps(records) else { throw CLIError("some managed apps did not quit") }
+            try AppStore.update { _ in }
+        }
+    }
+    if let daemon {
+        guard waitFor(timeout: 8, { daemon.matchesProcess ? nil : true }) != nil else {
+            throw CLIError("daemon did not stop within 8 seconds; see \(Paths.log.path)")
+        }
+    }
+    Locks.pruneAppLocks()
+    if daemon != nil { return ["ok": true] }
+    return quit.isEmpty ? ["ok": true, "note": "daemon not running"] : ["ok": true, "quit": quit]
 }

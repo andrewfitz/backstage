@@ -1,6 +1,8 @@
 // Fixture app for backstage's end-to-end test. Logs everything it receives to TESTAPP_LOG.
 // Env: TESTAPP_ACTIVATE=1 -> calls NSApp.activate() 1s after launch (rude app)
 //      TESTAPP_POPUP=1    -> opens a second window 2s after launch (tests the new-window guard)
+//      TESTAPP_MARKER=X   -> prints "fixture marker X" to stdout (tells instances apart in logs)
+//      TESTAPP_PAD=red|green -> pad color (tells instances apart in screenshots; default blue)
 import Cocoa
 
 func log(_ s: String) {
@@ -14,7 +16,13 @@ func log(_ s: String) {
 final class Pad: NSView {
     var clicks = 0
     override func draw(_ r: NSRect) {
-        NSColor.systemBlue.setFill(); bounds.fill()
+        let color: NSColor
+        switch ProcessInfo.processInfo.environment["TESTAPP_PAD"] {
+        case "red": color = NSColor(srgbRed: 1, green: 0, blue: 0, alpha: 1)
+        case "green": color = NSColor(srgbRed: 0, green: 1, blue: 0, alpha: 1)
+        default: color = .systemBlue
+        }
+        color.setFill(); bounds.fill()
         ("pad clicks: \(clicks)" as NSString).draw(at: NSPoint(x: 8, y: 8), withAttributes: [.foregroundColor: NSColor.white, .font: NSFont.systemFont(ofSize: 16)])
     }
     override func mouseDown(with e: NSEvent) {
@@ -54,7 +62,9 @@ final class D: NSObject, NSApplicationDelegate {
         for v in [b, label!, tf, pad] as [NSView] { w.contentView!.addSubview(v) }
         w.makeKeyAndOrderFront(nil); w.makeFirstResponder(tf)
         log("launched active=\(NSApp.isActive)")
-        print("fixture stdout hello"); fflush(stdout)
+        print("fixture stdout hello")
+        if let marker = ProcessInfo.processInfo.environment["TESTAPP_MARKER"] { print("fixture marker \(marker)") }
+        fflush(stdout)
         NSEvent.addLocalMonitorForEvents(matching: [.leftMouseDown, .leftMouseUp, .rightMouseDown]) { e in log("monitor type=\(e.type.rawValue) clicks=\(e.clickCount) win=\(e.windowNumber)"); return e }
         NotificationCenter.default.addObserver(forName: NSApplication.didBecomeActiveNotification, object: nil, queue: nil) { _ in log("became active!") }
         NotificationCenter.default.addObserver(forName: NSControl.textDidChangeNotification, object: tf, queue: nil) { _ in log("text=\(tf.stringValue)") }

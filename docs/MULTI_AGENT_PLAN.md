@@ -48,6 +48,44 @@ PreToolUse hooks.
 A session owns its managed app instances, default target, logs and screenshot paths. Ownership
 routes commands among cooperating agents in one login; it isn't a security boundary.
 
+**What the agents expose (checked 2026-11-23).**
+
+- **Claude Code 2.1.330.** Every Bash tool shell gets `CLAUDE_CODE_SESSION_ID`, `CLAUDE_PID`
+  and `CLAUDE_CODE_CHILD_SESSION=1`. These aren't in the `claude` process's own environment;
+  Claude Code adds them per shell. The session ID is the top-level session. Two sibling
+  subagents and their parent all saw the same `CLAUDE_CODE_SESSION_ID` and `CLAUDE_PID`; only
+  `CLAUDE_EFFORT` differed. There's no per-subagent variable, so neither the variables nor
+  the parent walk can tell concurrent subagents apart.
+- **Codex 0.171.0.** The binary has `CODEX_THREAD_ID` in its shell-environment code, and Codex
+  subagents run as their own threads. This is from `strings` only and hasn't been checked in a
+  live session. Codex also has a daemon mode; herdr's wrapper passes `--no-daemon`. In daemon
+  mode, shells may hang off a shared `codex`/`codex-exec-server` process, where only the
+  thread ID tells sessions apart.
+- **Grok 1.0.92.** The binary has `GROK_SESSION_ID`, but next to the hook variables
+  (`GROK_HOOK_EVENT`). It isn't verified to reach tool shells.
+- **herdr.** `HERDR_PANE_ID` and similar identify a terminal pane, not an agent, so they aren't
+  used.
+
+**Derivation as built (phase 1).** First match wins:
+
+1. `BACKSTAGE_SESSION`. `legacy` is reserved.
+2. The nearest known agent ancestor's own variable: `CLAUDE_CODE_SESSION_ID` (only if
+   `CLAUDE_PID` is that ancestor), `CODEX_THREAD_ID`, or `GROK_SESSION_ID`. Variables are
+   inherited, so they're only trusted for the *nearest* agent. A Codex started from a Claude
+   shell doesn't join Claude's session.
+3. That agent process: name, PID and start time.
+4. The nearest non-shell, non-wrapper ancestor: PID and start time.
+5. The outermost shell ancestor. That keeps one script's commands together without falling
+   back to a shared default.
+
+The variable comes before the PID because hosts can serve several sessions from one process
+(Codex daemon mode, and possibly IDE or desktop hosts). The cost: if an agent starts a new
+session ID in the same process (for example Claude's `/clear`), its earlier apps stay with the
+old session. Only `stop --all` or the menu bar reach them then.
+
+**Subagents.** Claude Code subagents share a session. The skill tells them to prefix each
+command with `BACKSTAGE_SESSION=<unique-name>` when they launch their own apps.
+
 ## Architecture: stay CLI-side, serialize with file locks
 
 Commands keep running in the short-lived CLI process, as today. The daemon keeps its current
@@ -59,6 +97,23 @@ jobs only: the display, window guarding, and cursor guarding. Coordination uses 
 | per app (`locks/app-<pid>-<birth>`) | a whole input command: focus plus every event in a click, drag or key/type sequence | interleaved typing into one app |
 | per session (`locks/session-<id>`) | launch registration, quit, stop | double stop; stop racing a launch |
 | global state lock (exists) | reading or writing the app list | none new |
+
+**As built (phase 1).** The old global `session.lock` serialized every launch, stop and show
+across all agents. It's now `lifecycle.lock`, so the name no longer clashes with sessions, and
+it changed shape:
+
+| Lock | Mode, holder | Guards |
+|---|---|---|
+| `client.lock` (exists) | exclusive: daemon start, and `stop`/`stop --all` while they wait for the daemon to exit | one daemon starter; no launch while the daemon is going away |
+| `lifecycle.lock` (was `session.lock`) | **shared** by each launch from daemon start until its app is registered, and by `show`; **exclusive** for daemon shutdown (non-blocking, retried each tick) and for `stop`'s "anything left?" check | the daemon never quits or vanishes around an app it can't see yet. Launches in different sessions run concurrently. |
+| `locks/session-<key>` | exclusive: launch registration, `quit`, `stop`, `show` | double stop. `stop` writes a timestamp in the file, and a launch that started earlier quits its app instead of registering it. |
+| `locks/app-<pid>-<birth>` | exclusive: every input command (press, set, focus, action, click, hover, drag, scroll, type, key, menu) | interleaved input into one app |
+| `lock` (exists) | apps.json read-modify-write | — |
+
+Acquisition order: client → lifecycle → session → app → state. A launch still holds
+`lifecycle.lock` (shared) while LaunchServices identifies the new process: an unregistered app
+must not outlive the display. That wait blocks only daemon shutdown, never other sessions.
+Waiting for the first window happens after registration, with no lock held.
 
 - **Waits run unlocked.** Long waits (LaunchServices, the first window, `wait --text`) happen
   outside any lock, and the result is revalidated before it's published.
@@ -91,6 +146,26 @@ jobs only: the display, window guarding, and cursor guarding. Coordination uses 
 - Targeting another session's app by explicit PID or ref fails.
 - Stopping A while B is typing leaves B's app and input intact.
 - The existing single-agent suite passes unchanged with no session configured.
+
+**Status: done (2026-11-23).** `tests/multi.sh` (`make test-multi`, part of `make test`) covers
+every gate item, with the non-interference watchdog running throughout. It failed on the
+pre-session code (shared default target, interleaved typing, A's `stop` quitting B's app) and
+passes now, along with `make test-cli`, `make test-agents` and `tests/e2e.sh`, unchanged and
+with no session configured. Where the build departs from the text above:
+
+- **Legacy apps are reachable by explicit `--pid`.** They're never a default target, and
+  never in a session's `list` or plain `stop`. But nobody owns them, so an explicit PID still
+  reaches them, as `tests/cli.sh` expects. `list --all` and `stop --all` cover them.
+- **Plain `stop` also stops the daemon when no session has apps left.** That keeps
+  single-agent behaviour and keeps test runs from leaking a virtual display for the idle
+  timeout. It checks under exclusive `lifecycle.lock` with `client.lock` held, so it can't
+  race another session's launch.
+- **`show` locks the owning session**, as well as taking `lifecycle.lock` shared.
+- **Found while testing: per-app screenshots included other instances of the same app.**
+  ScreenCaptureKit's application filter matched every instance of the bundle, so session A's
+  screenshot showed B's copy of the fixture. Captures now include only the target PID's
+  windows.
+- **The menu bar counts sessions**, not agent processes.
 
 ## 2. Same app, many instances
 
@@ -169,7 +244,7 @@ If it's needed:
 
 ## Delivery order
 
-1. Session identity, ownership, and the two-agent regression test.
+1. Session identity, ownership, and the two-agent regression test. **Done.**
 2. `--isolated-home`, if the verification passes.
 3. Shared-display concurrency checks.
 4. Load runs and published capacity numbers.

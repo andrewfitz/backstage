@@ -143,11 +143,17 @@ func cmdShow(_ args: Args) throws -> [String: Any] {
 }
 
 /// Move a managed app onto the user's screen and stop managing it (used by `show` and the menu bar).
-/// `wait: false` (the daemon's menu) never blocks the daemon's main thread on a CLI that holds the lock.
+/// `wait: false` (the daemon's menu) never blocks the daemon's main thread on a CLI that holds a lock.
+/// Callers check ownership (the CLI goes through `managedApp`); this locks the record's owning session.
 func handOver(pid: pid_t, wait: Bool = true) throws {
-    let session = try StateLock("session.lock", nonblocking: !wait)
-    defer { withExtendedLifetime(session) {} }
-    guard AppStore.load().contains(where: { $0.pid == pid }) else { throw CLIError("pid \(pid) is not a live managed app") }
+    let lifecycle = try StateLock("lifecycle.lock", nonblocking: !wait, shared: true)
+    defer { lifecycle.release() }
+    guard let record = AppStore.load().first(where: { $0.pid == pid }) else { throw CLIError("pid \(pid) is not a live managed app") }
+    let owner = try Locks.session(record.owner, nonblocking: !wait)
+    defer { owner.release() }
+    guard AppStore.load().contains(where: { $0.pid == pid && $0.processStart == record.processStart }) else {
+        throw CLIError("pid \(pid) is not a live managed app")
+    }
     guard let target = userDisplayBounds().first else { throw CLIError("no user display available for handoff") }
     guard let app = NSRunningApplication(processIdentifier: pid) else { throw CLIError("app \(pid) is gone") }
     try AppStore.remove(pid)
