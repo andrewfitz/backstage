@@ -32,8 +32,11 @@ func waitFor<T>(timeout: Double, interval: Double = 0.05, _ cond: () throws -> T
     return nil
 }
 
-/// Run an async closure synchronously from the CLI's main thread.
-func runAsync<T>(_ body: @escaping () async throws -> T) throws -> T {
+/// Run an async closure synchronously from the CLI's main thread. With a timeout, give up
+/// (throwing `onTimeout`) if it hasn't finished by then; the closure keeps running until the
+/// process exits.
+func runAsync<T>(timeout: Double? = nil, onTimeout: @autoclosure () -> Error = CLIError("timed out"),
+                 _ body: @escaping () async throws -> T) throws -> T {
     let pending = DispatchGroup()
     var result: Result<T, Error>?
     pending.enter()
@@ -42,7 +45,11 @@ func runAsync<T>(_ body: @escaping () async throws -> T) throws -> T {
         do { result = .success(try await body()) }
         catch { result = .failure(error) }
     }
-    while pending.wait(timeout: .now()) != .success { pump(0.01) }
+    let deadline = timeout.map { ProcessInfo.processInfo.systemUptime + $0 }
+    while pending.wait(timeout: .now()) != .success {
+        if let deadline, ProcessInfo.processInfo.systemUptime >= deadline { throw onTimeout() }
+        pump(0.01)
+    }
     return try result!.get()
 }
 
@@ -113,10 +120,21 @@ struct Args {
         case "screenshot", "shot":
             allowed = target + ["window", "o", "out", "scale", "full"]; arity = 0...0
             if has("full"), (target + ["window"]).contains(where: { opt($0) != nil }) {
-                throw CLIError("--full captures the entire agent display and takes no app or window selector")
+                throw CLIError("--full captures all of your session's apps over the whole display and takes no app or window selector")
             }
             if opt("o") != nil && opt("out") != nil { throw CLIError("supply one output path") }
         case "tree": allowed = target + ["window", "depth", "json"]; arity = 0...0
+        case "window":
+            allowed = target + ["window"]
+            switch positional.first {
+            case "fill": arity = 1...1
+            case "size":
+                arity = 3...3
+                if positional.count == 3, !positional.dropFirst().allSatisfy({ Double($0).map { $0.isFinite && $0 >= 1 } ?? false }) {
+                    throw CLIError("window size needs a width and height in points (at least 1)")
+                }
+            default: throw CLIError("usage: backstage window fill [--window W]  |  backstage window size <w> <h> [--window W]")
+            }
         case "wait", "find":
             allowed = target + ["window", "role", "text"] + (command == "wait" ? ["timeout", "gone"] : [])
             arity = 0...(opt("text") == nil ? 1 : 0)

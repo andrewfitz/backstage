@@ -11,9 +11,13 @@ final class StatusMenu: NSObject, NSMenuDelegate {
     private var thumbViews: [CGDirectDisplayID: NSImageView] = [:]
     private var refreshTimer: Timer?
     private var capturing = false
+    private var thumbLock: StateLock?
     static let thumbWidth: CGFloat = 320
     /// The agent display has its own copy of the menu bar; leave it out of the thumbnail.
-    static let menuBarHeight: CGFloat = 25
+    static func menuBarHeight(_ id: CGDirectDisplayID) -> CGFloat {
+        guard let screen = nsScreen(id) else { return 0 }
+        return max(0, screen.frame.maxY - screen.visibleFrame.maxY)
+    }
 
     init(daemon: Daemon) {
         self.daemon = daemon
@@ -77,7 +81,7 @@ final class StatusMenu: NSObject, NSMenuDelegate {
 
         for id in activeDisplays().filter(isOurDisplay) {
             let b = CGDisplayBounds(id)
-            let h = (Self.thumbWidth * (b.height - Self.menuBarHeight) / max(b.width, 1)).rounded()
+            let h = (Self.thumbWidth * (b.height - Self.menuBarHeight(id)) / max(b.width, 1)).rounded()
             let container = NSView(frame: NSRect(x: 0, y: 0, width: Self.thumbWidth + 28, height: h + 12))
             let iv = NSImageView(frame: NSRect(x: 14, y: 6, width: Self.thumbWidth, height: h))
             iv.imageScaling = .scaleProportionallyUpOrDown
@@ -153,16 +157,23 @@ final class StatusMenu: NSObject, NSMenuDelegate {
     /// Small, cheap captures of each agent display while the menu is open.
     private func refreshThumbnails() {
         guard !capturing, !thumbViews.isEmpty else { return }
+        // Concurrent ScreenCaptureKit calls hang (see `capture`), so share capture.lock with the
+        // CLI. Never wait for it here: skip this refresh if a capture is running. A thumbnail
+        // capture that doesn't return gives the lock back after 5 s, since the daemon can't exit
+        // to clear it.
+        guard let lock = try? StateLock("capture.lock", nonblocking: true) else { return }
+        thumbLock = lock
+        DispatchQueue.main.asyncAfter(deadline: .now() + 5) { lock.release() }
         capturing = true
-        let targets = thumbViews.map { ($0.key, $0.value.frame.size) }
+        let targets = thumbViews.map { ($0.key, $0.value.frame.size, Self.menuBarHeight($0.key)) }
         Task.detached { [weak self] in
             var images: [CGDirectDisplayID: CGImage] = [:]
             if let content = try? await SCShareableContent.excludingDesktopWindows(false, onScreenWindowsOnly: true) {
-                for (id, size) in targets {
+                for (id, size, menuBar) in targets {
                     guard let disp = content.displays.first(where: { $0.displayID == id }) else { continue }
                     let cfg = SCStreamConfiguration()
                     let db = CGDisplayBounds(id)
-                    cfg.sourceRect = CGRect(x: 0, y: StatusMenu.menuBarHeight, width: db.width, height: db.height - StatusMenu.menuBarHeight)
+                    cfg.sourceRect = CGRect(x: 0, y: menuBar, width: db.width, height: db.height - menuBar)
                     cfg.width = Int(size.width * 2); cfg.height = Int(size.height * 2)
                     cfg.showsCursor = false
                     if let img = try? await SCScreenshotManager.captureImage(contentFilter: SCContentFilter(display: disp, excludingWindows: []), configuration: cfg) {
@@ -173,6 +184,7 @@ final class StatusMenu: NSObject, NSMenuDelegate {
             DispatchQueue.main.async {
                 guard let self else { return }
                 self.capturing = false
+                self.thumbLock?.release(); self.thumbLock = nil
                 for (id, img) in images { self.thumbViews[id]?.image = NSImage(cgImage: img, size: .zero) }
             }
         }
@@ -181,7 +193,8 @@ final class StatusMenu: NSObject, NSMenuDelegate {
     // MARK: actions (user-initiated)
 
     @objc private func showApp(_ sender: NSMenuItem) {
-        do { try handOver(pid: pid_t(sender.tag), wait: false) } catch { NSSound.beep(); daemon?.log("menu show failed (busy launch/stop?): \(error)") }
+        guard let rec = daemon?.registry.first(where: { $0.pid == pid_t(sender.tag) }) else { NSSound.beep(); return }
+        do { try handOver(rec, wait: false) } catch { NSSound.beep(); daemon?.log("menu show failed (busy launch/stop?): \(error)") }
     }
 
     @objc private func quitApp(_ sender: NSMenuItem) {

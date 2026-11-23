@@ -117,7 +117,12 @@ rejected a type x --pid "$PB" && pass "A: type --pid B" || { fail "A typed into 
 rejected a set "$FB" "hijacked" && pass "A: set with B's element ref" || { fail "A set B's field through a ref"; CROSS=0; }
 rejected a focus "$FB" && pass "A: focus with B's element ref" || { fail "A focused B's element through a ref"; CROSS=0; }
 waitvalue "bravo text" b && pass "B's field untouched by A" || fail "B's field changed to '$(value b)'"
-rejected a screenshot --full -o "$WORK/full.png" && pass "A: screenshot --full rejected while B has windows" || fail "A captured the whole shared display"
+if a screenshot --full -o "$WORK/full.png" > "$WORK/full.json" && [[ -s "$WORK/full.png" ]]; then
+    read -r FR FG <<< "$(colors "$WORK/full.png")"
+    (( FR > 10000 && FG < 1000 )) && pass "A's --full shows A's app and none of B's ($FR red, $FG green)" || fail "A's --full: $FR red, $FG green"
+else
+    fail "A's screenshot --full: $(cat "$WORK/full.json")"
+fi
 if [[ $CROSS == 1 ]]; then
     # Only safe once the harmless checks above prove PIDs are session-scoped: on a build without
     # ownership, these would quit B's app or put it on the user's screen.
@@ -154,6 +159,35 @@ alive "$PB" && pass "B's app still running" || fail "A's stop quit B's app"
 daemon_up && pass "daemon kept running for B" || fail "daemon stopped while B had an app"
 [[ $(a stop | jget "['ok']") == True ]] && pass "A's second stop is a no-op" || fail "A's second stop"
 alive "$PB" && pass "B's app survived A's second stop" || fail "B's app gone after A's second stop"
+
+echo "== a launch killed before registering its app leaves nothing behind"
+# Freeze the CLI once its provisional record exists, let the app start, then kill the CLI: the
+# daemon must quit the app nobody registered.
+BACKSTAGE_SESSION=C "$BS" launch "$WORK/BackstageTestApp.app" --env "TESTAPP_LOG=$WORK/e.log" --env TESTAPP_MARKER=orphan \
+    > "$WORK/e.json" 2>&1 & LC=$!
+REC=
+for _ in $(seq 1 1000); do
+    REC=$(compgen -G "$BACKSTAGE_HOME/launching/*.json" | head -1)
+    [[ -n "$REC" ]] && break
+    sleep 0.01
+done
+kill -STOP "$LC" 2>/dev/null
+if [[ -n "$REC" && -f "$REC" ]]; then
+    ELOG=$(jget "['log']" < "$REC")
+    for _ in $(seq 1 150); do grep -q "fixture marker orphan" "$ELOG" 2>/dev/null && break; sleep 0.1; done
+    # The app has the log as stdout (so did `open`, briefly): pick the fixture's process.
+    PE=$(for p in $(lsof -t "$ELOG" 2>/dev/null); do ps -o comm= -p "$p" | grep -q BackstageTestApp && echo "$p"; done | head -1)
+    kill -KILL "$LC"; wait "$LC" 2>/dev/null
+    [[ -n "$PE" ]] && pass "orphaned launch started pid $PE" || fail "orphaned launch's app never started"
+    for _ in $(seq 1 300); do [[ ! -f "$REC" ]] && ! { [[ -n "$PE" ]] && alive "$PE"; } && break; sleep 0.1; done
+    [[ -z "$PE" ]] || ! alive "$PE" && pass "the daemon quit the unregistered app" || fail "orphaned app $PE still running"
+    [[ ! -f "$REC" ]] && pass "the provisional record is gone" || fail "provisional record left: $REC"
+    [[ $(BACKSTAGE_SESSION=C "$BS" list | pids) == "[]" ]] && pass "the orphan is in no session" || fail "C lists $(BACKSTAGE_SESSION=C "$BS" list | pids)"
+    alive "$PB" && daemon_up && pass "B's app and the daemon are unaffected" || fail "B's app or the daemon is gone"
+else
+    kill -KILL "$LC" 2>/dev/null; wait "$LC" 2>/dev/null
+    fail "no provisional launch record appeared"
+fi
 
 echo "== records from before sessions belong to 'legacy'"
 /bin/sleep 300 & SLEEPER=$!

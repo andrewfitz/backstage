@@ -2,9 +2,17 @@
 // interval) for N seconds and reports any moment where
 //  - a window owned by a process with the given bundle ID is on-screen on a user display, or
 //  - that process is frontmost, or
-//  - the cursor is on a non-user (virtual) display.
+//  - the cursor is on a non-user (virtual) display, or
+//  - input that backstage didn't send (the user's typing, clicks, scrolls) reached that process,
+//    or input backstage sent reached the user's frontmost app. A listen-only event tap sees every
+//    key, click and scroll after the WindowServer has picked its target process; backstage tags
+//    its own events (kCGEventSourceUserData), so nothing here depends on someone typing: any
+//    untagged event a test posts to the test app, or any key the user types while a test app holds
+//    the keyboard focus, shows up. It also polls which process holds the keyboard focus (an open
+//    menu takes it, even in a background app) and reports how long the test app held it.
 // usage: watch <bundle-id> <seconds> [stop-file]
 import Cocoa
+import os
 
 let bundleID = CommandLine.arguments[1]
 let secs = Double(CommandLine.arguments[2])!
@@ -13,6 +21,78 @@ func userDisplays() -> [CGRect] {
     return ids[0..<Int(n)].filter { CGDisplayVendorNumber($0) != 0xB57A }.map { CGDisplayBounds($0) }
 }
 var violations: [String: Int] = [:]
+
+// Tags backstage puts in kCGEventSourceUserData (Sources/backstage/InputGuard.swift).
+let agentTag: Int64 = 0x6273_7467_0001, redirectedTag: Int64 = 0x6273_7467_0002
+var tapLock = os_unfair_lock()
+var testPids: Set<pid_t> = []
+var userFront: pid_t = 0
+var tapViolations: [String: Int] = [:]
+var tapNotes: [String: Int] = [:]
+func withTapLock<T>(_ body: () -> T) -> T { os_unfair_lock_lock(&tapLock); defer { os_unfair_lock_unlock(&tapLock) }; return body() }
+func refreshPids() {
+    let pids = Set(NSRunningApplication.runningApplications(withBundleIdentifier: bundleID).map(\.processIdentifier))
+    let front = NSWorkspace.shared.runningApplications.first(where: { $0.isActive })?.processIdentifier ?? 0
+    withTapLock { testPids = pids; if !pids.contains(front) { userFront = front } }
+}
+refreshPids()
+let tapCallback: CGEventTapCallBack = { _, type, e, _ in
+    if type == .tapDisabledByTimeout || type == .tapDisabledByUserInput {
+        withTapLock { tapNotes["watch's event tap was disabled by macOS (\(type.rawValue)) and re-enabled", default: 0] += 1 }
+        if let tap = watchTap { CGEvent.tapEnable(tap: tap, enable: true) }
+        return Unmanaged.passUnretained(e)
+    }
+    let target = pid_t(truncatingIfNeeded: e.getIntegerValueField(.eventTargetUnixProcessID))
+    let source = e.getIntegerValueField(.eventSourceUnixProcessID), tag = e.getIntegerValueField(.eventSourceUserData)
+    withTapLock {
+        if testPids.contains(target) && tag != agentTag {
+            tapViolations["input backstage didn't send (event type \(type.rawValue) from pid \(source)) reached the test app", default: 0] += 1
+        } else if tag == agentTag && target == userFront && target != 0 {
+            tapViolations["backstage input (event type \(type.rawValue)) reached the user's frontmost app (pid \(target))", default: 0] += 1
+        } else if tag == redirectedTag {
+            tapNotes["user input the daemon's input guard handed back to the user's app", default: 0] += 1
+        }
+    }
+    return Unmanaged.passUnretained(e)
+}
+var watchTap: CFMachPort?
+let tapTypes: [CGEventType] = [.keyDown, .keyUp, .flagsChanged, .leftMouseDown, .leftMouseUp, .leftMouseDragged, .rightMouseDown, .rightMouseUp,
+                               .rightMouseDragged, .otherMouseDown, .otherMouseUp, .otherMouseDragged, .scrollWheel]
+do {
+    let ready = DispatchSemaphore(value: 0)
+    let thread = Thread {
+        // Listen-only, appended last: it sees what is left after the daemon's input guard.
+        watchTap = CGEvent.tapCreate(tap: .cgAnnotatedSessionEventTap, place: .tailAppendEventTap, options: .listenOnly,
+                                     eventsOfInterest: tapTypes.reduce(CGEventMask(0)) { $0 | (CGEventMask(1) << $1.rawValue) },
+                                     callback: tapCallback, userInfo: nil)
+        if let tap = watchTap { CFRunLoopAddSource(CFRunLoopGetCurrent(), CFMachPortCreateRunLoopSource(nil, tap, 0), .commonModes) }
+        ready.signal()
+        if watchTap != nil { CFRunLoopRun() }
+    }
+    thread.start()
+    ready.wait()
+    guard watchTap != nil else { print("watch: could not install the input event tap (Accessibility / Input Monitoring?)"); exit(1) }
+}
+
+// Which process holds the WindowServer's keyboard focus (SkyLight, private). Not the frontmost app:
+// an open menu takes the focus without activating its app.
+typealias KeyFocusFn = @convention(c) (UnsafeMutablePointer<ProcessSerialNumber>, UnsafeMutablePointer<UInt64>) -> Int32
+typealias PSNToPIDFn = @convention(c) (UnsafePointer<ProcessSerialNumber>, UnsafeMutablePointer<pid_t>) -> Int32
+let skyLight = dlopen("/System/Library/PrivateFrameworks/SkyLight.framework/SkyLight", RTLD_NOW)
+let keyFocusFn = dlsym(skyLight, "SLPSGetKeyFocusProcess").map { unsafeBitCast($0, to: KeyFocusFn.self) }
+// The query needs this process's WindowServer connection, which nothing else here opens.
+_ = dlsym(skyLight, "SLSMainConnectionID").map { unsafeBitCast($0, to: (@convention(c) () -> Int32).self)() }
+let psnToPID = dlsym(dlopen("/System/Library/Frameworks/ApplicationServices.framework/ApplicationServices", RTLD_NOW), "GetProcessPID")
+    .map { unsafeBitCast($0, to: PSNToPIDFn.self) }
+func keyFocusPid() -> pid_t? {
+    guard let keyFocusFn, let psnToPID else { return nil }
+    var psn = ProcessSerialNumber(), extra: UInt64 = 0, pid: pid_t = 0
+    guard keyFocusFn(&psn, &extra) == 0, psnToPID(&psn, &pid) == 0 else { return nil }
+    return pid
+}
+if keyFocusPid() == nil { print("watch: cannot read the keyboard focus process"); exit(1) }
+var focusSince: Double?
+var focusEpisodes: [Double] = []
 struct Exposure {
     let title: String
     let first: Double
@@ -61,12 +141,28 @@ while Date() < end && !(stopFile.map { FileManager.default.fileExists(atPath: $0
     if let loc = CGEvent(source: nil)?.location, !screens.contains(where: { $0.contains(loc) }) {
         violations["cursor off user displays at \(loc)", default: 0] += 1
     }
-    if samples % 20 == 0 { RunLoop.current.run(until: Date().addingTimeInterval(0.001)) }
+    if let pid = keyFocusPid(), withTapLock({ testPids.contains(pid) }) {
+        if focusSince == nil { focusSince = now }
+    } else if let since = focusSince {
+        focusEpisodes.append(now - since); focusSince = nil
+    }
+    if samples % 20 == 0 { refreshPids(); RunLoop.current.run(until: Date().addingTimeInterval(0.001)) }
 }
 let frontAtEnd = NSWorkspace.shared.frontmostApplication?.bundleIdentifier ?? "?"
 print("watch: \(samples) samples (\(String(format: "%.1f", Date().timeIntervalSince(t0) * 1000 / Double(samples)))ms each), front start=\(frontAtStart) end=\(frontAtEnd)")
 // A window an app opens *later* can be on screen for a moment before the AX observer moves it.
 // Tolerate under one 60Hz frame (16ms) per window; anything longer is a failure.
+if let since = focusSince { focusEpisodes.append(ProcessInfo.processInfo.systemUptime - since) }
+if !focusEpisodes.isEmpty {
+    // Expected while a test app's menu is open: the input guard keeps the user's input out (the
+    // tap checks above). A focus held much longer than any test's menu means one was left open.
+    print("watch: note: keyboard focus at the test app \(focusEpisodes.count) time(s), \(String(format: "%.0f", focusEpisodes.reduce(0, +) * 1000))ms in all, longest \(String(format: "%.0f", (focusEpisodes.max() ?? 0) * 1000))ms")
+    for e in focusEpisodes where e > 15 { violations["keyboard focus held by the test app for \(String(format: "%.1f", e))s (a menu left open?)", default: 0] += 1 }
+}
+withTapLock {
+    for (k, v) in tapViolations { violations[k, default: 0] += v }
+    for (k, v) in tapNotes { print("watch: note: \(k) x\(v)") }
+}
 for episode in completed + Array(active.values) {
     let milliseconds = (episode.last - episode.first) * 1000
     let detail = "window '\(episode.title)' on a user screen for \(episode.samples) sample(s), \(String(format: "%.1f", milliseconds))ms from first to last observation"

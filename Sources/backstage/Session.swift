@@ -7,13 +7,27 @@ import CryptoKit
 ///
 /// Derivation, first match wins:
 /// 1. `BACKSTAGE_SESSION=<name>` (scripts, test harnesses, or one agent splitting its subagents).
-/// 2. The nearest known agent ancestor (claude, codex, grok…), using that agent's own session
+/// 2. The nearest known agent ancestor (claude, codex, grok…; also `node`/`python`/`bun`/`deno`
+///    running one of them, recognised by its arguments), using that agent's own session
 ///    variable when it sets one in tool shells: `CLAUDE_CODE_SESSION_ID` (checked against
-///    `CLAUDE_PID`), `CODEX_THREAD_ID`, `GROK_SESSION_ID`. Variables are only trusted for the
-///    nearest agent, so a nested agent doesn't inherit its parent's session.
+///    `CLAUDE_PID`), `CODEX_THREAD_ID`, `GROK_SESSION_ID`. A variable counts only for the
+///    nearest agent and only if that agent didn't itself inherit the same value, so a nested
+///    agent that doesn't export its own ID (codex → claude → codex) gets its own session.
 /// 3. Otherwise that agent process: name, PID and process start time.
-/// 4. Otherwise the nearest non-shell ancestor (PID and start time).
-/// 5. Otherwise the outermost shell ancestor: a private session, never a shared default.
+/// 4. No agent, with a controlling terminal (a person, or a script run in a terminal): the
+///    terminal session (`getsid`, plus the leader's start time), so each tab or tmux pane is
+///    its own session. Agent tool shells are usually session leaders without a terminal, so
+///    an unknown agent isn't split into one session per command.
+/// 5. Otherwise the nearest non-shell ancestor (PID and start time).
+/// 6. Otherwise the outermost shell ancestor: a private session, never a shared default.
+/// If the parent has already exited (`backstage … &` from a finished shell, nohup, cron or
+/// launchd), there's no chain to walk. A single agent session variable is used as is; otherwise
+/// it's an error asking for BACKSTAGE_SESSION. launchd (PID 1) is never a session key.
+/// Known limits: Claude Code subagents share their parent's session (Claude gives them no
+/// variable of their own), while each Codex subagent has its own CODEX_THREAD_ID (checked live;
+/// CODEX_SESSION_ID is shared by a Codex session's subagents, so it isn't used). GROK_SESSION_ID
+/// hasn't been checked in a live Grok session. `env -i` or `sudo` drop the variables, so the
+/// same Claude session becomes `claude:<pid>-<start>` there.
 /// The daemon and the menu bar never derive a session; they act on records' stored owners.
 struct Session {
     let id: String
@@ -48,33 +62,46 @@ struct Session {
             }
             return Session(id: name, source: "BACKSTAGE_SESSION")
         }
+        func variable(_ key: String) -> String? { env[key].flatMap { $0.isEmpty ? nil : $0 } }
         let chain = ancestors()
-        if let agent = chain.first(where: { $0.agent != nil }), let kind = agent.agent {
-            func variable(_ key: String) -> String? { env[key].flatMap { $0.isEmpty ? nil : $0 } }
-            switch kind {
-            case "claude":
-                if let id = variable("CLAUDE_CODE_SESSION_ID"), env["CLAUDE_PID"].map({ Int32($0) == agent.pid }) ?? true {
-                    return Session(id: "claude:" + id, source: "CLAUDE_CODE_SESSION_ID")
-                }
-            case "codex":
-                if let id = variable("CODEX_THREAD_ID") { return Session(id: "codex:" + id, source: "CODEX_THREAD_ID") }
-            case "grok":
-                if let id = variable("GROK_SESSION_ID") { return Session(id: "grok:" + id, source: "GROK_SESSION_ID") }
-            default: break
+        guard !chain.isEmpty else {
+            // Reparented to launchd: every detached caller would share a launchd-based key.
+            let found = sessionVariables.compactMap { v in variable(v.key).map { (v, $0) } }
+            if found.count == 1, let (v, id) = found.first { return Session(id: v.kind + ":" + id, source: v.key) }
+            let why = found.isEmpty ? "" : " Several agent session variables are set (\(found.map { $0.0.key }.joined(separator: ", "))), so which one applies is unclear."
+            throw CLIError("can't work out the backstage session: the calling process's parent has exited (detached with &/nohup/setsid, or run by cron/launchd).\(why) Set BACKSTAGE_SESSION=<name> on each command.")
+        }
+        if let agent = nearestAgent(chain), let kind = agent.agent {
+            // Trust the variable only if this agent set it: a value the agent itself inherited
+            // came from an outer agent. Unreadable environments (another user) are trusted.
+            func own(_ key: String) -> String? {
+                guard let id = variable(key) else { return nil }
+                return processArguments(agent.pid)?.env[key] == id ? nil : id
+            }
+            if let v = sessionVariables.first(where: { $0.kind == kind }), let id = own(v.key),
+               v.key != "CLAUDE_CODE_SESSION_ID" || env["CLAUDE_PID"].map({ Int32($0) == agent.pid }) ?? true {
+                return Session(id: kind + ":" + id, source: v.key)
             }
             return Session(id: "\(kind):\(agent.pid)-\(agent.birth)", source: "agent process")
+        }
+        let sid = getsid(0)
+        if hasControllingTerminal(), sid > 1, sid != getpid(), let birth = processBirth(sid) {
+            return Session(id: "tty:\(sid)-\(birth)", source: "terminal session")
         }
         if let other = chain.first(where: { !$0.skipped }) {
             return Session(id: "\(other.name):\(other.pid)-\(other.birth)", source: "parent process")
         }
-        if let top = chain.last {
-            return Session(id: "process:\(top.pid)-\(top.birth)", source: "calling process")
-        }
-        let me = getppid()
-        return Session(id: "process:\(me)-\(processBirth(me) ?? 0)", source: "calling process")
+        let top = chain[chain.count - 1]
+        return Session(id: "process:\(top.pid)-\(top.birth)", source: "calling process")
     }
 
+    /// Each agent's own session variable, as its tool shells see it.
+    static let sessionVariables: [(kind: String, key: String)] = [
+        ("claude", "CLAUDE_CODE_SESSION_ID"), ("codex", "CODEX_THREAD_ID"), ("grok", "GROK_SESSION_ID"),
+    ]
     static let knownAgents = ["claude", "codex", "grok", "cursor-agent", "gemini", "opencode", "aider", "amp", "goose"]
+    /// Runtimes that npm/pip-installed agents run under; their arguments name the agent.
+    static let interpreters = ["node", "python", "bun", "deno"]
     static let skippedProcesses: Set<String> = ["zsh", "bash", "sh", "fish", "dash", "env", "sudo", "login", "nohup", "timeout",
                                                 "xargs", "make", "gmake", "script", "tmux", "screen", "backstage", "herdr-zsh"]
 
@@ -85,6 +112,24 @@ struct Session {
         let agent: String?
         var skipped: Bool { Session.skippedProcesses.contains(name) || name.hasPrefix("-") }
     }
+
+    static func agentName(_ word: String) -> String? {
+        let n = word.lowercased()
+        return knownAgents.first { n == $0 || n.hasPrefix($0 + "-") || n.hasPrefix($0 + ".") }
+    }
+
+    /// The agent an interpreter runs: a path component of one of its first arguments
+    /// (`node …/bin/gemini`, `node …/@anthropic-ai/claude-code/cli.js`, `python -m aider`).
+    static func interpretedAgent(_ pid: pid_t) -> String? {
+        guard let argv = processArguments(pid)?.argv else { return nil }
+        for arg in argv.dropFirst().prefix(4) where !arg.hasPrefix("-") {
+            if let agent = arg.split(separator: "/").lazy.compactMap({ agentName(String($0)) }).first { return agent }
+        }
+        return nil
+    }
+
+    /// The closest ancestor that is an agent; the scan stops there.
+    static func nearestAgent(_ chain: [Ancestor]) -> Ancestor? { chain.first { $0.agent != nil } }
 
     /// Parent processes from the caller up to (not including) launchd.
     static func ancestors() -> [Ancestor] {
@@ -98,12 +143,52 @@ struct Session {
             let name = withUnsafeBytes(of: info.pbi_name) { String(decoding: $0.prefix { $0 != 0 }, as: UTF8.self) }
             let comm = withUnsafeBytes(of: info.pbi_comm) { String(decoding: $0.prefix { $0 != 0 }, as: UTF8.self) }
             let n = (name.isEmpty ? comm : name).lowercased()
-            let agent = knownAgents.first { n == $0 || n.hasPrefix($0 + "-") || n.hasPrefix($0 + ".") }
+            var agent = agentName(n)
+            if agent == nil, interpreters.contains(where: { n == $0 || n.hasPrefix($0 + "3") || n.hasPrefix($0 + "-") }) {
+                agent = interpretedAgent(pid)
+            }
             chain.append(Ancestor(pid: pid, birth: info.pbi_start_tvsec * 1_000_000 + info.pbi_start_tvusec, name: n, agent: agent))
             pid = pid_t(info.pbi_ppid)
         }
         return chain
     }
+
+    static func hasControllingTerminal() -> Bool {
+        var info = proc_bsdinfo()
+        let size = Int32(MemoryLayout.size(ofValue: info))
+        return proc_pidinfo(getpid(), PROC_PIDTBSDINFO, 0, &info, size) == size && info.pbi_flags & UInt32(PROC_FLAG_CONTROLT) != 0
+    }
+}
+
+/// A process's arguments and environment, from KERN_PROCARGS2: argc, the executable path,
+/// alignment padding, argv, then the environment. Nil if unreadable (another user's process).
+func processArguments(_ pid: pid_t) -> (argv: [String], env: [String: String])? {
+    var mib = [CTL_KERN, KERN_PROCARGS2, pid]
+    var size = 0
+    guard sysctl(&mib, 3, nil, &size, nil, 0) == 0, size > MemoryLayout<Int32>.size else { return nil }
+    var bytes = [UInt8](repeating: 0, count: size)
+    guard sysctl(&mib, 3, &bytes, &size, nil, 0) == 0, size > MemoryLayout<Int32>.size else { return nil }
+    let argc = bytes.withUnsafeBytes { Int($0.loadUnaligned(as: Int32.self)) }
+    var index = MemoryLayout<Int32>.size
+    guard argc > 0, let endOfPath = bytes[index..<size].firstIndex(of: 0) else { return nil }
+    index = endOfPath
+    while index < size && bytes[index] == 0 { index += 1 }
+    var argv: [String] = []
+    for _ in 0..<argc {
+        guard let end = bytes[index..<size].firstIndex(of: 0) else { return nil }
+        argv.append(String(decoding: bytes[index..<end], as: UTF8.self))
+        index = end + 1
+    }
+    var env: [String: String] = [:]
+    while index < size && bytes[index] != 0 {
+        guard let end = bytes[index..<size].firstIndex(of: 0) else { break }
+        let entry = String(decoding: bytes[index..<end], as: UTF8.self)
+        if let eq = entry.firstIndex(of: "="), env[String(entry[..<eq])] == nil {
+            env[String(entry[..<eq])] = String(entry[entry.index(after: eq)...])
+        }
+        index = end + 1
+    }
+    return (argv, env)
 }
 
 /// Coordination locks in BACKSTAGE_HOME. Acquire in this order, never the reverse:
@@ -124,13 +209,34 @@ enum Locks {
         try StateLock("locks/app-\(app.pid)-\(app.processStart ?? 0)")
     }
     /// Remove lock files of apps that are gone. Nobody can hold a dead app's lock usefully.
+    /// Records without a start time lock `app-<pid>-0`, which can't be checked: those stay.
+    /// StateLock re-checks the path after locking, so unlinking a lock file is safe.
     static func pruneAppLocks() {
         let dir = Paths.dir.appendingPathComponent("locks")
         guard let names = try? FileManager.default.contentsOfDirectory(atPath: dir.path) else { return }
         for name in names where name.hasPrefix("app-") {
             let parts = name.dropFirst(4).split(separator: "-")
-            guard parts.count == 2, let pid = pid_t(parts[0]), let birth = UInt64(parts[1]) else { continue }
+            guard parts.count == 2, let pid = pid_t(parts[0]), let birth = UInt64(parts[1]), birth != 0 else { continue }
             if processBirth(pid) != birth { try? FileManager.default.removeItem(at: dir.appendingPathComponent(name)) }
+        }
+    }
+
+    /// Remove lock files of sessions that have no apps or launches and haven't stopped or
+    /// launched for a day. A session's lock file holds its last `stop` time, which a launch
+    /// started before that stop reads; no launch runs anywhere near a day, so dropping it then
+    /// loses nothing. Each file is unlinked while holding its lock (non-blocking: skip if busy).
+    static func pruneSessionLocks() {
+        let dir = Paths.dir.appendingPathComponent("locks")
+        guard let names = try? FileManager.default.contentsOfDirectory(atPath: dir.path),
+              let apps = try? AppStore.read() else { return }
+        let live = Set((apps.map { $0.owner } + Launching.records().map { $0.session }).map { "session-" + Session.fileKey($0) })
+        let cutoff = Date().addingTimeInterval(-86_400)
+        for name in names where name.hasPrefix("session-") && !live.contains(name) {
+            let url = dir.appendingPathComponent(name)
+            guard let modified = (try? FileManager.default.attributesOfItem(atPath: url.path))?[.modificationDate] as? Date,
+                  modified < cutoff, let lock = try? StateLock("locks/" + name, nonblocking: true) else { continue }
+            try? FileManager.default.removeItem(at: url)
+            lock.release()
         }
     }
 }

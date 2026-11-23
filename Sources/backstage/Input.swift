@@ -4,7 +4,8 @@ import CoreGraphics
 
 /// Background input: events are posted straight to the target process (CGEventPostToPid),
 /// never through the HID system, so the user's cursor, keyboard focus and frontmost app
-/// are untouched.
+/// are untouched. Every event is tagged (`postTagged`) so the daemon's input guard
+/// (InputGuard.swift) can tell it from the user's input.
 
 private typealias SetWinLocFn = @convention(c) (CGEvent, CGPoint) -> Void
 private let setWindowLocation: SetWinLocFn? = {
@@ -67,41 +68,41 @@ func primeActivation(_ pid: pid_t) {
     guard let e = NSEvent.otherEvent(with: .appKitDefined, location: .zero, modifierFlags: [], timestamp: ProcessInfo.processInfo.systemUptime,
                                      windowNumber: 0, context: nil, subtype: NSEvent.EventSubtype.applicationActivated.rawValue, data1: 0, data2: 0),
           let cg = e.cgEvent else { return }
-    cg.postToPid(pid)
+    cg.postTagged(to: pid)
     usleep(30_000)
 }
 
 func postClick(at p: CGPoint, hit: WindowHit, right: Bool = false, count: Int = 1) {
     let (down, up, btn): (CGEventType, CGEventType, CGMouseButton) = right ? (.rightMouseDown, .rightMouseUp, .right) : (.leftMouseDown, .leftMouseUp, .left)
     primeActivation(hit.pid)
-    mouseEvent(.mouseMoved, at: p, hit: hit, button: btn, clicks: 0).postToPid(hit.pid)
+    mouseEvent(.mouseMoved, at: p, hit: hit, button: btn, clicks: 0).postTagged(to: hit.pid)
     usleep(20_000)
     for c in 1...max(1, count) {
-        mouseEvent(down, at: p, hit: hit, button: btn, clicks: c).postToPid(hit.pid)
+        mouseEvent(down, at: p, hit: hit, button: btn, clicks: c).postTagged(to: hit.pid)
         usleep(30_000)
-        mouseEvent(up, at: p, hit: hit, button: btn, clicks: c).postToPid(hit.pid)
+        mouseEvent(up, at: p, hit: hit, button: btn, clicks: c).postTagged(to: hit.pid)
         usleep(40_000)
     }
 }
 
 func postMove(to p: CGPoint, hit: WindowHit) {
-    mouseEvent(.mouseMoved, at: p, hit: hit, button: .left, clicks: 0).postToPid(hit.pid)
+    mouseEvent(.mouseMoved, at: p, hit: hit, button: .left, clicks: 0).postTagged(to: hit.pid)
 }
 
 func postDrag(from a: CGPoint, to b: CGPoint, hit: WindowHit, steps: Int = 20) {
     primeActivation(hit.pid)
-    mouseEvent(.mouseMoved, at: a, hit: hit, button: .left, clicks: 0).postToPid(hit.pid)
+    mouseEvent(.mouseMoved, at: a, hit: hit, button: .left, clicks: 0).postTagged(to: hit.pid)
     usleep(20_000)
-    mouseEvent(.leftMouseDown, at: a, hit: hit, button: .left, clicks: 1).postToPid(hit.pid)
+    mouseEvent(.leftMouseDown, at: a, hit: hit, button: .left, clicks: 1).postTagged(to: hit.pid)
     usleep(50_000)
     let segments = max(1, steps)
     for i in 1...segments {
         let t = CGFloat(i) / CGFloat(segments)
         let p = CGPoint(x: a.x + (b.x - a.x) * t, y: a.y + (b.y - a.y) * t)
-        mouseEvent(.leftMouseDragged, at: p, hit: hit, button: .left, clicks: 1).postToPid(hit.pid)
+        mouseEvent(.leftMouseDragged, at: p, hit: hit, button: .left, clicks: 1).postTagged(to: hit.pid)
         usleep(15_000)
     }
-    mouseEvent(.leftMouseUp, at: b, hit: hit, button: .left, clicks: 1).postToPid(hit.pid)
+    mouseEvent(.leftMouseUp, at: b, hit: hit, button: .left, clicks: 1).postTagged(to: hit.pid)
 }
 
 func postScroll(at p: CGPoint, hit: WindowHit, dx: Int32, dy: Int32) {
@@ -114,7 +115,7 @@ func postScroll(at p: CGPoint, hit: WindowHit, dx: Int32, dy: Int32) {
     e.setIntegerValueField(.mouseEventWindowUnderMousePointerThatCanHandleThisEvent, value: Int64(hit.windowID))
     e.setIntegerValueField(kWindowNumberField, value: Int64(hit.windowID))
     setWindowLocation?(e, CGPoint(x: p.x - hit.bounds.minX, y: p.y - hit.bounds.minY))
-    e.postToPid(hit.pid)
+    e.postTagged(to: hit.pid)
 }
 
 // MARK: keyboard
@@ -172,7 +173,7 @@ func postKey(pid: pid_t, key: (CGKeyCode, CGEventFlags)) {
     for down in [true, false] {
         let e = CGEvent(keyboardEventSource: src, virtualKey: k, keyDown: down)!
         e.flags = flags
-        e.postToPid(pid)
+        e.postTagged(to: pid)
         usleep(15_000)
     }
 }
@@ -187,7 +188,7 @@ func postText(pid: pid_t, text: String, delayMicros: UInt32 = 8_000) {
         for down in [true, false] {
             let e = CGEvent(keyboardEventSource: src, virtualKey: 0, keyDown: down)!
             e.keyboardSetUnicodeString(stringLength: u.count, unicodeString: &u)
-            e.postToPid(pid)
+            e.postTagged(to: pid)
             usleep(delayMicros)
         }
     }

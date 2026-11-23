@@ -8,7 +8,8 @@ cursor, keyboard focus or frontmost app. Output is JSON except for help, logs an
 
 COORDINATES: everything uses agent-display points with (0,0) at the display's top-left.
 A default `screenshot` is cropped from (0,0), so image pixel (x,y) == click point (x,y)
-(divide by --scale if you passed one).
+(divide by --scale if you passed one). The display is Retina: a default screenshot is
+downsampled to 1 pixel per point; --scale 2 gives the native pixels.
 
 SESSIONS: each agent session sees and drives only the apps it launched. The session is
 worked out automatically (the agent's own session ID, or its process); set BACKSTAGE_SESSION=name
@@ -21,7 +22,8 @@ LIFECYCLE
   launch <App.app|bundle.id|Name|/path/to/executable> [--env K=V]... [--timeout S] [-- args…]
   list [--all]                      your session's apps + their windows (--all: every session)
   quit [--pid P] [--force]          quit a managed app
-  status | doctor                   daemon/display/permission status
+  status | doctor                   daemon/display/permission status, and the display's
+                                    `screencapture -D` index (to record it with standard tools)
   start                             start the daemon
   stop                              quit your session's apps (and the daemon, if no apps are left)
   stop --all                        quit every session's apps and stop the daemon
@@ -42,10 +44,13 @@ AGENT INTEGRATION
 
 SEE
   screenshot [-o out.png] [--window I] [--full] [--scale S]
-                                    (--full: whole display; refused while other sessions have windows)
+                                    (--full: the whole display, showing all of your session's apps
+                                    and nothing else)
   tree [--window I] [--depth N] [--json]           accessibility tree with element refs
   find [--role R] [--text T] [--window I]          find elements (text matches title/value/desc/id)
   windows                                           window list with frames
+  window fill [--window I]                          make a window fill the display (below its menu bar)
+  window size <w> <h> [--window I]                  resize a window (points); default window: frontmost
   wait --text T [--role R] [--gone] [--timeout S]   wait for an element to appear/disappear
 
 ACT (all delivered in the background)
@@ -98,8 +103,27 @@ func managedApp(_ args: Args) throws -> ManagedApp {
 func managedPid(_ args: Args) throws -> pid_t { try managedApp(args).pid }
 
 func requireDaemon() throws -> DaemonInfo {
+    if let d = readJSON(Paths.daemon, DaemonInfo.self), d.matchesProcess, d.protocolMismatch { throw daemonVersionError(d) }
     guard let d = liveDaemon() else { throw CLIError("daemon not running (run `backstage launch …` or `backstage start`)") }
     return d
+}
+
+/// Input that can open a menu (a right-click, a pressed pop-up button or menu bar item) hands
+/// the app the keyboard focus; only the daemon's input guard keeps the user's typing out of it.
+/// Without the guard, refuse rather than risk it.
+func requireInputGuard() throws {
+    guard let d = readJSON(Paths.daemon, DaemonInfo.self), d.matchesProcess else {
+        throw CLIError("the backstage daemon isn't running, and without its input guard the user's typing could reach this app "
+            + "while one of its menus is open; `backstage stop --all`, then launch the app again")
+    }
+    guard let up = d.inputGuard else {
+        throw CLIError("the running backstage daemon (pid \(d.pid)) is from an older build without the input guard; "
+            + "run `backstage stop --all` (quits every managed app) to replace it, then retry")
+    }
+    guard up else {
+        throw CLIError("the backstage daemon's input guard isn't running (see \(Paths.log.path)), so the user's typing could reach "
+            + "this app while one of its menus is open. Check Accessibility for the app running backstage, then `backstage stop --all` and retry")
+    }
 }
 
 func elementCenter(_ e: AXUIElement) throws -> CGPoint {
@@ -165,16 +189,13 @@ func cmdScreenshot(_ args: Args) throws -> [String: Any] {
     }
     let out = URL(fileURLWithPath: (outArg as NSString).expandingTildeInPath)
     if args.has("full") {
-        // The display is shared: a whole-display capture would include other sessions' apps.
-        let others = Set(try AppStore.read().filter { $0.session != me }.map { $0.pid })
-        if onscreenWindows().contains(where: {
-            guard let pid = $0[kCGWindowOwnerPID as String] as? pid_t else { return false }
-            return others.contains(pid) && vd.intersects(cgBounds($0))
-        }) {
-            throw CLIError("--full is unavailable while other sessions have windows on the shared agent display; capture your app (omit --full) or a --window")
-        }
-        let size = try capture(.display(d.displayID, crop: nil), to: out, scale: scale)
-        return ["path": out.path, "width": Int(size.width), "height": Int(size.height), "origin": ["x": 0, "y": 0], "scale": scale]
+        // The display is shared: capture every window of this session's apps (and nothing
+        // else, from the same window snapshot), over the whole display.
+        let pids = Set(try AppStore.read().filter { $0.session == me }.map { $0.pid })
+        guard !pids.isEmpty else { throw CLIError("no managed apps in this session; --full captures all of your session's apps, so launch one first") }
+        let size = try capture(.apps(pids, display: d.displayID, crop: vd), to: out, scale: scale)
+        return ["path": out.path, "width": Int(size.width), "height": Int(size.height), "origin": ["x": 0, "y": 0], "scale": scale,
+                "pids": pids.sorted()]
     }
     let pid = try managedPid(args)
     if let ws = args.opt("window") {
@@ -193,8 +214,59 @@ func cmdScreenshot(_ args: Args) throws -> [String: Any] {
     }
     guard !union.isNull else { throw CLIError("app \(pid) has no visible windows on the agent display") }
     let crop = CGRect(x: vd.minX, y: vd.minY, width: union.maxX - vd.minX, height: union.maxY - vd.minY)
-    let size = try capture(.app(pid, display: d.displayID, crop: crop), to: out, scale: scale)
+    let size = try capture(.apps([pid], display: d.displayID, crop: crop), to: out, scale: scale)
     return ["path": out.path, "width": Int(size.width), "height": Int(size.height), "origin": ["x": 0, "y": 0], "scale": scale, "pid": pid]
+}
+
+/// The agent display's usable area, in global points: the display below its menu bar.
+func agentVisibleFrame(_ d: DaemonInfo) -> CGRect {
+    let bounds = d.bounds
+    guard let screen = nsScreen(d.displayID) else { return bounds }
+    // NSScreen is bottom-left based, from the bottom of the primary display.
+    let primaryHeight = CGDisplayBounds(CGMainDisplayID()).height
+    let v = screen.visibleFrame
+    let area = CGRect(x: v.minX, y: primaryHeight - v.maxY, width: v.width, height: v.height).intersection(bounds)
+    return area.isEmpty ? bounds : area
+}
+
+/// `window fill` / `window size <w> <h>`: resize one of the app's windows (default: its frontmost)
+/// with AX, staying inside the agent display.
+func cmdWindow(_ args: Args, pid: pid_t) throws -> [String: Any] {
+    let d = try requireDaemon()
+    let spec = args.opt("window") ?? "0"
+    let w = try resolveWindow(pid, spec)
+    guard let current = w.frame else { throw CLIError("window \(spec) has no frame") }
+    let area = agentVisibleFrame(d)
+    let target: CGRect
+    switch (args.pos(0), args.positional.count) {
+    case ("fill", 1):
+        target = area
+    case ("size", 3):
+        // Args has checked both are finite numbers >= 1.
+        let width = Double(args.pos(1)!)!, height = Double(args.pos(2)!)!
+        guard width <= area.width, height <= area.height else {
+            throw CLIError("\(r(width))x\(r(height)) doesn't fit the agent display's usable area (\(r(area.width))x\(r(area.height)) points); start the daemon with a larger BACKSTAGE_WIDTH/BACKSTAGE_HEIGHT")
+        }
+        // Keep the window where it is, moving it only as far as needed to stay on the display.
+        target = CGRect(x: min(max(current.minX, area.minX), area.maxX - width),
+                        y: min(max(current.minY, area.minY), area.maxY - height), width: width, height: height)
+    default:
+        throw CLIError("usage: backstage window fill [--window W]  |  backstage window size <w> <h> [--window W]")
+    }
+    // Move, resize, move again: the system may constrain a resize by where the window is.
+    w.setPosition(target.origin)
+    let rc = w.setSize(target.size)
+    w.setPosition(target.origin)
+    guard rc == .success else { throw CLIError("could not resize window \(spec) (AXError \(rc.rawValue)); it may not be resizable") }
+    pump(0.1)
+    let got = w.frame ?? target
+    var res: [String: Any] = ["ok": true, "pid": pid, "window": windowRef(w, index: Int(spec) ?? 0),
+                              "frame": rectDict(got.offsetBy(dx: -d.bounds.minX, dy: -d.bounds.minY))]
+    if abs(got.width - target.width) > 1 || abs(got.height - target.height) > 1 {
+        res["requested"] = rectDict(target.offsetBy(dx: -d.bounds.minX, dy: -d.bounds.minY))
+        res["note"] = "the app limited the window's size (minimum/maximum size or a fixed-size window)"
+    }
+    return res
 }
 
 func cmdTree(_ args: Args) throws {
@@ -275,16 +347,37 @@ func cmdStatus() throws -> [String: Any] {
         "home": Paths.dir.path,
     ]
     if let d = liveDaemon() {
-        s["daemon"] = ["pid": d.pid, "displayID": d.displayID, "size": ["w": Int(d.width), "h": Int(d.height)],
-                       "globalOrigin": ["x": Int(d.x), "y": Int(d.y)]]
+        var daemon: [String: Any] = ["pid": d.pid, "displayID": d.displayID, "size": ["w": Int(d.width), "h": Int(d.height)],
+                                     "globalOrigin": ["x": Int(d.x), "y": Int(d.y)]]
+        if let source = d.sizeSource { daemon["sizeSource"] = source }
+        daemon["inputGuard"] = d.inputGuard == true
+        if let mode = CGDisplayCopyDisplayMode(d.displayID) {
+            daemon["pixels"] = ["w": mode.pixelWidth, "h": mode.pixelHeight]
+            daemon["scale"] = d.width > 0 ? Double(mode.pixelWidth) / d.width : 1
+        }
+        // For recording with standard tools: `screencapture -D` counts the active displays from
+        // 1, ffmpeg's avfoundation names them "Capture screen 0", 1… in the same order. The order
+        // changes when displays come and go, so read it just before recording.
+        if let i = activeDisplays().firstIndex(of: d.displayID) {
+            daemon["screencaptureDisplay"] = i + 1
+            daemon["ffmpegScreen"] = "Capture screen \(i)"
+        }
+        s["daemon"] = daemon
     } else {
         s["daemon"] = NSNull()
     }
-    let session = try Session.current()
-    s["session"] = ["id": session.id, "from": session.source]
+    do {
+        let session = try Session.current()
+        s["session"] = ["id": session.id, "from": session.source]
+    } catch {
+        s["session"] = ["error": "\(error)"]
+    }
     s["managedApps"] = try AppStore.read().map { ["pid": $0.pid, "name": $0.name, "session": $0.owner] }
     var problems: [String] = []
     if !accessibility { problems.append("Accessibility not granted: System Settings > Privacy & Security > Accessibility — enable the app that runs this CLI (your terminal / agent host).") }
+    if let d = liveDaemon(), d.inputGuard != true {
+        problems.append("The daemon's input guard isn't running (see \(Paths.log.path)), so input commands refuse to run. Check Accessibility, then `backstage stop --all`.")
+    }
     if !recording { problems.append("Screen Recording not granted: System Settings > Privacy & Security > Screen & System Audio Recording — enable the terminal / agent host, then restart it.") }
     s["ok"] = problems.isEmpty
     if !problems.isEmpty { s["problems"] = problems }
@@ -308,6 +401,7 @@ func cmdQuit(_ args: Args) throws -> [String: Any] {
     if gone {
         // Prune by process identity so a concurrent registration survives PID reuse.
         try AppStore.update { _ in }
+        Locks.pruneAppLocks()
     }
     return ["ok": gone, "pid": pid]
 }
@@ -363,14 +457,19 @@ func run() throws {
     // Input commands hold the target app's lock from focus through the last event, so two
     // clients typing into one app can't interleave. Other apps are unaffected.
     var input: (pid: pid_t, lock: StateLock)?
-    if ["press", "focus", "action", "set", "click", "hover", "drag", "scroll", "type", "key", "menu"].contains(cmd) {
+    if ["press", "focus", "action", "set", "click", "hover", "drag", "scroll", "type", "key", "menu", "window"].contains(cmd) {
         let app = try managedApp(args)
+        if cmd != "window" { try requireInputGuard() }
         input = (app.pid, try Locks.app(app))
     }
     defer { input?.lock.release() }
     func inputTarget() throws -> pid_t { try input?.pid ?? managedPid(args) }
 
     switch cmd {
+    case "__guard-selftest":
+        let result = guardSelfTest()
+        emit(result)
+        if result["ok"] as? Bool != true { exit(1) }
     case "__daemon":
         try Paths.ensure()
         let d = try Daemon()
@@ -397,6 +496,7 @@ func run() throws {
         emit(result)
         if result["ok"] as? Bool == false { exit(1) }
     case "logs": try cmdLogs(args)
+    case "window": emit(try cmdWindow(args, pid: try inputTarget()))
     case "windows":
         let d = try requireDaemon(); let pid = try managedPid(args)
         emit(["pid": pid, "windows": axWindowsSummary(pid, origin: d.bounds.origin)])

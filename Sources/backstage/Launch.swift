@@ -19,12 +19,13 @@ func resolveApp(_ arg: String) throws -> URL {
 }
 
 /// LaunchServices can only launch-hidden a bundle, so wrap bare executables (e.g. `swift build`
-/// products) in a throwaway .app whose executable is a tiny exec shim.
-func wrapExecutable(_ exe: URL) throws -> URL {
+/// products) in a throwaway .app whose executable is a tiny exec shim. `show` uses a separate
+/// wrapper (its own bundle ID), so LaunchServices never routes it to an instance `launch` runs hidden.
+func wrapExecutable(_ exe: URL, shown: Bool = false) throws -> URL {
     try Paths.ensure()
     let name = exe.lastPathComponent
     let hash = SHA256.hash(data: Data(exe.path.utf8)).map { String(format: "%02x", $0) }.joined()
-    let app = Paths.wrappers.appendingPathComponent("\(hash).app")
+    let app = Paths.wrappers.appendingPathComponent(shown ? "\(hash)-shown.app" : "\(hash).app")
     let macos = app.appendingPathComponent("Contents/MacOS")
     try FileManager.default.createDirectory(at: macos, withIntermediateDirectories: true)
     let shim = macos.appendingPathComponent(name)
@@ -48,7 +49,7 @@ func wrapExecutable(_ exe: URL) throws -> URL {
     guard chmod(shim.path, 0o755) == 0 else { throw CLIError("couldn't make wrapper executable") }
     let plist: [String: Any] = [
         "CFBundleExecutable": name,
-        "CFBundleIdentifier": "dev.backstage.wrapped.\(hash)",
+        "CFBundleIdentifier": shown ? "dev.backstage.shown.\(hash)" : "dev.backstage.wrapped.\(hash)",
         "CFBundleName": name,
         "CFBundlePackageType": "APPL",
         "NSPrincipalClass": "NSApplication",
@@ -84,30 +85,6 @@ func launch(_ args: Args) throws -> [String: Any] {
                               session: session, started: started, lifecycle: lifecycle)
 }
 
-// Darwin returns argc, the executable path, alignment padding, argv, then the environment.
-private func hasLaunchToken(_ pid: pid_t, assignment: String) -> Bool {
-    var mib = [CTL_KERN, KERN_PROCARGS2, pid]
-    var size = 0
-    guard sysctl(&mib, 3, nil, &size, nil, 0) == 0, size > MemoryLayout<Int32>.size else { return false }
-    var bytes = [UInt8](repeating: 0, count: size)
-    guard sysctl(&mib, 3, &bytes, &size, nil, 0) == 0, size > MemoryLayout<Int32>.size else { return false }
-    let argc = bytes.withUnsafeBytes { Int($0.loadUnaligned(as: Int32.self)) }
-    var index = MemoryLayout<Int32>.size
-    guard argc > 0, let endOfPath = bytes[index..<size].firstIndex(of: 0) else { return false }
-    index = endOfPath
-    while index < size && bytes[index] == 0 { index += 1 }
-    for _ in 0..<argc {
-        guard let end = bytes[index..<size].firstIndex(of: 0) else { return false }
-        index = end + 1
-    }
-    while index < size && bytes[index] != 0 {
-        guard let end = bytes[index..<size].firstIndex(of: 0) else { return false }
-        if bytes[index..<end].elementsEqual(assignment.utf8) { return true }
-        index = end + 1
-    }
-    return false
-}
-
 private func launchResolved(_ url: URL, bareExecutable: URL?, args: Args, info: DaemonInfo, timeout: Double,
                             session: Session, started: Double, lifecycle: StateLock) throws -> [String: Any] {
     let vd = info.bounds
@@ -137,7 +114,15 @@ private func launchResolved(_ url: URL, bareExecutable: URL?, args: Args, info: 
         guard receiptFD >= 0 else { throw CLIError("could not create wrapper PID receipt") }
         close(receiptFD)
     }
-    defer { if bareExecutable != nil { try? FileManager.default.removeItem(at: receipt) } }
+    // A provisional record lets the daemon clean up if this process dies before registering
+    // the app. Kept (with the receipt) when the app couldn't be identified in time, so the
+    // daemon quits it if it turns up late.
+    var leaveToDaemon = false
+    defer { if bareExecutable != nil && !leaveToDaemon { try? FileManager.default.removeItem(at: receipt) } }
+    try Launching.begin(LaunchRecord(id: launchID, session: session.id, cliPID: getpid(), cliStart: processBirth(getpid()) ?? 0,
+                                     bundle: url.path, executable: bareExecutable?.path, log: logURL.path,
+                                     startedAt: Date().timeIntervalSince1970))
+    defer { if !leaveToDaemon { Launching.end(launchID) } }
 
     // -g: don't bring to foreground, -j: launch hidden, -n: fresh instance (never touch the user's copy)
     var openArgs = ["-g", "-j", "-n", "--stdout", logURL.path, "--stderr", logURL.path]
@@ -150,54 +135,11 @@ private func launchResolved(_ url: URL, bareExecutable: URL?, args: Args, info: 
     try p.run(); p.waitUntilExit()
     guard p.terminationStatus == 0 else { throw CLIError("open failed (status \(p.terminationStatus))") }
 
-    let bundleURL = url.resolvingSymlinksInPath().standardizedFileURL
-    func ownsLog(_ pid: pid_t) -> Bool {
-        for descriptor in [STDOUT_FILENO, STDERR_FILENO] {
-            var detail = vnode_fdinfo()
-            let size = Int32(MemoryLayout.size(ofValue: detail))
-            if proc_pidfdinfo(pid, descriptor, PROC_PIDFDVNODEINFO, &detail, size) == size,
-               detail.pvi.vi_stat.vst_ino == logStat.st_ino,
-               detail.pvi.vi_stat.vst_dev == UInt32(bitPattern: logStat.st_dev) { return true }
-        }
-        return false
-    }
-    func receiptPID() -> pid_t? {
-        guard let value = try? String(contentsOf: receipt, encoding: .utf8) else { return nil }
-        return pid_t(value.trimmingCharacters(in: .whitespacesAndNewlines))
-    }
-    func matchesExecutable(_ pid: pid_t, _ target: URL) -> Bool {
-        var path = [CChar](repeating: 0, count: Int(MAXPATHLEN))
-        var expected = stat(), actual = stat()
-        return proc_pidpath(pid, &path, UInt32(path.count)) > 0 &&
-            stat(target.path, &expected) == 0 && stat(path, &actual) == 0 &&
-            actual.st_dev == expected.st_dev && actual.st_ino == expected.st_ino
-    }
-    func findApp() -> (NSRunningApplication?, pid_t, UInt64)? {
-        let candidate: NSRunningApplication?
-        let pid: pid_t
-        if bareExecutable != nil {
-            guard let reported = receiptPID(), reported > 0, !before.contains(reported) else { return nil }
-            pid = reported
-            candidate = NSRunningApplication(processIdentifier: pid)
-        } else {
-            candidate = NSWorkspace.shared.runningApplications.first {
-                !before.contains($0.processIdentifier) && !$0.isTerminated
-                    && $0.bundleURL?.resolvingSymlinksInPath().standardizedFileURL == bundleURL
-                    && (ownsLog($0.processIdentifier) || hasLaunchToken($0.processIdentifier, assignment: assignment))
-            }
-            guard let candidate else { return nil }
-            pid = candidate.processIdentifier
-        }
-        guard let birth = processBirth(pid) else { return nil }
-        let app = candidate.flatMap { $0.processIdentifier == pid && !$0.isTerminated ? $0 : nil }
-        if let target = bareExecutable {
-            guard receiptPID() == pid, matchesExecutable(pid, target),
-                  ownsLog(pid) || hasLaunchToken(pid, assignment: assignment) else { return nil }
-        } else if app == nil { return nil }
-        guard processBirth(pid) == birth else { return nil }
-        return (app, pid, birth)
-    }
+    let identity = LaunchTarget(bundle: url.resolvingSymlinksInPath().standardizedFileURL, executable: bareExecutable,
+                                launchID: launchID, logDevice: logStat.st_dev, logInode: logStat.st_ino, receipt: receipt)
+    func findApp() -> (NSRunningApplication?, pid_t, UInt64)? { identity.find { !before.contains($0) } }
     guard let (app, pid, birth) = waitFor(timeout: 15, { findApp() }) else {
+        leaveToDaemon = true
         throw CLIError("open accepted \(url.path), but its process could not be identified. Launch log: \(logURL.path)")
     }
     func stillRunning() -> Bool { processBirth(pid) == birth }
@@ -218,6 +160,7 @@ private func launchResolved(_ url: URL, bareExecutable: URL?, args: Args, info: 
                                     launchedAt: Date().timeIntervalSince1970, stdout: logURL.path,
                                     processStart: birth, agent: launcher?.name, agentPID: launcher?.pid,
                                     session: session.id))
+        Launching.end(launchID)
     } catch {
         if let current = currentApp() { _ = current.forceTerminate() }
         else if stillRunning() { _ = kill(pid, SIGTERM) }
@@ -232,7 +175,9 @@ private func launchResolved(_ url: URL, bareExecutable: URL?, args: Args, info: 
     } ?? false
     pump(0.3)
     guard stillRunning() else { throw CLIError("app exited before window placement") }
-    for w in axApp(pid).windows { placeBeside(w, display: vd) }
+    // The app is still hidden, so its own windows aren't on screen yet: keep them apart too.
+    var placedFrames: [CGRect] = []
+    for w in axApp(pid).windows { placedFrames.append(placeBeside(w, display: vd, avoiding: placedFrames)) }
     pump(0.1)
     let placed = waitFor(timeout: 1) {
         guard stillRunning() else { return false }
@@ -247,8 +192,23 @@ private func launchResolved(_ url: URL, bareExecutable: URL?, args: Args, info: 
     if placed {
         _ = canUnhide?.unhide()
         if gotWindow {
+            let raiseAt = ProcessInfo.processInfo.systemUptime + 0.5
+            var raised = false
             _ = waitFor(timeout: 3) {
-                !stillRunning() || onscreenWindows().contains { ($0[kCGWindowOwnerPID as String] as? pid_t) == pid } ? true : nil
+                if !stillRunning() || onscreenWindows().contains(where: { ($0[kCGWindowOwnerPID as String] as? pid_t) == pid }) { return true }
+                // Accessory (LSUIElement-style) apps launched hidden keep their windows off screen
+                // after being unhidden, until they think they're active. Send the private "you're
+                // active" event every first input sends anyway (the real frontmost app doesn't
+                // change), then raise the windows, which were checked to be on the agent display.
+                if !raised && ProcessInfo.processInfo.systemUptime >= raiseAt {
+                    raised = true
+                    primeActivation(pid)
+                    for w in axApp(pid).windows where (w.attr(kAXMinimizedAttribute) as? Bool) != true
+                        && w.frame.map({ vd.contains($0) }) == true {
+                        AXUIElementPerformAction(w, kAXRaiseAction as CFString)
+                    }
+                }
+                return nil
             }
         }
         guard stillRunning() else { throw CLIError("app exited during launch") }

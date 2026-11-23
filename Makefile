@@ -1,7 +1,7 @@
 PREFIX ?= /opt/homebrew
 BIN = $(shell swift build -c release --show-bin-path)/backstage
 
-.PHONY: build install uninstall dist test test-cli test-agents test-multi
+.PHONY: build install uninstall dist test test-cli test-agents test-multi test-concurrency test-focus load
 
 build:
 	swift build -c release
@@ -30,6 +30,23 @@ test-agents: build
 test-multi: build
 	BACKSTAGE_BIN="$(BIN)" tests/multi.sh
 
+test-concurrency: build
+	BACKSTAGE_BIN="$(BIN)" tests/concurrency.sh
+
+test-focus: build
+	BACKSTAGE_BIN="$(BIN)" tests/focus.sh
+
 test: test-cli test-agents
 	BACKSTAGE_BIN="$(BIN)" tests/e2e.sh
 	BACKSTAGE_BIN="$(BIN)" tests/multi.sh
+	BACKSTAGE_BIN="$(BIN)" tests/concurrency.sh
+	BACKSTAGE_BIN="$(BIN)" tests/focus.sh
+
+# Load harness (docs/LOAD_TESTING.md), not part of `make test`. Defaults to a short 2-session
+# smoke run. Full runs (8/16/32 sessions, with --dedicated) belong on a separate macOS user
+# account or a dedicated Mac: make load LOAD_SESSIONS=32 LOAD_ARGS=--dedicated
+LOAD_SESSIONS ?= 2
+LOAD_WORKLOADS ?= all
+LOAD_ARGS ?= --duration 6 --rounds 2 --cycles 3
+load: build
+	BACKSTAGE_BIN="$(BIN)" tests/load.sh $(LOAD_SESSIONS) $(LOAD_WORKLOADS) $(LOAD_ARGS)

@@ -112,20 +112,37 @@ func cmdShow(_ args: Args) throws -> [String: Any] {
     if let target = args.pos(0) {
         if args.opt("pid") != nil || args.opt("app") != nil { throw CLIError("give either a target or --pid/--app, not both") }
         var openArgs: [String] = []
-        if let u = URL(string: target), let s = u.scheme, s.count > 1, !target.hasPrefix("/") { openArgs = [target] }
-        else {
+        // The app that will open the target, to keep LaunchServices from handing it to a
+        // hidden instance that backstage manages (possibly for another session).
+        var handler: URL?
+        var isApp = false
+        if let u = URL(string: target), let s = u.scheme, s.count > 1, !target.hasPrefix("/") {
+            openArgs = [target]
+            handler = NSWorkspace.shared.urlForApplication(toOpen: u)
+        } else {
             let path = (target as NSString).expandingTildeInPath
             if FileManager.default.fileExists(atPath: path) {
                 var isDir: ObjCBool = false
                 FileManager.default.fileExists(atPath: path, isDirectory: &isDir)
                 if !isDir.boolValue, FileManager.default.isExecutableFile(atPath: path), !path.hasSuffix(".app") {
-                    openArgs = [try wrapExecutable(URL(fileURLWithPath: path)).path]   // bare GUI binary
+                    // Bare GUI binary: its own wrapper, never the one `launch` runs hidden.
+                    openArgs = [try wrapExecutable(URL(fileURLWithPath: path), shown: true).path]
                 } else {
-                    openArgs = [URL(fileURLWithPath: path).standardizedFileURL.path]
+                    let url = URL(fileURLWithPath: path).standardizedFileURL
+                    openArgs = [url.path]
+                    isApp = Bundle(url: url)?.bundleIdentifier != nil && url.pathExtension == "app"
+                    handler = isApp ? url : NSWorkspace.shared.urlForApplication(toOpen: url)
                 }
             } else {
-                openArgs = [try resolveApp(target).path]
+                let url = try resolveApp(target)
+                openArgs = [url.path]
+                isApp = true
+                handler = url
             }
+        }
+        if let handler, managedInstanceRunning(of: handler) {
+            // -n: a new instance for the user, rather than activating the hidden one.
+            openArgs = isApp ? ["-n"] + openArgs : ["-n", "-a", handler.path] + openArgs
         }
         let p = Process()
         p.executableURL = URL(fileURLWithPath: "/usr/bin/open")
@@ -133,30 +150,41 @@ func cmdShow(_ args: Args) throws -> [String: Any] {
         try p.run(); p.waitUntilExit()
         guard p.terminationStatus == 0 else { throw CLIError("open failed for \(target)") }
         logShown("open \(openArgs.joined(separator: " "))")
-        return ["ok": true, "shown": openArgs[0]]
+        return ["ok": true, "shown": openArgs.last!]
     }
 
     // Hand a managed (hidden) app over to the user: stop managing it, move it, bring it forward.
-    let pid = try managedPid(args)
-    try handOver(pid: pid)
-    return ["ok": true, "pid": pid, "note": "app is now on the user's screen and no longer managed by backstage"]
+    let app = try managedApp(args)
+    try handOver(app)
+    return ["ok": true, "pid": app.pid, "note": "app is now on the user's screen and no longer managed by backstage"]
+}
+
+/// A live managed (hidden) instance of this app exists, in any session.
+private func managedInstanceRunning(of app: URL) -> Bool {
+    let resolved = app.resolvingSymlinksInPath().standardizedFileURL
+    let bundleID = Bundle(url: app)?.bundleIdentifier
+    return AppStore.load().contains {
+        URL(fileURLWithPath: $0.path).resolvingSymlinksInPath().standardizedFileURL == resolved
+            || (bundleID != nil && $0.bundleID == bundleID)
+    }
 }
 
 /// Move a managed app onto the user's screen and stop managing it (used by `show` and the menu bar).
 /// `wait: false` (the daemon's menu) never blocks the daemon's main thread on a CLI that holds a lock.
-/// Callers check ownership (the CLI goes through `managedApp`); this locks the record's owning session.
-func handOver(pid: pid_t, wait: Bool = true) throws {
+/// Callers check ownership (the CLI goes through `managedApp`) and pass the record they checked;
+/// this locks its owning session and hands over only that same process (PID, start time, owner),
+/// so a reused PID can't hand over another session's app.
+func handOver(_ record: ManagedApp, wait: Bool = true) throws {
+    let pid = record.pid
     let lifecycle = try StateLock("lifecycle.lock", nonblocking: !wait, shared: true)
     defer { lifecycle.release() }
-    guard let record = AppStore.load().first(where: { $0.pid == pid }) else { throw CLIError("pid \(pid) is not a live managed app") }
     let owner = try Locks.session(record.owner, nonblocking: !wait)
     defer { owner.release() }
-    guard AppStore.load().contains(where: { $0.pid == pid && $0.processStart == record.processStart }) else {
-        throw CLIError("pid \(pid) is not a live managed app")
-    }
+    func same(_ a: ManagedApp) -> Bool { a.pid == pid && a.processStart == record.processStart && a.owner == record.owner }
+    guard AppStore.load().contains(where: same) else { throw CLIError("pid \(pid) is not a live managed app") }
     guard let target = userDisplayBounds().first else { throw CLIError("no user display available for handoff") }
-    guard let app = NSRunningApplication(processIdentifier: pid) else { throw CLIError("app \(pid) is gone") }
-    try AppStore.remove(pid)
+    guard let app = NSRunningApplication(processIdentifier: pid), record.matchesProcess else { throw CLIError("app \(pid) is gone") }
+    try AppStore.update { $0.removeAll(where: same) }
     pump(0.2) // the daemon re-reads the app list on change; give it a beat so it stops pulling windows back
     for (i, w) in axApp(pid).windows.enumerated() {
         let size = w.size ?? CGSize(width: 600, height: 400)

@@ -59,6 +59,14 @@ backstage quit                          # always clean up; `backstage stop` quit
   with `--env K=V`.
 - **Seeing:** prefer `tree`/`find` for structure and text, and `screenshot` for visual checks.
   Re-run `tree`/`find` after the UI changes, because refs can go stale.
+- **Retina:** the display renders at 2x. A screenshot is 1 pixel per point by default;
+  `--scale 2` gives full detail (then pass `--scale 2` to `click`, or halve the pixel).
+- **Full-display shots:** `backstage window fill` makes the window cover the display (below its
+  menu bar); `backstage window size 1280 800` sets an exact size in points.
+- **Recording:** to record 10 s of the agent display, run
+  `screencapture -x -v -V 10 -D "$(backstage status | jq .daemon.screencaptureDisplay)" out.mov`
+  (`-x` keeps it silent). It captures the whole agent display, including other sessions'
+  windows. Never record or capture the user's own screens.
 - **Acting:** `press`/`set`/`menu` are the most reliable. Use coordinate `click`/`drag`/`scroll`
   for custom-drawn views. `hover` is best-effort: tooltips won't appear.
 - **Several apps:** commands target your most recent launch. Pass `--pid P` (from
@@ -67,10 +75,11 @@ backstage quit                          # always clean up; `backstage stop` quit
   apps it launched (its own `list`, default target, logs and screenshots). Another
   session's PID or ref is an error, and `backstage stop` only quits your own apps. Never use
   `stop --all` unless the user asks: it quits every agent's apps.
-- **Subagents:** Claude Code subagents share their parent's session. If you're a subagent
-  launching your own apps, or you start subagents that do, give each its own session by
-  prefixing every command: `BACKSTAGE_SESSION=<unique-name> backstage …`. Use the prefix on
-  every call; `export` doesn't carry over to the next command.
+- **Subagents:** Claude Code subagents share their parent's session (Codex subagents get
+  their own). If you're a subagent launching your own apps, or you start subagents that do,
+  give each its own session by prefixing every command:
+  `BACKSTAGE_SESSION=<unique-name> backstage …`. Use the prefix on every call; `export`
+  doesn't carry over to the next command.
 - **Output** is JSON on stdout. Errors come back as `{"ok": false, "error": …}` with exit status 1
   and say what to do next.
 
@@ -79,6 +88,12 @@ backstage quit                          # always clean up; `backstage stop` quit
 - Apps launch as a fresh instance (`-n`), so the user's own copy is untouched. Single-instance
   apps that hand off to an existing copy (Safari, Mail) don't suit this.
 - A launched app appears in the user's Dock and ⌘-Tab, like any running app. Quit it when done.
+- All instances of an app (the user's and other agents') share its preferences and app data.
+  Don't rely on per-instance settings, and expect settings another instance changed.
+- The clipboard is shared with the user and other agents. Put text in with `set`/`type`, not
+  cmd+C/cmd+V.
+- An open menu (`click --right`, a pop-up button) can be closed by the user's clicks at any
+  time: if it's gone, open it again. Close menus you no longer need (`key esc`).
 - Web pages: for your own checks use a headless browser or HTTP. Use `backstage show <url>`
   only if the user wants it open in front of them.
 - If `backstage doctor` reports missing permissions, tell the user what to grant. The host

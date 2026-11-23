@@ -41,6 +41,19 @@ struct DaemonInfo: Codable {
     var x: Double, y: Double, width: Double, height: Double
     var startedAt: Double
     var processStart: UInt64? = nil
+    /// The CLI/daemon protocol, bumped when they stop understanding each other's locks or
+    /// records. Absent before sessions existed (protocol 1).
+    var `protocol`: Int? = nil
+    /// The daemon has been asked to shut down (SIGTERM, display lost) and is waiting to quit
+    /// its apps. Launches wait for it to exit and start a fresh daemon instead of using it.
+    var stopping: Bool? = nil
+    /// Where the display's size came from: "main display" or "env" (BACKSTAGE_WIDTH/HEIGHT).
+    var sizeSource: String? = nil
+    /// The daemon's input guard (InputGuard.swift) is running. Input commands refuse without it.
+    var inputGuard: Bool? = nil
+
+    static let currentProtocol = 2
+    var protocolMismatch: Bool { (self.protocol ?? 1) != DaemonInfo.currentProtocol }
     var matchesProcess: Bool {
         guard let start = processBirth(pid) else { return false }
         if let processStart { return start == processStart }
@@ -118,15 +131,30 @@ final class StateLock {
         let url = Paths.dir.appendingPathComponent(name)
         try Paths.ensureDirectory(url.deletingLastPathComponent())
         let path = url.path
-        let descriptor = open(path, O_CREAT | O_RDWR | O_CLOEXEC, 0o600)
-        guard descriptor >= 0 else { throw CLIError("cannot open lock at " + path) }
-        while flock(descriptor, (shared ? LOCK_SH : LOCK_EX) | (nonblocking ? LOCK_NB : 0)) != 0 {
-            if errno == EINTR { continue }
-            let error = errno
+        while true {
+            let descriptor = open(path, O_CREAT | O_RDWR | O_CLOEXEC, 0o600)
+            guard descriptor >= 0 else { throw CLIError("cannot open lock at " + path) }
+            while flock(descriptor, (shared ? LOCK_SH : LOCK_EX) | (nonblocking ? LOCK_NB : 0)) != 0 {
+                if errno == EINTR { continue }
+                let error = errno
+                close(descriptor)
+                throw POSIXError(POSIXErrorCode(rawValue: error) ?? .EIO)
+            }
+            // Lock files of dead apps and old sessions are pruned (unlinked under the lock). If
+            // that happened while this waited, the lock is on an orphaned file: start over.
+            var held = stat(), current = stat()
+            if fstat(descriptor, &held) == 0, stat(path, &current) == 0,
+               held.st_dev == current.st_dev, held.st_ino == current.st_ino {
+                fd = descriptor
+                return
+            }
             close(descriptor)
-            throw POSIXError(POSIXErrorCode(rawValue: error) ?? .EIO)
         }
-        fd = descriptor
+    }
+
+    /// True if the error is a non-blocking lock attempt finding the lock held.
+    static func isBusy(_ error: Error) -> Bool {
+        (error as? POSIXError).map { $0.code.rawValue == EWOULDBLOCK } ?? false
     }
 
     func release() {

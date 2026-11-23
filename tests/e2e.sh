@@ -106,6 +106,12 @@ waitlog "pad right click" && pass "right click opened context menu" || fail "rig
 "$BS" screenshot $A -o "$WORK/menu.png" >/dev/null
 "$BS" key esc $A >/dev/null
 waitlog "context menu closed" && pass "esc closed context menu" || fail "esc closed context menu"
+# A --scale 2 screenshot pixel is (2x, 2y) for point (x, y): the same click, given in 2x pixels.
+CLICKS=$(grep -c "pad click" "$LOG")
+"$BS" click $(( $1 * 2 )) $(( $2 * 2 )) --scale 2 $A >/dev/null
+waitlog "pad click $(( CLICKS + 1 )) " \
+    && [[ $(grep -o "pad click $(( CLICKS + 1 )) at [0-9,]*" "$LOG" | cut -d' ' -f5) == $(grep -o "pad click 1 at [0-9,]*" "$LOG" | cut -d' ' -f5) ]] \
+    && pass "click --scale 2 at 2x pixels hit the same point" || fail "click --scale 2"
 
 echo "== type + key"
 "$BS" set "$FIELD" "hello" $A >/dev/null
@@ -143,6 +149,7 @@ PYTHON
 )
 "$BS" screenshot $A --window "$MAIN_REF" --scale 0.5 -o "$WORK/scaled.png" > "$WORK/scaled.json"
 "$BS" screenshot $A --window "$MAIN_REF" -o "$WORK/window.jpg" > "$WORK/window.json"
+"$BS" screenshot $A --window "$MAIN_REF" --scale 2 -o "$WORK/retina.png" > "$WORK/retina.json"
 "$BS" screenshot --full -o "$WORK/full.png" > "$WORK/full.json"
 python3 - "$WORK" <<'PYTHON'
 import json, pathlib, re, subprocess, sys
@@ -151,7 +158,15 @@ def record(name):
     return json.loads((work / (name + ".json")).read_text())
 frame = next(w["frame"] for w in record("windows")["windows"] if w["title"] == "BackstageTestApp")
 display = record("live-status")["daemon"]["size"]
-for name, extension, scale, bounds in [("scaled", "png", 0.5, frame), ("window", "jpg", 1, frame), ("full", "png", 1, display)]:
+# The agent display is Retina unless BACKSTAGE_SCALE=1: same points, twice the pixels.
+daemon = record("live-status")["daemon"]
+backing = int(__import__("os").environ.get("BACKSTAGE_SCALE", "2"))
+assert daemon["scale"] == backing and daemon["pixels"] == {"w": display["w"] * backing, "h": display["h"] * backing}, daemon
+# Its size in points is the main display's, unless BACKSTAGE_WIDTH/HEIGHT set one.
+env = __import__("os").environ
+assert daemon["sizeSource"] == ("env" if "BACKSTAGE_WIDTH" in env or "BACKSTAGE_HEIGHT" in env else "main display"), daemon
+for name, extension, scale, bounds in [("scaled", "png", 0.5, frame), ("window", "jpg", 1, frame), ("retina", "png", 2, frame),
+                                       ("full", "png", 1, display)]:
     path = work / (name + "." + extension)
     signature = b"\x89PNG\r\n\x1a\n" if extension == "png" else b"\xff\xd8\xff"
     with path.open("rb") as image:
@@ -163,7 +178,29 @@ for name, extension, scale, bounds in [("scaled", "png", 0.5, frame), ("window",
     assert dimensions == expected == (result["width"], result["height"]), (path, dimensions, expected, result)
     assert result["scale"] == scale and pathlib.Path(result["path"]).samefile(path), result
 PYTHON
-pass "scaled PNG, window JPEG, and full display PNG match expected dimensions"
+pass "display is ${BACKSTAGE_SCALE:-2}x; scaled PNG, window JPEG, 2x PNG and full display PNG match expected dimensions"
+
+echo "== window size / fill"
+"$BS" window size 600 420 --window "$MAIN_REF" $A > "$WORK/wsize.json"
+"$BS" window fill --window "$MAIN_REF" $A > "$WORK/wfill.json"
+"$BS" screenshot $A --scale 2 -o "$WORK/filled.png" > "$WORK/filled.json"
+python3 - "$WORK" <<'PYTHON'
+import json, pathlib, sys
+work = pathlib.Path(sys.argv[1])
+record = lambda name: json.loads((work / (name + ".json")).read_text())
+display = record("live-status")["daemon"]["size"]
+size, fill, shot = record("wsize"), record("wfill"), record("filled")
+assert size["ok"] and "note" not in size and (size["frame"]["w"], size["frame"]["h"]) == (600, 420), size
+f = fill["frame"]
+# The whole display below its own menu bar.
+assert fill["ok"] and "note" not in fill and f["x"] == 0 and 0 < f["y"] < 60 and f["w"] == display["w"] \
+    and f["y"] + f["h"] == display["h"], fill
+# A default screenshot runs from (0,0) to the window's bottom-right corner: the whole display.
+assert (shot["width"], shot["height"]) == (display["w"] * 2, display["h"] * 2), shot
+PYTHON
+pass "window size 600x420, then fill: $(jq -c .frame "$WORK/wfill.json")"
+if BACKSTAGE_SESSION=e2e-other "$BS" window fill $A > "$WORK/wforeign.json"; then fail "another session resized our window"
+else grep -q "another backstage session" "$WORK/wforeign.json" && pass "window fill refuses another session's app" || fail "window fill (foreign)"; fi
 
 echo "== logs"
 "$BS" logs $A | grep -q "fixture stdout hello" && pass "logs captured app stdout" || fail "logs"

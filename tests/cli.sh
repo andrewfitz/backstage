@@ -42,6 +42,14 @@ reject 'timeout' wait --text ready --timeout inf
 reject 'env' launch fixture --env MISSING_VALUE
 reject 'pid' stop --pid "$child"
 reject 'selector' screenshot --full --pid "$child"
+reject 'usage: backstage window' window
+reject 'usage: backstage window' window maximize
+reject 'arguments' window fill 10
+reject 'arguments' window size 800
+reject 'width and height' window size 800 0
+reject 'width and height' window size 800 inf
+reject 'not an option' window fill --scale 2
+reject 'managed' window fill --pid "$child"
 reject 'managed' quit --force --pid "$child"
 kill -0 "$child"
 
@@ -91,8 +99,100 @@ PYTHON
 for n in 1 2 3; do check_tail "$n"; done
 : > "$work/log"
 check_tail 3
+
+# A daemon from another backstage version (no protocol field) that still has apps is refused
+# with a way out, and isn't touched. `windows` only reads state, so a bug here can't start a
+# real daemon.
+jq -n --argjson pid "$child" --argjson birth "$birth" \
+    '{pid:$pid,displayID:1,x:0,y:0,width:1,height:1,startedAt:now,processStart:$birth}' > "$BACKSTAGE_HOME/daemon.json"
+reject 'older version.*stop --all' windows
+kill -0 "$child"
+rm "$BACKSTAGE_HOME/daemon.json"
+
+# Session derivation. Results mustn't depend on the agent (if any) running this script, so
+# agent variables are scrubbed, and fake agents are copies of a spawn-and-wait helper.
+unset BACKSTAGE_SESSION
+scrub=(env -u CLAUDE_CODE_SESSION_ID -u CLAUDE_PID -u CODEX_THREAD_ID -u GROK_SESSION_ID)
+cat > "$work/spawn.c" <<'C'
+#include <spawn.h>
+#include <string.h>
+#include <sys/wait.h>
+extern char **environ;
+int main(int argc, char **argv) {
+    int i = 1, status;
+    pid_t pid;
+    while (i < argc && strcmp(argv[i], "--")) i++;
+    if (i + 1 >= argc || posix_spawnp(&pid, argv[i + 1], NULL, NULL, argv + i + 1, environ)) return 127;
+    waitpid(pid, &status, 0);
+    return WIFEXITED(status) ? WEXITSTATUS(status) : 1;
+}
+C
+xcrun clang "$work/spawn.c" -o "$work/spawn"
+mkdir -p "$work/agents" "$work/pkg/gemini"
+for name in codex claude node; do cp "$work/spawn" "$work/agents/$name"; done
+expect_session() {
+    local pattern=$1
+    shift
+    "$@" > "$work/session"
+    if ! jq -e --arg pattern "$pattern" '.session.id | test($pattern)' "$work/session" >/dev/null; then
+        echo "Expected a session matching '$pattern' for $*" >&2
+        cat "$work/session" >&2
+        exit 1
+    fi
+}
+# An agent's variable counts only if that agent set it rather than inheriting it.
+expect_session '^codex:inner$' "${scrub[@]}" "$work/agents/codex" -- env CODEX_THREAD_ID=inner "$bin" status
+expect_session '^codex:[0-9]+-[0-9]+$' "${scrub[@]}" CODEX_THREAD_ID=outer "$work/agents/codex" -- "$bin" status
+expect_session '^claude:mine$' "${scrub[@]}" "$work/agents/claude" -- env CLAUDE_CODE_SESSION_ID=mine "$bin" status
+expect_session '^claude:[0-9]+-[0-9]+$' "${scrub[@]}" CLAUDE_CODE_SESSION_ID=outer "$work/agents/claude" -- "$bin" status
+# An outer agent's variable never reaches a nested agent of another kind.
+expect_session '^codex:[0-9]+-[0-9]+$' "${scrub[@]}" CLAUDE_CODE_SESSION_ID=outer "$work/agents/codex" -- "$bin" status
+# An agent run by an interpreter is recognised from its arguments, and the nearest agent wins.
+expect_session '^gemini:[0-9]+-[0-9]+$' "${scrub[@]}" CLAUDE_CODE_SESSION_ID=outer \
+    "$work/agents/claude" -- "$work/agents/node" "$work/pkg/gemini/cli.js" -- "$bin" status
+
+# A caller whose parent has exited is reparented to launchd. That is never a session key: only
+# a single agent variable is used as is; otherwise it's an error naming BACKSTAGE_SESSION.
+detached() {
+    rm -f "$work/detached"
+    ( (sleep 0.3; exec "$@" > "$work/detached") & )
+    for _ in $(seq 1 100); do
+        jq -e . "$work/detached" >/dev/null 2>&1 && return
+        sleep 0.1
+    done
+    echo "No output from detached $*" >&2
+    exit 1
+}
+detached "${scrub[@]}" "$bin" list
+jq -e '.ok == false and (.error | test("BACKSTAGE_SESSION"))' "$work/detached" >/dev/null
+detached "${scrub[@]}" CODEX_THREAD_ID=lone "$bin" status
+jq -e '.session.id == "codex:lone"' "$work/detached" >/dev/null
+detached "${scrub[@]}" CODEX_THREAD_ID=one CLAUDE_CODE_SESSION_ID=two "$bin" list
+jq -e '.ok == false and (.error | test("BACKSTAGE_SESSION"))' "$work/detached" >/dev/null
+
+# No agent, in a terminal: the terminal session (a tab or tmux pane) is one session, another
+# terminal is another. `script` gives a detached command a fresh terminal session.
+in_terminal() {
+    rm -f "$work/tty.$1."*
+    ( (exec "${scrub[@]}" script -q /dev/null bash -c '"$1" status > "$2.1"; "$1" status > "$2.2"' _ "$bin" "$work/tty.$1" \
+        < /dev/null > /dev/null 2>&1) & )
+    for _ in $(seq 1 100); do
+        jq -e . "$work/tty.$1.2" >/dev/null 2>&1 && return
+        sleep 0.1
+    done
+    echo "No output from terminal session $1" >&2
+    exit 1
+}
+in_terminal a
+in_terminal b
+jq -e '.session.from == "terminal session" and (.session.id | test("^tty:[0-9]+-[0-9]+$"))' "$work/tty.a.1" >/dev/null
+[[ $(jq -r .session.id "$work/tty.a.1") == $(jq -r .session.id "$work/tty.a.2") ]]
+[[ $(jq -r .session.id "$work/tty.a.1") != $(jq -r .session.id "$work/tty.b.1") ]]
+
 # A managed, windowless process can lack an AppKit application handle.
 "$bin" quit --force --pid "$child" | jq -e '.ok == true' >/dev/null
 wait "$child" 2>/dev/null || :
 child=
+# The input guard's classifier (InputGuard.swift), on constructed events that are never posted.
+"$bin" __guard-selftest | jq -e '.ok == true and .cases >= 12' >/dev/null
 echo "CLI regression checks passed"

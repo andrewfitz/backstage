@@ -17,21 +17,42 @@ func placeOnAgentDisplay(_ w: AXUIElement, display b: CGRect, slot: Int) {
     w.setPosition(CGPoint(x: b.minX + x, y: b.minY + y))
 }
 
-/// Place a newly appeared window to the right of everything already on the agent display
-/// (so it doesn't hide other windows from screenshots); cascade if there's no room.
-func placeBeside(_ w: AXUIElement, display b: CGRect) {
+/// Place a window in the first free spot on the agent display, so windows of different apps
+/// (and sessions) don't overlap; cascade if nothing fits. `avoiding` adds rects that aren't on
+/// screen yet, such as windows of the same hidden app placed just before. Returns the frame.
+/// Two launches placing at the same moment can still pick the same spot (each other's windows
+/// are hidden); that overlap is harmless for capture and input.
+@discardableResult
+func placeBeside(_ w: AXUIElement, display b: CGRect, avoiding: [CGRect] = []) -> CGRect {
     let me = w.windowID
     let occupied = onscreenWindows()
         .filter { ($0[kCGWindowLayer as String] as? Int) == 0 && ($0[kCGWindowNumber as String] as? CGWindowID) != me }
         .map(cgBounds)
-        .filter { b.intersects($0) && $0.width > 50 && $0.height > 50 }
+        // Only windows mostly on the agent display count: not ones that just overlap its edge.
+        .filter { $0.width > 50 && $0.height > 50 && b.intersection($0).width * b.intersection($0).height >= $0.width * $0.height / 2 }
+        .map { b.intersection($0) } + avoiding
     let size = w.size ?? CGSize(width: 400, height: 300)
-    let x = max((occupied.map { $0.maxX }.max() ?? b.minX) + 20, b.minX + 40)
-    if x + size.width <= b.maxX - 10, size.height <= b.height - 70 {
-        w.setPosition(CGPoint(x: x, y: b.minY + 60))
-    } else {
-        placeOnAgentDisplay(w, display: b, slot: occupied.count)
+    if let spot = freeSpot(size, occupied: occupied, display: b) {
+        w.setPosition(spot)
+        return CGRect(origin: spot, size: size)
     }
+    placeOnAgentDisplay(w, display: b, slot: occupied.count)
+    return w.frame ?? CGRect(origin: b.origin, size: size)
+}
+
+/// First-fit: rows top to bottom, then left to right, with candidate edges taken from the
+/// windows already there. Nil when the display is full.
+func freeSpot(_ size: CGSize, occupied: [CGRect], display b: CGRect) -> CGPoint? {
+    let gap: CGFloat = 20, left = b.minX + 40, top = b.minY + 60
+    let xs = Set([left] + occupied.map { $0.maxX + gap }).filter { $0 >= left && $0 + size.width <= b.maxX - 10 }.sorted()
+    let ys = Set([top] + occupied.map { $0.maxY + gap }).filter { $0 >= top && $0 + size.height <= b.maxY - 10 }.sorted()
+    for y in ys {
+        for x in xs {
+            let spot = CGRect(x: x, y: y, width: size.width, height: size.height).insetBy(dx: -gap / 2, dy: -gap / 2)
+            if !occupied.contains(where: { $0.intersects(spot) }) { return CGPoint(x: x, y: y) }
+        }
+    }
+    return nil
 }
 
 /// Move every window of `pid` that is not already on the agent display onto it.
@@ -61,20 +82,34 @@ final class Daemon {
     var signalSources: [DispatchSourceSignal] = []
     var statusMenu: StatusMenu?
     var nextMenuUpdate = 0.0
+    let sizeSource: String
+    let inputGuard = InputGuard()
+    var inputGuardUp = false
 
     init() throws {
         owner = try StateLock("daemon.lock", nonblocking: true)
         let env = ProcessInfo.processInfo.environment
-        guard let w = UInt32(env["BACKSTAGE_WIDTH"] ?? "1920"), w > 0,
-              let h = UInt32(env["BACKSTAGE_HEIGHT"] ?? "1200"), h > 0 else {
+        // By default the agent display has the main display's size in points, so screenshots have
+        // the user's aspect ratio. It's read once, here: if the user's displays change later
+        // (another monitor, a new resolution), the live display keeps its size until a restart.
+        let main = mainDisplaySize()
+        func points(_ v: CGFloat?, _ fallback: Int) -> String { String(v.map { Int($0.rounded()) } ?? fallback) }
+        guard let w = UInt32(env["BACKSTAGE_WIDTH"] ?? points(main?.width, 1920)), w > 0,
+              let h = UInt32(env["BACKSTAGE_HEIGHT"] ?? points(main?.height, 1200)), h > 0 else {
             throw CLIError("BACKSTAGE_WIDTH and BACKSTAGE_HEIGHT must be positive integers")
         }
+        sizeSource = env["BACKSTAGE_WIDTH"] != nil || env["BACKSTAGE_HEIGHT"] != nil ? "env" : main != nil ? "main display" : "default"
+        // Retina (2x) by default: same size in points, twice the pixels. BACKSTAGE_SCALE=1 opts out.
+        guard let scale = UInt32(env["BACKSTAGE_SCALE"] ?? "2"), scale == 1 || scale == 2 else {
+            throw CLIError("BACKSTAGE_SCALE must be 1 or 2")
+        }
+        guard w <= 8192, h <= 8192 else { throw CLIError("BACKSTAGE_WIDTH and BACKSTAGE_HEIGHT must be at most 8192 points") }
         guard let timeout = Double(env["BACKSTAGE_IDLE_TIMEOUT"] ?? "1800"),
               timeout.isFinite, timeout >= 0, timeout < Double(Int.max) else {
             throw CLIError("BACKSTAGE_IDLE_TIMEOUT must be a finite nonnegative number of seconds")
         }
         idleTimeout = timeout
-        display = try AgentDisplay(width: w, height: h)
+        display = try AgentDisplay(width: w, height: h, scale: scale)
     }
 
     func log(_ s: String) {
@@ -84,10 +119,14 @@ final class Daemon {
     }
 
     func run() throws -> Never {
-        // Wait for the display to come online, then park it.
-        guard waitFor(timeout: 5, { activeDisplays().contains(display.id) ? true : nil }) != nil, display.park() else {
-            throw CLIError("could not bring the agent display online and park it")
+        // Wait for the display to come online, give it its mode (Retina or 1x), then park it.
+        guard waitFor(timeout: 5, { activeDisplays().contains(display.id) ? true : nil }) != nil else {
+            throw CLIError("could not bring the agent display online")
         }
+        guard display.selectMode() else {
+            throw CLIError("could not set the agent display to \(display.size.width)x\(display.size.height) points at \(display.size.scale)x")
+        }
+        guard display.park() else { throw CLIError("could not park the agent display") }
         pump(0.5)
         screens = userDisplayBounds()
 
@@ -99,8 +138,12 @@ final class Daemon {
                 if let back = self.lastUserApp, !back.isTerminated { back.activate() }
             } else {
                 self.lastUserApp = app
+                self.inputGuard.update(managed: self.managed, userPid: app.processIdentifier)
             }
         }
+        // Keep the user's input out of managed apps (an open menu takes the keyboard focus).
+        inputGuard.update(managed: managed, userPid: lastUserApp?.processIdentifier ?? 0)
+        inputGuardUp = inputGuard.start()
         // Monitor arrangement changes (user plugs in a screen): re-park.
         CGDisplayRegisterReconfigurationCallback({ _, flags, _ in
             if flags.contains(.beginConfigurationFlag) { return }
@@ -117,13 +160,20 @@ final class Daemon {
 
         try writeInfo()
         log("daemon up pid=\(getpid()) display=\(display.id) bounds=\(display.bounds)")
+        log(inputGuardUp ? "input guard up" : "input guard unavailable (event tap refused; Accessibility not granted?): input commands will refuse to run")
         // Menu bar indicator: the daemon runs as an accessory app (no Dock icon, never activates).
         if ProcessInfo.processInfo.environment["BACKSTAGE_MENUBAR"] != "off" {
             NSApplication.shared.setActivationPolicy(.accessory)
             statusMenu = StatusMenu(daemon: self)
         }
         let timer = Timer(timeInterval: 0.05, repeats: true) { [weak self] _ in
-            autoreleasepool { self?.tick() }
+            autoreleasepool {
+                let started = ProcessInfo.processInfo.systemUptime
+                self?.tick()
+                // While a tick runs, nothing guards windows or the cursor: report long ones.
+                let took = ProcessInfo.processInfo.systemUptime - started
+                if took > 0.5 { self?.log(String(format: "slow tick: %.2fs", took)) }
+            }
         }
         RunLoop.main.add(timer, forMode: .common)   // keep guarding windows while a menu is open
         if statusMenu != nil { NSApplication.shared.run() } else { RunLoop.main.run() }
@@ -156,9 +206,22 @@ final class Daemon {
         do { try writeInfo() } catch { log("cannot update display state: \(error)") }
     }
 
+    /// Set once a shutdown is requested (not for idle ones), and published in daemon.json so a
+    /// launch starts a fresh daemon instead of registering an app with this one.
+    var shutdownRequested = false
+
     func writeInfo() throws {
         let b = display.bounds
-        try writeJSON(Paths.daemon, DaemonInfo(pid: getpid(), displayID: display.id, x: b.minX, y: b.minY, width: b.width, height: b.height, startedAt: startedAt, processStart: processBirth(getpid())))
+        try writeJSON(Paths.daemon, DaemonInfo(pid: getpid(), displayID: display.id, x: b.minX, y: b.minY, width: b.width, height: b.height,
+                                               startedAt: startedAt, processStart: processBirth(getpid()),
+                                               protocol: DaemonInfo.currentProtocol, stopping: shutdownRequested ? true : nil,
+                                               sizeSource: sizeSource, inputGuard: inputGuardUp))
+    }
+
+    func markShutdown(_ requested: Bool) {
+        guard shutdownRequested != requested else { return }
+        shutdownRequested = requested
+        do { try writeInfo() } catch { log("cannot update display state: \(error)") }
     }
 
     // Each registry update atomically replaces the file. Read and decode it only after replacement.
@@ -193,7 +256,9 @@ final class Daemon {
         nextReload = now + 0.25
         registry.removeAll { !$0.matchesProcess }
         managed = Set(registry.map { $0.pid })
-        for pid in managed where observers[pid] == nil { observe(pid) }
+        inputGuard.update(managed: managed, userPid: lastUserApp?.processIdentifier ?? 0)
+        for pid in managed where observers[pid] == nil && now >= observeAfter[pid, default: 0] { observe(pid, now: now) }
+        observeAfter = observeAfter.filter { managed.contains($0.key) }
         for pid in observers.keys where !managed.contains(pid) {
             if let o = observers.removeValue(forKey: pid) {
                 CFRunLoopRemoveSource(CFRunLoopGetMain(), AXObserverGetRunLoopSource(o), .defaultMode)
@@ -202,8 +267,9 @@ final class Daemon {
     }
 
     var observers: [pid_t: AXObserver] = [:]
+    var observeAfter: [pid_t: Double] = [:]
 
-    func observe(_ pid: pid_t) {
+    func observe(_ pid: pid_t, now: Double) {
         var obs: AXObserver?
         let cb: AXObserverCallback = { _, element, _, _ in
             guard let d = Daemon.shared, !d.stopping else { return }
@@ -211,9 +277,13 @@ final class Daemon {
         }
         guard AXObserverCreate(pid, cb, &obs) == .success, let obs else { return }
         let app = axApp(pid)
-        // Registration fails while the app is still starting up; retry on a later tick until it sticks.
+        // Registration fails while the app is still starting up; retry until it sticks. An app
+        // whose main thread is busy (a slow launch) doesn't answer, and this runs on the guard
+        // loop: wait briefly, and retry at most once a second, so the loop never stalls.
+        AXUIElementSetMessagingTimeout(app, 0.1)
         let rc = AXObserverAddNotification(obs, app, kAXWindowCreatedNotification as CFString, nil)
-        guard rc == .success || rc == .notificationAlreadyRegistered else { return }
+        guard rc == .success || rc == .notificationAlreadyRegistered else { observeAfter[pid] = now + 1; return }
+        AXUIElementSetMessagingTimeout(app, 3)
         for n in [kAXFocusedWindowChangedNotification, kAXMainWindowChangedNotification, kAXWindowMovedNotification] {
             AXObserverAddNotification(obs, app, n as CFString, nil)
         }
@@ -238,12 +308,30 @@ final class Daemon {
 
     var nextReload = 0.0
     var pendingShutdown: String?
+    var nextReap = 0.0
+    var launchesPending = false
+    var orphanSince: [String: Double] = [:]
 
+    func registered(_ pid: pid_t, _ birth: UInt64) -> Bool {
+        AppStore.load().contains { $0.pid == pid && $0.processStart == birth }
+    }
+
+    /// Once a second: quit apps whose launch died before registering them (see LaunchRecord).
+    func reapLaunches(now: Double) {
+        guard now >= nextReap else { return }
+        nextReap = now + 1
+        reapOrphanLaunches(deadSince: &orphanSince, registered: registered, log: log)
+        launchesPending = !Launching.records().isEmpty
+    }
+
+    var nextGuardLog = 0.0
     func tick() {
         guard !stopping else { return }
         let now = ProcessInfo.processInfo.systemUptime
         if let reason = pendingShutdown { shutdown(reason: reason); return }
         reloadManaged(now: now)
+        reapLaunches(now: now)
+        if now >= nextGuardLog { nextGuardLog = now + 1; inputGuard.logActivity(log) }
         if let m = statusMenu, now >= nextMenuUpdate {
             nextMenuUpdate = now + 0.5
             m.update(apps: managed.count)
@@ -263,6 +351,8 @@ final class Daemon {
                 let n = adoptWindows(pid: pid, display: b, slotBase: Int(pid % 5))
                 if n > 0 { log("moved \(n) window(s) of pid \(pid) to agent display") }
             }
+        } else if launchesPending {
+            idleSince = ProcessInfo.processInfo.systemUptime
         } else if managed.isEmpty && !registryUnreadable && now - idleSince > idleTimeout {
             shutdown(reason: "idle for \(Int(idleTimeout))s with no managed apps")
         }
@@ -280,9 +370,14 @@ final class Daemon {
 
     func shutdown(reason: String) {
         guard !stopping else { return }
-        // A launch holds lifecycle.lock (shared) until its app is registered; never tear down under one.
-        guard let lifecycle = try? StateLock("lifecycle.lock", nonblocking: true) else { pendingShutdown = reason; return }
-        defer { withExtendedLifetime(lifecycle) {} }
+        let idle = reason.hasPrefix("idle ")
+        // From now on, new launches wait for this daemon to exit and start a fresh one.
+        if !idle { markShutdown(true) }
+        // A launch holds lifecycle.lock (shared) until its app is registered; never tear down
+        // under one. Older CLIs (protocol 1) held session.lock for the same purpose.
+        guard let lifecycle = try? StateLock("lifecycle.lock", nonblocking: true),
+              let legacyLifecycle = try? StateLock("session.lock", nonblocking: true) else { pendingShutdown = reason; return }
+        defer { withExtendedLifetime((lifecycle, legacyLifecycle)) {} }
         pendingShutdown = nil
         let records: [ManagedApp]
         do {
@@ -290,17 +385,22 @@ final class Daemon {
         } catch {
             registryUnreadable = true
             log("retaining display because the app registry could not be read: \(error)")
+            markShutdown(false)
             return
         }
-        if reason.hasPrefix("idle "), !records.isEmpty {
+        if idle, !records.isEmpty || !Launching.records().isEmpty {
             idleSince = ProcessInfo.processInfo.systemUptime
             return
         }
         stopping = true
         log("shutting down: \(reason)")
+        // No launch can be running (lifecycle.lock is ours), so every provisional record is an
+        // orphan: quit what it started before the display goes.
+        let orphans = reapOrphanLaunches(deadSince: &orphanSince, registered: { _, _ in false }, final: true, log: log)
         for record in records {
             do { try record.requestTermination(force: false) } catch { log("quit pid \(record.pid): \(error)") }
         }
+        _ = waitFor(timeout: 2) { orphans.contains { processAlive($0) } ? nil : true }
         _ = waitFor(timeout: 3) { records.contains { $0.matchesProcess } ? nil : true }
         for record in records where record.matchesProcess {
             do { try record.requestTermination(force: true) } catch { log("force quit pid \(record.pid): \(error)") }
@@ -317,9 +417,11 @@ final class Daemon {
             stopping = false
             idleSince = ProcessInfo.processInfo.systemUptime
             log("retaining display: \(error)")
+            markShutdown(false)
             return
         }
         try? FileManager.default.removeItem(at: Paths.daemon)
+        inputGuard.logActivity(log, force: true)
         log("bye")
         exit(0)
     }
@@ -339,8 +441,44 @@ func ensureDaemon() throws -> DaemonInfo {
 func beginLaunch() throws -> (info: DaemonInfo, lifecycle: StateLock) {
     let client = try StateLock("client.lock")
     defer { client.release() }
-    let lifecycle = try StateLock("lifecycle.lock", shared: true)
-    return (try startDaemon(), lifecycle)
+    for _ in 0..<3 {
+        // A daemon on its way out needs lifecycle.lock exclusively, so wait for it unlocked.
+        try settleDaemon()
+        let lifecycle = try StateLock("lifecycle.lock", shared: true)
+        // Asked to stop after settleDaemon looked (its shutdown waits on another launch): retry.
+        if let d = readJSON(Paths.daemon, DaemonInfo.self), d.matchesProcess, d.stopping == true || d.protocolMismatch {
+            lifecycle.release()
+            continue
+        }
+        return (try startDaemon(), lifecycle)
+    }
+    throw CLIError("the backstage daemon kept shutting down while this launch waited; try again")
+}
+
+/// Commands that need the daemon refuse one from another backstage version: it doesn't know
+/// sessions or this version's locks, and its registry writes drop sessions' ownership.
+func daemonVersionError(_ d: DaemonInfo) -> CLIError {
+    let which = (d.protocol ?? 1) < DaemonInfo.currentProtocol ? "an older" : "a newer"
+    return CLIError("the running backstage daemon (pid \(d.pid)) is from \(which) version of backstage; "
+        + "run `backstage stop --all` (quits every managed app) to replace it, then retry")
+}
+
+/// With client.lock held and lifecycle.lock not: wait for a stopping daemon to exit, and replace
+/// an idle daemon from another version (one with apps is refused).
+private func settleDaemon() throws {
+    guard let d = readJSON(Paths.daemon, DaemonInfo.self), d.matchesProcess else { return }
+    if d.stopping != true {
+        guard d.protocolMismatch else { return }
+        guard try AppStore.read().isEmpty, Launching.records().isEmpty else { throw daemonVersionError(d) }
+        guard kill(d.pid, SIGTERM) == 0 || errno == ESRCH else { throw CLIError("failed to signal the old daemon (pid \(d.pid))") }
+    }
+    // Done when it exits, or when it gives up shutting down (an app wouldn't quit) and clears the flag.
+    let gone = waitFor(timeout: 30) {
+        !d.matchesProcess || (d.stopping == true && readJSON(Paths.daemon, DaemonInfo.self)?.stopping != true) ? true : nil
+    }
+    guard gone != nil else {
+        throw CLIError("the backstage daemon (pid \(d.pid)) is shutting down but hasn't exited after 30s; try again, or see \(Paths.log.path)")
+    }
 }
 
 private func startDaemon() throws -> DaemonInfo {
@@ -407,26 +545,51 @@ func stopSession() throws -> [String: Any] {
         try AppStore.update { _ in }   // prune by process identity
     }
     Locks.pruneAppLocks()
+    Locks.pruneSessionLocks()
     var result: [String: Any] = ["ok": allGone, "session": session.id, "quit": quit]
-    if !allGone { result["error"] = "some of this session's apps did not quit" }
-    result["daemon"] = try stopDaemonIfIdle()
+    var errors: [String] = []
+    if !allGone { errors.append("some of this session's apps did not quit") }
+    do {
+        result["daemon"] = try stopDaemonIfIdle(session: session.id)
+    } catch {
+        // Keep the quit list: the apps are gone even if the daemon didn't follow.
+        result["daemon"] = "error"
+        errors.append("\(error)")
+    }
+    if !errors.isEmpty {
+        result["ok"] = false
+        result["error"] = errors.joined(separator: "; ")
+    }
     return result
 }
 
-private func stopDaemonIfIdle() throws -> String {
+private func plural(_ n: Int, _ word: String) -> String { "\(n) \(word)\(n == 1 ? "" : "s")" }
+
+private func stopDaemonIfIdle(session: String) throws -> String {
     let client = try StateLock("client.lock")
     defer { client.release() }
     let daemon: DaemonInfo
     do {
-        // Exclusive: wait out launches that haven't registered their app yet. New launches
-        // can't start while client.lock is held, so the emptiness check stays true.
-        let lifecycle = try StateLock("lifecycle.lock")
+        // Exclusive, so no launch is between starting the daemon and registering its app; new
+        // launches can't start while client.lock is held, so the emptiness check stays true.
+        // Don't wait for it, though: a launch holds it shared through `open` and identifying
+        // its app (up to ~15 s), `show` while it hands an app over, and waiting here would keep
+        // client.lock, and with it every other session's launch, blocked that long. A daemon
+        // left running stops itself after its idle timeout.
+        let lifecycle: StateLock
+        do { lifecycle = try StateLock("lifecycle.lock", nonblocking: true) }
+        catch where StateLock.isBusy(error) { return "running (a launch or show is in progress in some session)" }
         defer { lifecycle.release() }
         let remaining = try AppStore.read()
         if !remaining.isEmpty {
-            return "running (\(remaining.count) app\(remaining.count == 1 ? "" : "s") in other sessions)"
+            let mine = remaining.filter { $0.session == session }.count
+            var parts: [String] = []
+            if mine > 0 { parts.append("\(plural(mine, "app")) of this session didn't quit") }
+            if remaining.count > mine { parts.append("\(plural(remaining.count - mine, "app")) in other sessions") }
+            return "running (" + parts.joined(separator: "; ") + ")"
         }
         guard let d = readJSON(Paths.daemon, DaemonInfo.self), d.matchesProcess else { return "not running" }
+        if !Launching.records().isEmpty { return "running (a launch is being cleaned up)" }
         guard kill(d.pid, SIGTERM) == 0 || errno == ESRCH else { throw CLIError("failed to signal daemon") }
         daemon = d
     }
@@ -463,6 +626,7 @@ func stopAll() throws -> [String: Any] {
         }
     }
     Locks.pruneAppLocks()
+    Locks.pruneSessionLocks()
     if daemon != nil { return ["ok": true] }
     return quit.isEmpty ? ["ok": true, "note": "daemon not running"] : ["ok": true, "quit": quit]
 }
