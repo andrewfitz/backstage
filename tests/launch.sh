@@ -4,6 +4,8 @@
 # only appears after `launch` gave up must end up registered to the session (or quit after a
 # `stop`), never left running untracked. A watchdog asserts nothing reaches the user's screens.
 set -uo pipefail
+# backstage's own tests use displays 7-8, never the ones agents use (docs/MULTI_DISPLAY_PLAN.md).
+export BACKSTAGE_DISPLAY=${BACKSTAGE_DISPLAY:-7}
 cd "$(dirname "$0")"
 ROOT="$(cd .. && pwd)"
 if [[ -z ${BACKSTAGE_BIN:-} ]]; then

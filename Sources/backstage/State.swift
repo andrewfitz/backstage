@@ -18,6 +18,7 @@ enum Paths {
     static var shots: URL { dir.appendingPathComponent("shots") }
     static var wrappers: URL { dir.appendingPathComponent("wrappers") }
     static var appLogs: URL { dir.appendingPathComponent("logs") }
+    static var requests: URL { dir.appendingPathComponent("requests") }
     static func ensureDirectory(_ url: URL) throws {
         let path = url.standardizedFileURL.path
         var result = mkdir(path, 0o700)
@@ -36,7 +37,7 @@ enum Paths {
     }
 
     static func ensure() throws {
-        for d in [dir, shots, wrappers, appLogs] { try ensureDirectory(d) }
+        for d in [dir, shots, wrappers, appLogs, requests] { try ensureDirectory(d) }
     }
 }
 
@@ -73,7 +74,12 @@ struct DaemonInfo: Codable {
     /// from before settings.
     var settingsApplied: String? = nil
 
-    static let currentProtocol = 2
+    /// Every display this daemon runs, the primary first (phase 2 of docs/MULTI_DISPLAY_PLAN.md).
+    /// The top-level displayID and bounds are the primary's.
+    var displays: [DisplayEntry]? = nil
+
+    /// 3: several displays per daemon (`displays`, ManagedApp/LaunchRecord `display`).
+    static let currentProtocol = 3
     var protocolMismatch: Bool { (self.protocol ?? 1) != DaemonInfo.currentProtocol }
     var matchesProcess: Bool {
         guard let start = processBirth(pid) else { return false }
@@ -81,6 +87,52 @@ struct DaemonInfo: Codable {
         return Double(start) / 1e6 <= startedAt && isDaemonCommand(pid)
     }
     var bounds: CGRect { CGRect(x: x, y: y, width: width, height: height) }
+
+    /// The primary display's slot (1 for the default home).
+    var primarySlot: Int { displays?.first?.slot ?? displaySlot(serial: CGDisplaySerialNumber(displayID)) ?? 1 }
+    func entry(_ slot: Int) -> DisplayEntry? { displays?.first { $0.slot == slot } }
+
+    /// This info as seen from one of its displays: displayID and bounds are that display's, so
+    /// every coordinate, crop and placement computed from it is relative to that display.
+    /// Nil if the daemon doesn't run that display.
+    func on(_ slot: Int?) -> DaemonInfo? {
+        guard let slot, slot != primarySlot else { return self }
+        guard let e = entry(slot) else { return nil }
+        var v = self
+        v.displayID = e.displayID
+        v.x = e.x; v.y = e.y; v.width = e.width; v.height = e.height
+        return v
+    }
+}
+
+/// `launch --display` / `move --display`: the CLI asks the daemon for a display (it must create
+/// it: a virtual display lives as long as the process that made it), in requests/<id>.json, and
+/// the daemon answers in requests/<id>.reply.
+struct DisplayRequest: Codable {
+    var id: String
+    var session: String
+    var want: String        // "new", or a slot number
+    var at: Double
+}
+struct DisplayReply: Codable {
+    var ok: Bool
+    var slot: Int?
+    var error: String?
+}
+
+/// One of a daemon's displays, as published in daemon.json.
+struct DisplayEntry: Codable, Equatable {
+    var slot: Int
+    var displayID: UInt32
+    var x: Double, y: Double, width: Double, height: Double
+    /// `launch --display new`: the session it's reserved for, and until when (epoch seconds).
+    var reservedBy: String? = nil
+    var reservedUntil: Double? = nil
+    var bounds: CGRect { CGRect(x: x, y: y, width: width, height: height) }
+    func reserved(now: Double = Date().timeIntervalSince1970) -> String? {
+        guard let by = reservedBy, let until = reservedUntil, now < until else { return nil }
+        return by
+    }
 }
 
 struct ManagedApp: Codable, Equatable {
@@ -100,6 +152,8 @@ struct ManagedApp: Codable, Equatable {
     /// records from before modes, which were metered.
     var audio: String? = nil
 
+    /// The display it's on (a slot); nil: the daemon's primary display (records before protocol 3).
+    var display: Int? = nil
     var owner: String { session ?? Session.legacy }
     var audioMode: AudioMode { AudioMode(audio) }
 

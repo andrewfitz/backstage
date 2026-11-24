@@ -69,7 +69,7 @@ struct Args {
                                 "audio", "inaudible"]
         let values: Set<String> = ["pid", "app", "env", "timeout", "lines", "scale", "o", "out",
                                    "window", "depth", "role", "text", "ref", "steps", "dx", "dy", "since", "min-db", "seconds",
-                                   "focus-to", "bundle-id", "name", "path"]
+                                   "focus-to", "bundle-id", "name", "path", "display", "displays", "page", "appearance"]
         var i = 0
         while i < raw.count {
             let token = raw[i]
@@ -110,7 +110,7 @@ struct Args {
         let arity: ClosedRange<Int>
         switch command {
         case "launch", "open":
-            allowed = ["env", "timeout", "dock", "audio", "inaudible"]; arity = 1...1
+            allowed = ["env", "timeout", "dock", "audio", "inaudible", "display"]; arity = 1...1
             for entry in multi("env") {
                 guard let equals = entry.firstIndex(of: "="), equals != entry.startIndex else {
                     throw CLIError("--env needs NAME=value")
@@ -121,7 +121,8 @@ struct Args {
         case "logs": allowed = target + ["lines"]; arity = 0...0
         case "windows": allowed = target; arity = 0...0
         case "screenshot", "shot":
-            allowed = target + ["window", "o", "out", "scale", "full"]; arity = 0...0
+            allowed = target + ["window", "o", "out", "scale", "full", "display"]; arity = 0...0
+            if opt("display") != nil && !has("full") { throw CLIError("--display goes with --full (an app's screenshot is taken on its own display)") }
             if has("full"), (target + ["window"]).contains(where: { opt($0) != nil }) {
                 throw CLIError("--full captures all of your session's apps over the whole display and takes no app or window selector")
             }
@@ -176,6 +177,9 @@ struct Args {
         case "scroll": allowed = target + ["scale", "dx", "dy"]; arity = 2...2
         case "drag": allowed = target + ["scale", "steps"]; arity = 4...4
         case "__menu-thumbnail": allowed = []; arity = 4...4
+        case "__menu-render": allowed = ["displays", "page", "o", "appearance"]; arity = 0...0
+        case "move": allowed = target + ["display"]; arity = 0...0
+        case "cleanup-displays": allowed = []; arity = 0...0
         case "settings": allowed = []; arity = 0...2
         case "__send-backstage": allowed = ["pid", "focus-to"]; arity = 0...0
         case "__send-refusal": allowed = ["bundle-id", "name", "path"]; arity = 0...0
@@ -229,4 +233,8 @@ func appendLogLine(_ line: String, to url: URL) {
             written += n
         }
     }
+}
+
+extension Array {
+    subscript(safe index: Int) -> Element? { indices.contains(index) ? self[index] : nil }
 }

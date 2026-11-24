@@ -90,7 +90,7 @@ window ref (`w8432`) or a front-to-back index (`0` = frontmost).
 
 ## Lifecycle
 
-### `launch <target> [--env K=V]… [--timeout S] [--dock] [--audio | --inaudible] [-- app args…]`
+### `launch <target> [--env K=V]… [--timeout S] [--dock] [--audio | --inaudible] [--display N|new] [-- app args…]`
 Starts the daemon if needed, then launches `target` hidden on the agent display. `target` can
 be an `.app` path, a bundle id (`com.apple.calculator`), an app name (`Calculator`), or a bare
 executable such as a `swift build` product. A bare executable is wrapped in a throwaway
@@ -335,7 +335,7 @@ backstage's input commands and computer-use input at the same time. See the READ
 
 ## See
 
-### `screenshot [-o out.png] [--window I] [--full] [--scale S]`
+### `screenshot [-o out.png] [--window I] [--full [--display N]] [--scale S]`
 - **Default:** the app's windows (including menus, sheets and popovers), cropped from the
   display origin, so image pixel = click point.
 - **`--window I`:** one window only. The JSON's `origin` is that window's position:
@@ -344,6 +344,8 @@ backstage's input commands and computer-use input at the same time. See the READ
   and nothing else: other sessions' apps are left out (black), wherever they are. Windows of
   separate system processes, such as the out-of-process open/save panel or a share sheet, are
   left out too (as in the default capture); inspect those with `tree`/`find`.
+- **`--full` with several displays:** it captures one display: the one your session's apps
+  are on, or `--display N` when they're on more than one.
 - **Format:** a `.jpg`/`.jpeg` output path gives JPEG; anything else gives PNG. Without
   `-o`, files go to a per-session folder, `~/.backstage/shots/<session>/`.
 
@@ -568,6 +570,47 @@ typing never interleaves. Commands on different apps don't wait for each other.
 | `key <combo>… [--ref R]` | Key presses such as `return`, `esc`, `tab`, `space`, `delete`, `up`/`down`/`left`/`right`, `home`, `end`, `pageup`, `f1`–`f12`, or letters/digits/punctuation with modifiers: `cmd+s`, `cmd+shift+z`, `ctrl+alt+t`. Takes several combos in one call. |
 | `menu "File > Save As…"` | Presses a menu bar item by path. Matching is case-insensitive, ignores `…`, and accepts prefixes. |
 
+## Displays
+
+macOS registers every new display identity for good (ColorSync, WindowServer), and ColorSync
+slows down as its list grows, so backstage uses only eight fixed displays
+(docs/MULTI_DISPLAY_PLAN.md):
+
+| Display | Used by |
+|---|---|
+| 1 | The default home (`~/.backstage`): all agents |
+| 2–6 | Other homes, and extra displays of a daemon (`launch --display new`) |
+| 7–8 | backstage's own test suites |
+
+`BACKSTAGE_DISPLAY=N` picks a home's display; without it, a home other than the default takes
+the lowest free of 2–6. Asking for a display that's in use fails (`display 7 is in use`) after
+waiting up to 5 s (a display that just stopped can linger a moment).
+
+### Several displays per daemon
+
+- `launch --display new` creates a display and **reserves** it for the caller's session for
+  30 minutes: other sessions can't launch on it, `move` onto it, or get it from Send Front Window
+  Backstage. The display itself goes away once no app or pending launch is on it (after a 30 s
+  grace for a launch that's about to land there).
+- `launch --display N` uses display N, creating it if this daemon may run it (2–6 for the
+  default home), refused if another session reserved it.
+- Without `--display`, a launch goes where the caller's session already has apps, else to the
+  primary display.
+- A launch whose window found no free spot (it overlaps others) says `"crowded": true`, with a
+  warning suggesting `--display new`.
+- `move --display N|new [--pid P]` moves an app and its windows; the window guard keeps it there.
+- Coordinates, screenshots, `window fill`/`size`, `tree`, `find` and input are relative to the
+  app's own display. `list` gives each app's `display`; `status` lists the displays
+  (`daemon.displays`: apps, reservation, `screencaptureDisplay` and `ffmpegScreen` for
+  recording) when there's more than one.
+- The menu bar menu shows up to two displays' pictures stacked, labelled, with ‹ › to page
+  through more.
+
+### `cleanup-displays`
+`sudo backstage cleanup-displays` removes ColorSync's records of backstage displays that aren't
+attached, left by versions that gave every home its own display identity. ColorSync only honours
+this from root; `doctor` says when it's worth running (`leftoverDisplays`).
+
 ## Agent integration
 
 ### `install [--claude] [--codex] [--grok] [--hooks]`
@@ -617,6 +660,7 @@ variables only reorder the advice: nothing extra is allowed.
 
 | Variable | Default | Effect |
 |---|---|---|
+| `BACKSTAGE_DISPLAY` | 1 for the default home, else the lowest free of 2–6 | Which of the eight fixed displays this home's daemon uses (see [Displays](#displays)) |
 | `BACKSTAGE_HOME` | `~/.backstage` | State, logs, screenshots. Each home has its own daemon and agent display; daemons of different homes run side by side, their displays chained diagonally off the corner, each touching the next only at a corner point |
 | `BACKSTAGE_SESSION` | derived | The session this command belongs to (see Sessions); `legacy` and `user` are reserved |
 | `BACKSTAGE_WIDTH` / `BACKSTAGE_HEIGHT` | main display's size | Agent display size in points (set before the daemon starts) |

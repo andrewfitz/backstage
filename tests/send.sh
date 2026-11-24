@@ -18,6 +18,8 @@
 #   shown with no apps and no count while it's on, hidden when it's off; the daemon doesn't
 #   idle-exit while it's on, and does once it's turned off.
 set -euo pipefail
+# backstage's own tests use displays 7-8, never the ones agents use (docs/MULTI_DISPLAY_PLAN.md).
+export BACKSTAGE_DISPLAY=${BACKSTAGE_DISPLAY:-7}
 cd "$(dirname "$0")"
 ROOT="$(cd .. && pwd)"
 if [[ -z ${BACKSTAGE_BIN:-} ]]; then

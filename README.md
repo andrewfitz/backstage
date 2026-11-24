@@ -48,17 +48,31 @@ backstage show                        # you asked to see it: hand it over, state
 
 ## Install
 
+With [Homebrew](https://brew.sh):
+
+```bash
+brew install andrewfitz/backstage/backstage
+backstage doctor              # check permissions
+backstage install --hooks     # optional: skill + hook for Claude Code / Codex / Grok
+```
+
+Prebuilt for macOS 15 and later on Apple Silicon; elsewhere Homebrew builds it from source
+(needs Xcode). Installing by the full name trusts the tap's formula. After
+`brew upgrade backstage`, run `backstage stop --all && backstage start` so the daemon runs the
+new version (this quits the apps agents have open backstage).
+
+From source:
+
 ```bash
 git clone https://github.com/andrewfitz/backstage.git
 cd backstage
 make install                  # builds and copies $(PREFIX)/bin/backstage (PREFIX=/opt/homebrew)
                               # and $(PREFIX)/lib/backstage/libbackstage-inaudible.dylib
-backstage doctor              # check permissions
-backstage install --hooks     # optional: skill + hook for Claude Code / Codex / Grok
 ```
 
 `make install PREFIX=/usr/local` installs elsewhere. `make uninstall` stops the daemon and
-removes both.
+removes both. Use one or the other: a `make install` copy in `/opt/homebrew/bin` stops
+Homebrew from linking its own.
 
 ## Quick start
 
@@ -89,6 +103,7 @@ What changed in each version: [CHANGELOG.md](CHANGELOG.md).
 | Silence | Every agent app is muted the moment it first uses Core Audio: a private, muted process tap per app (helper processes included), inside a private tap-only aggregate device. Nothing reaches your speakers, whatever device the app picks; your apps, output device and volume aren't touched. If an app can't be muted, it isn't launched, or is quit. Dev builds and test runners are also made inaudible from inside (a small injected library), so they're silent in screen sharing, remote desktop and recordings too. Only apps launched with `--audio` are measured (`backstage audio`, `wait --sound`). |
 | Teardown | `backstage stop` quits the calling session's apps, and stops the daemon when no session has apps left. `backstage stop --all` (or the daemon getting SIGTERM/SIGINT/SIGHUP) quits every app *before* removing the display, so nothing lands on your screen. After 30 min with no managed apps in any session, the daemon exits by itself, unless Keep in Menu Bar is on. |
 | Several agents | Each agent session owns the apps it launches, so concurrent agents never pick up, type into, screenshot or stop each other's apps. Commands on one app are serialized with a per-app lock. See [Sessions](docs/USAGE.md#concepts). |
+| More room | An agent can take a hidden display of its own with `launch --display new` (reserved for its session for 30 minutes, gone when its apps quit), and a launch says `"crowded": true` when its window found no free spot. Backstage only ever uses eight fixed display identities, so macOS's display registry doesn't grow. See [Displays](docs/USAGE.md#displays). |
 
 ## Sound
 
@@ -144,7 +159,8 @@ small level meter, five bars of the loudest app's recent level; with Reduce Moti
 a still waveform instead. The icon's box never changes size. The menu shows:
 
 - a **live picture** of the hidden agent display, refreshed every second while the menu is open.
-  Point at an app's row and its windows are picked out in the picture
+  Point at an app's row and its windows are picked out in the picture. With several displays
+  (`launch --display new`), two pictures are stacked, each labelled, with ‹ › to page through more
 - **each app**, grouped by the agent session that launched it ("Claude — myproject": the agent,
   then the name given with `BACKSTAGE_SESSION` or the folder the agent works in), with how long
   it has been running, and a note if it has no windows or is playing sound (apps launched with

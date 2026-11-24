@@ -71,6 +71,11 @@ backstage quit                          # always clean up; `backstage stop` quit
   windows. Never record or capture the user's own screens.
 - **Acting:** `press`/`set`/`menu` are the most reliable. Use coordinate `click`/`drag`/`scroll`
   for custom-drawn views. `hover` is best-effort: tooltips won't appear.
+- **A display of your own:** `launch --display new` puts the app on a fresh hidden display
+  reserved for your session (for 30 minutes; it goes away when its apps quit). Use it for a
+  clean full-display screenshot or recording, a full-screen app, or when a launch result says
+  `"crowded": true` (no free spot: windows overlap). Your later launches follow you there;
+  `move --display N` moves an app. Coordinates are always relative to the app's own display.
 - **Several apps:** commands target your most recent launch. Pass `--pid P` (from
   `launch`/`list`) to be explicit.
 - **Other agents share the hidden display.** Each agent session only sees and drives the

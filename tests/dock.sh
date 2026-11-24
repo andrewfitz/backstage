@@ -5,6 +5,8 @@
 # The restore is tested through `backstage __dock-restore`, which runs show's restore without
 # moving the app's windows to the user's screen or activating it.
 set -euo pipefail
+# backstage's own tests use displays 7-8, never the ones agents use (docs/MULTI_DISPLAY_PLAN.md).
+export BACKSTAGE_DISPLAY=${BACKSTAGE_DISPLAY:-7}
 cd "$(dirname "$0")"
 ROOT="$(cd .. && pwd)"
 if [[ -z ${BACKSTAGE_BIN:-} ]]; then

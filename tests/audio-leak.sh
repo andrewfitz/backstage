@@ -18,6 +18,8 @@
 #    kill -9 of the daemon, a coreaudiod restart (needs passwordless sudo), speech (`say`) and
 #    an alert sound (`osascript -e beep`) from managed processes.
 set -uo pipefail
+# backstage's own tests use displays 7-8, never the ones agents use (docs/MULTI_DISPLAY_PLAN.md).
+export BACKSTAGE_DISPLAY=${BACKSTAGE_DISPLAY:-7}
 cd "$(dirname "$0")"
 ROOT="$(cd .. && pwd)"
 MODE=${1:-}

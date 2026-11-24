@@ -1,52 +1,188 @@
 import AppKit
 import QuartzCore
 
-/// The top of the menu: what Backstage is doing, in a sentence, and a live picture of the hidden
-/// display. One view, so the text and the picture share the menu's grid: the text starts where
-/// menu item titles start, and the picture sits just outside it, like the selection highlight.
-/// Nothing here knows about the daemon; StatusMenu feeds it.
+/// The top of the menu: live pictures of the hidden displays. One display: one picture, as
+/// big as fits. Several: up to two stacked, each labelled, and with more than two a pager row
+/// (‹ 1–2 of 4 ›) under them (docs/MULTI_DISPLAY_PLAN.md). The view's size depends only on how
+/// many pictures it stacks, so paging never resizes the menu. Nothing here knows about the
+/// daemon; StatusMenu feeds it.
 final class MenuHeroView: NSView {
     /// Where NSMenu starts item titles and images.
     static let textInset: CGFloat = 16
     static let previewInset: CGFloat = 12
     /// A very tall display (BACKSTAGE_WIDTH/HEIGHT) gets a narrower, centred picture, not a taller menu.
     static let maxPreviewHeight: CGFloat = 240
+    /// Each of two stacked pictures is at most this tall, so the pair fits with the app list.
+    static let maxStackedHeight: CGFloat = 150
+    static let stackGap: CGFloat = 8
+    static let pagerHeight: CGFloat = 24
 
     /// The menu's width for a picture this wide.
     static func width(previewWidth: CGFloat) -> CGFloat { previewWidth + previewInset * 2 }
 
-    /// Nil when there's no display to show.
-    let preview: DisplayPreviewView?
+    /// The pictures, top first (one or two). Empty when there's no display to show.
+    let previews: [DisplayPreviewView]
+    /// The first picture (the only one with a single display).
+    var preview: DisplayPreviewView? { previews.first }
+    private var labels: [Label] = []
+    private var pager: Pager?
 
     /// Kept for callers; the menu no longer shows a status line (the picture and rows say it).
     var status: String = ""
 
     override var isFlipped: Bool { true }
 
-    /// `aspect` is the previewed area's width over its height; nil for no picture.
-    init(previewWidth: CGFloat, aspect: CGFloat?) {
+    /// `aspect` is the previewed area's width over its height; nil for no picture. `stacked`:
+    /// two labelled pictures; `paged`: with the pager row under them.
+    init(previewWidth: CGFloat, aspect: CGFloat?, stacked: Bool = false, paged: Bool = false,
+         onPage: ((Int) -> Void)? = nil) {
         let width = Self.width(previewWidth: previewWidth)
         var previewSize = CGSize.zero
+        var made: [DisplayPreviewView] = []
         if let aspect, aspect.isFinite, aspect > 0 {
-            let height = max(1, min((previewWidth / aspect).rounded(), Self.maxPreviewHeight))
+            let cap = stacked ? Self.maxStackedHeight : Self.maxPreviewHeight
+            let height = max(1, min((previewWidth / aspect).rounded(), cap))
             previewSize = CGSize(width: max(1, min(previewWidth, (height * aspect).rounded())), height: height)
-            preview = DisplayPreviewView(frame: NSRect(origin: .zero, size: previewSize))
-        } else {
-            preview = nil
+            made = (0..<(stacked ? 2 : 1)).map { _ in DisplayPreviewView(frame: NSRect(origin: .zero, size: previewSize)) }
         }
+        previews = made
         // The picture leads the menu: the same inset above it as on its sides.
         let previewTop = Self.previewInset - 6
-        let height = preview == nil ? 0 : previewTop + previewSize.height + 5
+        var y = previewTop
+        var frames: [CGFloat] = []
+        for _ in made { frames.append(y); y += previewSize.height + Self.stackGap }
+        var height: CGFloat = made.isEmpty ? 0 : y - Self.stackGap + 5
+        let pagerY = height
+        if paged && !made.isEmpty { height += Self.pagerHeight }
         super.init(frame: NSRect(x: 0, y: 0, width: width, height: height))
         autoresizingMask = [.width]
-        if let preview {
-            preview.frame.origin = CGPoint(x: ((width - previewSize.width) / 2).rounded(), y: previewTop)
+        for (preview, top) in zip(made, frames) {
+            preview.frame.origin = CGPoint(x: ((width - previewSize.width) / 2).rounded(), y: top)
             preview.autoresizingMask = [.minXMargin, .maxXMargin]   // stays centred if the menu gets wider
             addSubview(preview)
+            if stacked {
+                let label = Label()
+                label.isHidden = true
+                preview.addSubview(label)
+                labels.append(label)
+            }
+        }
+        if paged && !made.isEmpty {
+            let pager = Pager(frame: NSRect(x: 0, y: pagerY, width: width, height: Self.pagerHeight), onPage: onPage ?? { _ in })
+            pager.autoresizingMask = [.width]
+            addSubview(pager)
+            self.pager = pager
         }
     }
 
     required init?(coder: NSCoder) { fatalError("not used") }
+
+    /// The label on picture `index` ("Display 2 · 3 apps"); nil hides that picture.
+    func setLabel(_ text: String?, at index: Int) {
+        guard previews.indices.contains(index) else { return }
+        previews[index].isHidden = text == nil && labels.indices.contains(index)
+        guard labels.indices.contains(index) else { return }
+        let label = labels[index]
+        label.isHidden = text == nil
+        if let text, label.text != text { label.text = text }
+        previews[index].setAccessibilityLabel(text.map { "Preview of \($0)" } ?? "Preview of the hidden display")
+    }
+
+    /// "1–2 of 4", and which arrows work; `toward` lights one arrow (a row pointed at is on
+    /// that side).
+    func setPage(first: Int, last: Int, of total: Int, canBack: Bool, canForward: Bool, toward: Int = 0) {
+        pager?.update(text: first == last ? "\(first) of \(total)" : "\(first)–\(last) of \(total)",
+                      canBack: canBack, canForward: canForward, toward: toward)
+    }
+
+    /// TEST: where the pager and its parts are (`__menu-render`).
+    var pagerFrames: [String: Any]? {
+        guard let pager else { return nil }
+        return ["pager": NSStringFromRect(pager.frame), "parts": pager.subviews.map { "\(type(of: $0)) \(NSStringFromRect($0.frame)) hidden=\($0.isHidden)" }]
+    }
+
+    /// A small dark capsule at the top left of a stacked picture: which display it is.
+    private final class Label: NSView {
+        private let field = NSTextField(labelWithString: "")
+        var text: String {
+            get { field.stringValue }
+            set { field.stringValue = newValue; field.sizeToFit(); needsLayout = true }
+        }
+        override var isFlipped: Bool { true }
+        override init(frame: NSRect) {
+            super.init(frame: frame)
+            wantsLayer = true
+            layer?.backgroundColor = NSColor.black.withAlphaComponent(0.55).cgColor
+            layer?.cornerRadius = 5
+            layer?.cornerCurve = .continuous
+            field.font = .systemFont(ofSize: NSFont.smallSystemFontSize - 1, weight: .medium)
+            field.textColor = .white
+            field.lineBreakMode = .byTruncatingTail
+            addSubview(field)
+        }
+        required init?(coder: NSCoder) { fatalError("not used") }
+        override func layout() {
+            super.layout()
+            guard let parent = superview else { return }
+            let w = min(ceil(field.frame.width) + 10, parent.bounds.width - 12)
+            frame = NSRect(x: 6, y: 6, width: w, height: 18)
+            field.frame = NSRect(x: 5, y: ((18 - field.frame.height) / 2).rounded(.down), width: w - 10, height: field.frame.height)
+        }
+        override func viewDidMoveToSuperview() { super.viewDidMoveToSuperview(); needsLayout = true }
+        override func hitTest(_ point: NSPoint) -> NSView? { nil }
+    }
+
+    /// ‹ 1–2 of 4 ›: quiet, centred, the arrows as plain symbol buttons.
+    private final class Pager: NSView {
+        private let back = NSButton()
+        private let forward = NSButton()
+        private let field = NSTextField(labelWithString: "")
+        private let onPage: (Int) -> Void
+        override var isFlipped: Bool { true }
+        init(frame: NSRect, onPage: @escaping (Int) -> Void) {
+            self.onPage = onPage
+            super.init(frame: frame)
+            wantsLayer = true
+            for (button, symbol, label) in [(back, "chevron.left", "Previous displays"), (forward, "chevron.right", "Next displays")] {
+                button.isBordered = false
+                button.image = NSImage(systemSymbolName: symbol, accessibilityDescription: label)
+                button.symbolConfiguration = .init(pointSize: 11, weight: .semibold)
+                button.imagePosition = .imageOnly
+                button.target = self
+                button.setAccessibilityLabel(label)
+                addSubview(button)
+            }
+            back.action = #selector(goBack)
+            forward.action = #selector(goForward)
+            field.font = .monospacedDigitSystemFont(ofSize: NSFont.smallSystemFontSize - 1, weight: .regular)
+            field.textColor = .secondaryLabelColor
+            field.alignment = .center
+            addSubview(field)
+        }
+        required init?(coder: NSCoder) { fatalError("not used") }
+        func update(text: String, canBack: Bool, canForward: Bool, toward: Int) {
+            field.stringValue = text
+            back.isEnabled = canBack
+            forward.isEnabled = canForward
+            back.contentTintColor = toward < 0 && canBack ? .controlAccentColor : nil
+            forward.contentTintColor = toward > 0 && canForward ? .controlAccentColor : nil
+            arrange()
+        }
+        override func layout() {
+            super.layout()
+            arrange()
+        }
+        private func arrange() {
+            field.sizeToFit()
+            let fw = max(64, ceil(field.frame.width) + 8)
+            let mid = bounds.midX
+            field.frame = NSRect(x: (mid - fw / 2).rounded(), y: ((bounds.height - field.frame.height) / 2).rounded(), width: fw, height: field.frame.height)
+            back.frame = NSRect(x: field.frame.minX - 26, y: (bounds.height - 20) / 2, width: 22, height: 20)
+            forward.frame = NSRect(x: field.frame.maxX + 4, y: (bounds.height - 20) / 2, width: 22, height: 20)
+        }
+        @objc private func goBack() { onPage(-1) }
+        @objc private func goForward() { onPage(1) }
+    }
 }
 
 /// A live picture of the agent display: rounded like the menu's own highlight, a hairline edge so
@@ -80,6 +216,8 @@ final class DisplayPreviewView: NSView {
         didSet { if isStale != oldValue { updateState() } }
     }
     private(set) var hasImage = false
+    /// The display the picture is of (StatusMenu's bookkeeping when it pages).
+    var shownSlot: Int?
     var reduceMotion = NSWorkspace.shared.accessibilityDisplayShouldReduceMotion
 
     private let canvas = NSView()
@@ -168,6 +306,15 @@ final class DisplayPreviewView: NSView {
         CATransaction.commit()
         hasImage = true
         isStale = false
+        updateState()
+    }
+
+    /// No picture (paged to a display not captured yet): the placeholder until the first frame.
+    func clearImage() {
+        imageLayer.contents = nil
+        hasImage = false
+        isStale = false
+        regions = []
         updateState()
     }
 

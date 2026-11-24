@@ -138,7 +138,13 @@ private func launchResolved(_ url: URL, bareExecutable: URL?, args: Args, info: 
                             session: Session, started: Double, lifecycle: StateLock, hideFromDock: Bool,
                             audio plan: AudioPlan) throws -> [String: Any] {
     var audio = plan
-    let vd = info.bounds
+    // Which display: --display N|new, else where this session already has apps, else the primary.
+    let slot = try launchDisplay(args.opt("display"), info: info, session: session)
+    // A display just created is in the daemon's info only from now on.
+    let current = slot == info.primarySlot || info.entry(slot) != nil ? info : (liveDaemon() ?? info)
+    guard let view = current.on(slot) else { throw CLIError("display \(slot) isn't running") }
+    let vd = view.bounds
+    let recordSlot: Int? = slot == current.primarySlot ? nil : slot
     let bundle = Bundle(url: url)
     let bid = bundle?.bundleIdentifier
     let name = (bundle?.infoDictionary?["CFBundleName"] as? String) ?? url.deletingPathExtension().lastPathComponent
@@ -179,7 +185,7 @@ private func launchResolved(_ url: URL, bareExecutable: URL?, args: Args, info: 
                                    bundle: url.path, executable: bareExecutable?.path, log: logURL.path,
                                    startedAt: Date().timeIntervalSince1970, audio: audio.mode.rawValue,
                                    agent: launcher?.name, agentPID: launcher?.pid,
-                                   commandStartedAt: started, forcedInaudible: audio.forced ? true : nil)
+                                   commandStartedAt: started, forcedInaudible: audio.forced ? true : nil, display: recordSlot)
     try Launching.begin(provisional)
     defer { if !leaveToDaemon { Launching.end(launchID) } }
 
@@ -330,7 +336,7 @@ private func launchResolved(_ url: URL, bareExecutable: URL?, args: Args, info: 
         let record = ManagedApp(pid: pid, name: name, bundleID: bid, path: url.path,
                                 launchedAt: Date().timeIntervalSince1970, stdout: logURL.path,
                                 processStart: birth, agent: launcher?.name, agentPID: launcher?.pid,
-                                session: session.id, audio: audio.mode.rawValue)
+                                session: session.id, audio: audio.mode.rawValue, display: recordSlot)
         // Handover and input must wait until this launch finishes moving its windows.
         placementLock = try Locks.app(record)
         try AppStore.add(record)
@@ -356,7 +362,12 @@ private func launchResolved(_ url: URL, bareExecutable: URL?, args: Args, info: 
     var gotWindow = !initialWindows.isEmpty
     // The app is still hidden, so its own windows aren't on screen yet: keep them apart too.
     var placedFrames: [CGRect] = []
-    for w in initialWindows { placedFrames.append(placeBeside(w, display: vd, avoiding: placedFrames)) }
+    var crowded = false
+    for w in initialWindows {
+        let placement = placeBesideReporting(w, display: vd, avoiding: placedFrames)
+        placedFrames.append(placement.frame)
+        crowded = crowded || placement.cascaded
+    }
     func isContained(_ window: AXUIElement) -> Bool {
         (window.attr(kAXMinimizedAttribute) as? Bool) == true || window.frame.map { vd.contains($0) } == true
     }
@@ -409,6 +420,7 @@ private func launchResolved(_ url: URL, bareExecutable: URL?, args: Args, info: 
     var result: [String: Any] = [
         "pid": pid, "name": name, "path": url.path,
         "windows": axWindowsSummary(pid, origin: vd.origin),
+        "display": slot,
         "log": logURL.path,
     ]
     if let bid { result["bundleID"] = bid }
@@ -424,6 +436,11 @@ private func launchResolved(_ url: URL, bareExecutable: URL?, args: Args, info: 
     if !placed { result["warning"] = "window placement could not be verified; backstage skipped unhiding the app" }
     else if gotWindow && canUnhide == nil { result["warning"] = "AppKit did not provide a running application handle for unhiding the windows" }
     else if !gotWindow { result["warning"] = "no window appeared within \(Int(timeout))s (app may be windowless or still loading); new windows will be moved to the agent display automatically" }
+    if crowded {
+        result["crowded"] = true
+        let hint = "display \(slot) is crowded: no free spot for this window, so it overlaps others; `launch --display new` gives you a display of your own"
+        result["warning"] = [result["warning"] as? String, hint].compactMap { $0 }.joined(separator: "; ")
+    }
     if let launchWarning {
         result["warning"] = [launchWarning, result["warning"] as? String].compactMap { $0 }.joined(separator: "; ")
     }

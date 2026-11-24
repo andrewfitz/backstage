@@ -29,6 +29,7 @@ let package = Package(
                 .linkedFramework("CoreAudio"),
                 .linkedFramework("AudioToolbox"),
                 .linkedFramework("Accelerate"),
+                .linkedFramework("ColorSync"),
             ]
         ),
     ]

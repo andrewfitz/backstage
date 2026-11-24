@@ -11,6 +11,8 @@
 # throughout; anything reaching the user's screens fails the run. Results (JSON + markdown) go
 # to load-results/ (or --results DIR). Options: python3 tests/load.py --help.
 set -uo pipefail
+# backstage's own tests use displays 7-8, never the ones agents use (docs/MULTI_DISPLAY_PLAN.md).
+export BACKSTAGE_DISPLAY=${BACKSTAGE_DISPLAY:-7}
 cd "$(dirname "$0")"
 ROOT="$(cd .. && pwd)"
 if [[ -z ${BACKSTAGE_BIN:-} ]]; then

@@ -1,0 +1,61 @@
+import ColorSync
+import CoreGraphics
+import Foundation
+
+/// Backstage displays ColorSync still has registered but that aren't attached: left over from
+/// versions that gave every BACKSTAGE_HOME its own display identity (a new one per test run).
+/// ColorSync walks every registered device whenever a display comes or goes, so a long list
+/// costs CPU (docs/MULTI_DISPLAY_PLAN.md). Matched by the name backstage gives its displays and
+/// only when not attached, so the user's displays and a live backstage display never count.
+enum DisplayRegistry {
+    static let displayName = "Backstage (agent display)"
+
+    /// Device IDs of unattached backstage displays registered with ColorSync.
+    static func leftovers() -> [CFUUID] {
+        final class Collector {
+            let attached: Set<String>
+            var seen = Set<String>()
+            var found: [CFUUID] = []
+            init(attached: Set<String>) { self.attached = attached }
+        }
+        let attached = Set((onlineDisplays() ?? []).compactMap { id -> String? in
+            guard let uuid = CGDisplayCreateUUIDFromDisplayID(id)?.takeRetainedValue() else { return nil }
+            return CFUUIDCreateString(nil, uuid) as String?
+        })
+        let collector = Collector(attached: attached)
+        let context = Unmanaged.passUnretained(collector).toOpaque()
+        withExtendedLifetime(collector) {
+            ColorSyncIterateDeviceProfiles({ info, context in
+                guard let context, let d = info as? [String: Any] else { return true }
+                let c = Unmanaged<Collector>.fromOpaque(context).takeUnretainedValue()
+                guard (d[kColorSyncDeviceClass.takeUnretainedValue() as String] as? String) == (kColorSyncDisplayDeviceClass.takeUnretainedValue() as String),
+                      (d[kColorSyncDeviceDescription.takeUnretainedValue() as String] as? String) == DisplayRegistry.displayName,
+                      let raw = d[kColorSyncDeviceID.takeUnretainedValue() as String] as CFTypeRef?,
+                      CFGetTypeID(raw) == CFUUIDGetTypeID() else { return true }
+                let uuid = raw as! CFUUID
+                let key = CFUUIDCreateString(nil, uuid) as String
+                if !c.attached.contains(key), c.seen.insert(key).inserted { c.found.append(uuid) }
+                return true
+            }, context)
+        }
+        return collector.found
+    }
+
+    /// Past this many leftovers, doctor suggests the cleanup.
+    static let warnAbove = 8
+
+    static var cleanupCommand: String { "sudo \(selfCommandPath()) cleanup-displays" }
+}
+
+/// `cleanup-displays`: unregister the leftover backstage displays. ColorSync only honours this
+/// from root (a normal user's request is accepted and changes nothing), so it refuses otherwise.
+func cmdCleanupDisplays() throws -> [String: Any] {
+    guard geteuid() == 0 else {
+        throw CLIError("cleanup-displays needs root: ColorSync ignores this from a normal user. Run: \(DisplayRegistry.cleanupCommand)")
+    }
+    let before = DisplayRegistry.leftovers()
+    var removed = 0
+    for uuid in before where ColorSyncUnregisterDevice(kColorSyncDisplayDeviceClass.takeUnretainedValue(), uuid) { removed += 1 }
+    let after = DisplayRegistry.leftovers().count
+    return ["found": before.count, "unregistered": removed, "remaining": after]
+}

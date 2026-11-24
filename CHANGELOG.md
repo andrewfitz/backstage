@@ -1,5 +1,21 @@
 # Changelog
 
+## 1.3.0
+
+- **Fix: ColorSync CPU.** Every `BACKSTAGE_HOME` got its own display identity, and test suites
+  use a fresh home per run, so macOS registered a new display each time (161 in a day on one
+  Mac) and ColorSync's daemons spent hours of CPU walking the list. Backstage now uses eight
+  fixed displays: 1 for the default home, 2–6 for other homes and extra displays, 7–8 for its
+  own tests (`BACKSTAGE_DISPLAY`). `doctor` reports leftovers; `sudo backstage cleanup-displays`
+  removes them once.
+- **Several displays per daemon:** `launch --display new` gives a session a display of its own
+  (reserved for 30 minutes, removed when its apps quit); `launch --display N`; `move --display`;
+  launches follow their session's display; `"crowded": true` when a window found no free spot.
+  Coordinates, screenshots and input are relative to the app's own display.
+- **Menu:** with several displays, two pictures stacked with labels, and ‹ › to page.
+- A daemon that fails to start now says why (it used to say only "see daemon.log").
+- Protocol 3: replace a running older daemon with `backstage stop --all`.
+
 ## 1.2.2
 
 - **Fix:** the daemon didn't start when `backstage` was run by bare name from a folder holding

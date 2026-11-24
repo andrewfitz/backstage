@@ -25,6 +25,11 @@ func placeOnAgentDisplay(_ w: AXUIElement, display b: CGRect, slot: Int, size: C
 /// are hidden); that overlap is harmless for capture and input.
 @discardableResult
 func placeBeside(_ w: AXUIElement, display b: CGRect, avoiding: [CGRect] = []) -> CGRect {
+    placeBesideReporting(w, display: b, avoiding: avoiding).frame
+}
+
+/// `placeBeside`, also saying whether the display had no free spot (the window cascaded).
+func placeBesideReporting(_ w: AXUIElement, display b: CGRect, avoiding: [CGRect] = []) -> (frame: CGRect, cascaded: Bool) {
     let me = w.windowID
     let occupied = onscreenWindows()
         .filter { ($0[kCGWindowLayer as String] as? Int) == 0 && ($0[kCGWindowNumber as String] as? CGWindowID) != me }
@@ -35,10 +40,10 @@ func placeBeside(_ w: AXUIElement, display b: CGRect, avoiding: [CGRect] = []) -
     let size = w.size ?? CGSize(width: 400, height: 300)
     if let spot = freeSpot(size, occupied: occupied, display: b) {
         w.setPosition(spot)
-        return CGRect(origin: spot, size: size)
+        return (CGRect(origin: spot, size: size), false)
     }
     placeOnAgentDisplay(w, display: b, slot: occupied.count)
-    return w.frame ?? CGRect(origin: b.origin, size: size)
+    return (w.frame ?? CGRect(origin: b.origin, size: size), !occupied.isEmpty)
 }
 
 /// First-fit: rows top to bottom, then left to right, with candidate edges taken from the
@@ -136,6 +141,38 @@ final class Daemon {
     /// Keep in Menu Bar is on and there is a menu bar item to keep: no idle exit.
     var keepActive: Bool { settings.keep && statusMenu != nil }
     let testSendRequests = ProcessInfo.processInfo.environment["BACKSTAGE_TEST_SEND_REQUESTS"] == "1"
+
+    // MARK: extra displays (docs/MULTI_DISPLAY_PLAN.md, phase 2)
+    /// Displays beyond the primary, by slot, with when each was created.
+    var extras: [Int: AgentDisplay] = [:]
+    var extraCreated: [Int: Double] = [:]
+    /// `launch --display new`: the session a display is reserved for, until when (epoch seconds).
+    var reservations: [Int: (session: String, until: Double)] = [:]
+    /// The size every display gets (the primary's).
+    var displaySize: (width: UInt32, height: UInt32, scale: UInt32) { display.size }
+    /// Slots extra displays may take: 2-6, or BACKSTAGE_EXTRA_DISPLAYS (tests: "8").
+    let extraSlots: [Int] = {
+        if let raw = ProcessInfo.processInfo.environment["BACKSTAGE_EXTRA_DISPLAYS"] {
+            return raw.split(separator: ",").compactMap { Int($0.trimmingCharacters(in: .whitespaces)) }.filter { displaySlots.contains($0) }
+        }
+        return Array(sharedDisplaySlots)
+    }()
+    /// How long a reservation lasts, and how long an empty extra display waits before it goes
+    /// (a launch may be about to put its app there). Shortened by tests.
+    let reservationSeconds = Double(ProcessInfo.processInfo.environment["BACKSTAGE_RESERVATION_SECONDS"] ?? "") ?? 1800
+    let extraGraceSeconds = Double(ProcessInfo.processInfo.environment["BACKSTAGE_EXTRA_DISPLAY_GRACE"] ?? "") ?? 30
+    var creatingDisplay = false
+    var nextExtrasCheck = 0.0
+    var nextRemovalCheck = 0.0
+
+    /// Every display this daemon runs, the primary first.
+    var allDisplays: [AgentDisplay] { [display] + extras.keys.sorted().compactMap { extras[$0] } }
+    var ownDisplayIDs: Set<CGDirectDisplayID> { Set(allDisplays.map { $0.id }) }
+    /// The display a managed app's windows belong on.
+    func displayFor(pid: pid_t) -> AgentDisplay {
+        guard let slot = registry.first(where: { $0.pid == pid })?.display, let d = extras[slot] else { return display }
+        return d
+    }
 
     init() throws {
         owner = try StateLock("daemon.lock", nonblocking: true)
@@ -251,7 +288,8 @@ final class Daemon {
     var otherAgentScreens: [CGRect] = []
     func refreshScreens(from ids: [CGDirectDisplayID] = activeDisplays()) {
         screens = userDisplayBounds(from: ids)
-        otherAgentScreens = otherAgentDisplayBounds(excluding: display.id, from: ids)
+        let own = ownDisplayIDs
+        otherAgentScreens = ids.filter { isOurDisplay($0) && !own.contains($0) }.map { CGDisplayBounds($0) }
     }
 
     var reparkPending = false
@@ -272,22 +310,25 @@ final class Daemon {
         // and their windows would migrate onto it. Bail out so it disappears.
         refreshScreens()
         if screens.isEmpty { shutdown(reason: "no user display left"); return }
-        if display.isParked {
-            reparkFailures = 0
-        } else {
-            let was = display.bounds
-            if display.park() {
-                reparkFailures = 0
-                if display.bounds != was { log("re-parked display from \(was) to \(display.bounds)") }
+        var failed = false
+        for d in allDisplays where !d.isParked {
+            let was = d.bounds
+            if d.park() {
+                if d.bounds != was { log("re-parked display \(d.slot) from \(was) to \(d.bounds)") }
             } else {
-                // Another (older) daemon may be moving its display right now: try again shortly,
-                // but don't stay touching the user's desktop along an edge.
-                reparkFailures += 1
-                guard reparkFailures < 4 else { shutdown(reason: "failed to re-park display"); return }
-                log("could not re-park display (at \(display.bounds)); retrying")
-                scheduleRepark()
+                failed = true
+                log("could not re-park display \(d.slot) (at \(d.bounds)); retrying")
             }
             refreshScreens()
+        }
+        if failed {
+            // Another (older) daemon may be moving its display right now: try again shortly,
+            // but don't stay touching the user's desktop along an edge.
+            reparkFailures += 1
+            guard reparkFailures < 4 else { shutdown(reason: "failed to re-park display"); return }
+            scheduleRepark()
+        } else {
+            reparkFailures = 0
         }
         do { try writeInfo() } catch { log("cannot update display state: \(error)") }
     }
@@ -304,7 +345,105 @@ final class Daemon {
                                                sizeSource: sizeSource, inputGuard: inputGuardUp,
                                                audio: audioUnavailable == nil, audioReason: audioUnavailable,
                                                audioModes: true, delayedLaunchHandoff: true,
-                                               hotkey: hotKey?.registered?.spec, hotkeyError: hotkeyError, settingsApplied: settingsApplied))
+                                               hotkey: hotKey?.registered?.spec, hotkeyError: hotkeyError, settingsApplied: settingsApplied,
+                                               displays: displayEntries()))
+    }
+
+    /// Answer `launch --display` / `move --display` requests (files in requests/), expire
+    /// reservations, and remove extra displays nothing uses any more.
+    func handleDisplayRequests(now: Double) {
+        guard !creatingDisplay else { return }
+        let wall = Date().timeIntervalSince1970
+        var changed = false
+        for (slot, r) in reservations where r.until <= wall {
+            reservations[slot] = nil
+            log("display \(slot): reservation for session \(r.session) expired")
+            changed = true
+        }
+        if let names = try? FileManager.default.contentsOfDirectory(atPath: Paths.requests.path) {
+            for name in names.sorted() where name.hasSuffix(".json") {
+                let url = Paths.requests.appendingPathComponent(name)
+                guard let request = readJSON(url, DisplayRequest.self) else { continue }
+                try? FileManager.default.removeItem(at: url)
+                guard wall - request.at < 30 else { continue }   // its CLI gave up long ago
+                let reply = answer(request, wall: wall)
+                do { try writeJSON(Paths.requests.appendingPathComponent("\(request.id).reply"), reply) }
+                catch { log("cannot answer display request \(request.id): \(error)") }
+                changed = true
+            }
+        }
+        if now >= nextRemovalCheck || changed {
+            nextRemovalCheck = now + 1
+            let pending = Launching.records()
+            for slot in extras.keys.sorted() {
+                guard !registry.contains(where: { $0.display == slot && $0.matchesProcess }),
+                      !pending.contains(where: { $0.display == slot }),
+                      now - (extraCreated[slot] ?? now) >= extraGraceSeconds else { continue }
+                extras[slot] = nil
+                extraCreated[slot] = nil
+                reservations[slot] = nil
+                log("display \(slot) removed: no apps left on it")
+                changed = true
+            }
+        }
+        if changed {
+            refreshScreens()
+            do { try writeInfo() } catch { log("cannot update display state: \(error)") }
+        }
+    }
+
+    func answer(_ request: DisplayRequest, wall: Double) -> DisplayReply {
+        func refuse(_ why: String) -> DisplayReply { DisplayReply(ok: false, slot: nil, error: why) }
+        if request.want == "new" {
+            let free = extraSlots.filter { extras[$0] == nil }
+            guard !free.isEmpty else { return refuse("no free display left: this daemon runs \(allDisplays.count) (\(allDisplays.map { String($0.slot) }.joined(separator: ", ")))") }
+            do {
+                let d = try makeExtraDisplay(.lowestFree(free))
+                reservations[d.slot] = (request.session, wall + reservationSeconds)
+                log("display \(d.slot) reserved for session \(request.session) for \(Int(reservationSeconds))s")
+                return DisplayReply(ok: true, slot: d.slot, error: nil)
+            } catch { return refuse("\(error)") }
+        }
+        guard let n = Int(request.want), displaySlots.contains(n) else { return refuse("--display takes a display number (1-8) or new") }
+        if n == display.slot { return DisplayReply(ok: true, slot: n, error: nil) }
+        if extras[n] != nil {
+            if let r = reservations[n], r.until > wall, !Session.sameID(r.session, request.session) {
+                let until = DateFormatter.localizedString(from: Date(timeIntervalSince1970: r.until), dateStyle: .none, timeStyle: .short)
+                return refuse("display \(n) is reserved for another session until \(until)")
+            }
+            return DisplayReply(ok: true, slot: n, error: nil)
+        }
+        guard extraSlots.contains(n) else {
+            return refuse("display \(n) isn't one this daemon runs (it runs \(display.slot), and can add \(extraSlots.map(String.init).joined(separator: ", ")))")
+        }
+        do { return DisplayReply(ok: true, slot: try makeExtraDisplay(.exactly(n)).slot, error: nil) }
+        catch { return refuse("\(error)") }
+    }
+
+    /// Create, park and size an extra display, like the primary at startup.
+    func makeExtraDisplay(_ choice: AgentDisplay.SlotChoice) throws -> AgentDisplay {
+        creatingDisplay = true
+        defer { creatingDisplay = false }
+        let size = displaySize
+        let d = try AgentDisplay(width: size.width, height: size.height, scale: size.scale, choice: choice)
+        guard waitFor(timeout: 5, { activeDisplays().contains(d.id) ? true : nil }) != nil, d.park(force: true) else {
+            throw CLIError("could not bring display \(d.slot) online")
+        }
+        guard d.selectMode() else { throw CLIError("could not set display \(d.slot) to \(size.width)x\(size.height) points at \(size.scale)x") }
+        guard d.park() else { throw CLIError("could not park display \(d.slot)") }
+        extras[d.slot] = d
+        extraCreated[d.slot] = ProcessInfo.processInfo.systemUptime
+        log("display \(d.slot) up at \(d.bounds)")
+        return d
+    }
+
+    func displayEntries() -> [DisplayEntry] {
+        allDisplays.map { d in
+            let b = d.bounds
+            let r = reservations[d.slot]
+            return DisplayEntry(slot: d.slot, displayID: d.id, x: b.minX, y: b.minY, width: b.width, height: b.height,
+                                reservedBy: r?.session, reservedUntil: r?.until)
+        }
     }
 
     func markShutdown(_ requested: Bool) {
@@ -460,7 +599,7 @@ final class Daemon {
             guard let win = element.attr(kAXWindowAttribute), CFGetTypeID(win) == AXUIElementGetTypeID() else { return }
             w = win as! AXUIElement
         }
-        let b = display.bounds
+        let b = displayFor(pid: pid).bounds
         guard let state = guardWindowState(w), !state.minimized, !b.contains(state.frame) else { return }
         let inset = CGPoint(x: b.minX + min(40, b.width / 10), y: b.minY + min(60, b.height / 10))
         // Get the window off the user's screen before calculating a tidy spot.
@@ -494,9 +633,9 @@ final class Daemon {
     /// opened them), until their windows are on the agent display: then unhide, as `launch` does.
     var toReveal: [pid_t: (birth: UInt64, until: Double)] = [:]
     func revealRegistered(now: Double) {
-        let b = display.bounds
         for (pid, entry) in toReveal {
             guard processBirth(pid) == entry.birth else { toReveal[pid] = nil; continue }
+            let b = displayFor(pid: pid).bounds
             let app = AXUIElementCreateApplication(pid)
             AXUIElementSetMessagingTimeout(app, 0.25)   // never stall the guard loop on a busy app
             guard let windows = try? app.readElements(kAXWindowsAttribute) else {
@@ -540,31 +679,37 @@ final class Daemon {
             m.update(apps: managed.count)
         }
         if now >= nextArrangementCheck { nextArrangementCheck = now + 0.25; checkArrangement() }
-        let b = display.bounds
-        if now >= nextDockCheck { nextDockCheck = now + 1; guardDock(displayBounds: b) }
+        let own = allDisplays.map { (slot: $0.slot, bounds: $0.bounds) }
+        if now >= nextDockCheck { nextDockCheck = now + 1; guardDock(own: own.map { $0.bounds }) }
+        if now >= nextExtrasCheck { nextExtrasCheck = now + 0.1; handleDisplayRequests(now: now) }
 
         // 1. Keep managed windows off the user's screens, and off other homes' backstage
         //    displays (an app restoring a window to where it last was can land there).
         if !managed.isEmpty {
             idleSince = ProcessInfo.processInfo.systemUptime
+            // An app's windows belong on its own display: one on a sibling display counts too.
+            let slotOf = Dictionary(registry.map { ($0.pid, $0.display ?? display.slot) }, uniquingKeysWith: { a, _ in a })
             var offenders: Set<pid_t> = []
             for w in onscreenWindows() {
                 guard let pid = w[kCGWindowOwnerPID as String] as? pid_t, managed.contains(pid),
                       let layer = w[kCGWindowLayer as String] as? Int, layer < 1000 else { continue }
                 let f = cgBounds(w)
-                if screens.contains(where: { $0.intersects(f) }) || otherAgentScreens.contains(where: { $0.intersects(f) }) {
+                let home = slotOf[pid] ?? display.slot
+                if screens.contains(where: { $0.intersects(f) }) || otherAgentScreens.contains(where: { $0.intersects(f) })
+                    || own.contains(where: { $0.slot != home && $0.bounds.intersects(f) }) {
                     offenders.insert(pid)
                 }
             }
             for pid in offenders where registry.contains(where: { $0.pid == pid && $0.matchesProcess }) {
-                let n = adoptVisibleWindows(pid: pid, display: b)
-                if n > 0 { log("moved \(n) window(s) of pid \(pid) to agent display") }
+                let d = displayFor(pid: pid)
+                let n = adoptVisibleWindows(pid: pid, display: d.bounds)
+                if n > 0 { log("moved \(n) window(s) of pid \(pid) to agent display \(d.slot)") }
             }
         }
 
         // 2. Keep the user's cursor off every backstage display: ours and other homes'.
         //    Points on a user display's bottom or right edge (the Dock) are never on one.
-        if let loc = CGEvent(source: nil)?.location, b.contains(loc) || otherAgentScreens.contains(where: { $0.contains(loc) }) {
+        if let loc = CGEvent(source: nil)?.location, own.contains(where: { $0.bounds.contains(loc) }) || otherAgentScreens.contains(where: { $0.contains(loc) }) {
             let points = screens.map { u in
                 CGPoint(x: min(max(loc.x, u.minX), u.maxX - 1), y: min(max(loc.y, u.minY), u.maxY - 1))
             }
@@ -603,9 +748,10 @@ final class Daemon {
     var dockAway: CGRect?
     /// The Dock must stay on the user's screens. Parking (corner contact only) keeps macOS from
     /// moving it to a backstage display; this catches it if that ever happens anyway.
-    func guardDock(displayBounds: CGRect) {
+    func guardDock(own: [CGRect]) {
         guard let dock = dockWindowBounds() else { return }
-        let ours = contact(dock, displayBounds) == .overlap
+        let onto = own.first { contact(dock, $0) == .overlap }
+        let ours = onto != nil
         let theirs = otherAgentScreens.contains { contact(dock, $0) == .overlap }
         guard ours || theirs else {
             if let away = dockAway { log("the Dock is back on the user's screen (was at \(away))"); dockAway = nil }
@@ -614,10 +760,10 @@ final class Daemon {
         if dockAway == nil {
             // macOS moves the Dock to a display arranged right below its own. Re-parking (which
             // runs on any arrangement change) brings it back by itself ~0.1 s after the move.
-            log("the Dock moved onto \(ours ? "this daemon's" : "another backstage") display at \(dock); this display at \(displayBounds)"
-                + (ours && display.isParked ? " though parked: not moving it (no undisruptive way known)" : ""))
+            log("the Dock moved onto \(ours ? "this daemon's" : "another backstage") display at \(dock)"
+                + (ours && allDisplays.allSatisfy({ $0.isParked }) ? " though parked: not moving it (no undisruptive way known)" : ""))
         }
-        if ours, !display.isParked { scheduleRepark() }
+        if ours, !allDisplays.allSatisfy({ $0.isParked }) { scheduleRepark() }
         dockAway = dock
     }
 
@@ -802,6 +948,8 @@ private func startDaemon() throws -> DaemonInfo {
     // against the working directory, which may hold an unrelated `backstage` (a checkout).
     let selfPath = URL(fileURLWithPath: Bundle.main.executablePath ?? CommandLine.arguments[0]).resolvingSymlinksInPath().path
 
+    _ = try requestedDisplaySlot()   // a bad BACKSTAGE_DISPLAY is reported here, not as a failed start
+    let logStart = (try? FileManager.default.attributesOfItem(atPath: Paths.log.path)[.size] as? UInt64) ?? 0
     var attr: posix_spawnattr_t?
     posix_spawnattr_init(&attr)
     posix_spawnattr_setflags(&attr, Int16(POSIX_SPAWN_SETSID))
@@ -822,6 +970,7 @@ private func startDaemon() throws -> DaemonInfo {
     repeat {
         if let info = liveDaemon() { return info }
         if waitpid(pid, &status, WNOHANG) == pid {
+            if let why = lastLoggedError(since: logStart) { throw CLIError(why) }
             throw CLIError("daemon exited during startup; see \(Paths.log.path)")
         }
         pump(0.1)
@@ -832,6 +981,18 @@ private func startDaemon() throws -> DaemonInfo {
         while waitpid(pid, &status, 0) < 0 && errno == EINTR {}
     }
     throw CLIError("daemon did not come up; see \(Paths.log.path)")
+}
+
+/// The last `"error"` the daemon wrote to its log after `offset` (it reports a failed start there).
+private func lastLoggedError(since offset: UInt64) -> String? {
+    guard let h = try? FileHandle(forReadingFrom: Paths.log) else { return nil }
+    defer { try? h.close() }
+    try? h.seek(toOffset: offset)
+    guard let data = try? h.readToEnd(), let text = String(data: data, encoding: .utf8) else { return nil }
+    let pattern = try! NSRegularExpression(pattern: #""error" : "((?:[^"\\]|\\.)*)""#)
+    guard let m = pattern.matches(in: text, range: NSRange(text.startIndex..., in: text)).last,
+          let r = Range(m.range(at: 1), in: text) else { return nil }
+    return (try? JSONSerialization.jsonObject(with: Data("\"\(text[r])\"".utf8), options: .fragmentsAllowed) as? String) ?? String(text[r])
 }
 
 /// Quit apps gracefully, then forcefully. True once all of them are gone.

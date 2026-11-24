@@ -11,7 +11,7 @@ define fresh_bin
 testdir=$$(mktemp -d /tmp/backstage-test.XXXXXX) && trap 'rm -f "$$testdir/backstage" "$$testdir/$(DYLIB_NAME)"; rmdir "$$testdir"' EXIT && cp "$(BIN)" "$$testdir/backstage" && cp "$(DYLIB)" "$$testdir/$(DYLIB_NAME)"
 endef
 
-.PHONY: build install uninstall dist test test-cli test-agents test-multi test-concurrency test-focus test-computer-use test-audio test-dock test-launch test-send load
+.PHONY: build install uninstall dist test test-cli test-agents test-multi test-concurrency test-focus test-computer-use test-audio test-dock test-launch test-send test-displays test-multidisplay load
 
 build:
 	swift build -c release
@@ -81,6 +81,12 @@ test-launch: build
 
 test-send: build
 	$(fresh_bin) && BACKSTAGE_BIN="$$testdir/backstage" tests/send.sh
+
+test-displays: build
+	$(fresh_bin) && BACKSTAGE_BIN="$$testdir/backstage" tests/displays.sh
+
+test-multidisplay: build
+	$(fresh_bin) && BACKSTAGE_BIN="$$testdir/backstage" tests/multidisplay.sh
 
 test: test-cli test-agents
 	$(fresh_bin) && BACKSTAGE_BIN="$$testdir/backstage" tests/e2e.sh

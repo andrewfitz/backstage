@@ -13,6 +13,8 @@
 # fixture only plays to a device with input streams when its Microphone access is already
 # decided, and the measuring helper only when the host's is granted (see audioprobe.swift).
 set -uo pipefail
+# backstage's own tests use displays 7-8, never the ones agents use (docs/MULTI_DISPLAY_PLAN.md).
+export BACKSTAGE_DISPLAY=${BACKSTAGE_DISPLAY:-7}
 cd "$(dirname "$0")"
 ROOT="$(cd .. && pwd)"
 if [[ -z ${BACKSTAGE_BIN:-} ]]; then

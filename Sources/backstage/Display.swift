@@ -27,18 +27,44 @@ func otherAgentDisplayBounds(excluding own: CGDirectDisplayID, from ids: [CGDire
     ids.filter { $0 != own && isOurDisplay($0) }.map { CGDisplayBounds($0) }
 }
 
-/// Serial numbers for this home's display, best first. Each BACKSTAGE_HOME has its own daemon and
-/// so its own display, and two displays with the same vendor/product/serial can't coexist. The
-/// first is stable per home (FNV-1a of the resolved path): macOS remembers a display's mode and
-/// arrangement by its identity. The others are fallbacks for a clash with another home's.
-/// Never 0 or 1 (1 is what every display had before serials were per home).
-func displaySerials(home: URL = Paths.dir) -> [UInt32] {
-    let path = home.resolvingSymlinksInPath().standardizedFileURL.path
-    return (0..<4).map { salt in
-        var h: UInt32 = 2_166_136_261
-        for byte in (salt == 0 ? path : "\(path)#\(salt)").utf8 { h = (h ^ UInt32(byte)) &* 16_777_619 }
-        return h > 1 ? h : h + 2
+/// The eight backstage displays. macOS registers every new display identity (vendor, product,
+/// serial) for good, in ColorSync and in WindowServer's display list, and ColorSync slows down
+/// as its list grows: so backstage only ever uses these eight serials, never one per home.
+/// 1 is the default home's; 2-6 other homes' (then the default daemon's extra displays);
+/// 7-8 are for backstage's own test suites (docs/MULTI_DISPLAY_PLAN.md).
+let displaySlots = 1...8
+let sharedDisplaySlots = 2...6
+func displaySerial(slot: Int) -> UInt32 { 0x4253_0000 + UInt32(slot) }
+func displaySlot(serial: UInt32) -> Int? {
+    let slot = Int(serial) - 0x4253_0000
+    return displaySlots.contains(slot) ? slot : nil
+}
+
+/// The display this home asks for: BACKSTAGE_DISPLAY, else 1 for the default home, else nil
+/// (the lowest free shared display).
+func requestedDisplaySlot() throws -> Int? {
+    if let raw = ProcessInfo.processInfo.environment["BACKSTAGE_DISPLAY"], !raw.isEmpty {
+        guard let n = Int(raw), displaySlots.contains(n) else { throw CLIError("BACKSTAGE_DISPLAY must be a number from 1 to 8") }
+        return n
     }
+    return Paths.isDefaultHome ? 1 : nil
+}
+
+/// Every online display (active, asleep or mirrored), or nil if macOS won't say.
+func onlineDisplays() -> [CGDirectDisplayID]? {
+    var capacity: UInt32 = 16
+    while true {
+        var ids = [CGDirectDisplayID](repeating: 0, count: Int(capacity))
+        var count: UInt32 = 0
+        guard CGGetOnlineDisplayList(capacity, &ids, &count) == .success else { return nil }
+        if count < capacity { return Array(ids.prefix(Int(count))) }
+        capacity *= 2
+    }
+}
+
+/// The backstage display slots in use right now, by any home. Nil if macOS won't list displays.
+func displaySlotsInUse() -> Set<Int>? {
+    onlineDisplays().map { Set($0.filter(isOurDisplay).compactMap { displaySlot(serial: CGDisplaySerialNumber($0)) }) }
 }
 
 /// How two rectangles meet. Displays that share an edge let the cursor (and the Dock) cross;
@@ -144,11 +170,17 @@ final class AgentDisplay {
     var bounds: CGRect { CGDisplayBounds(id) }
 
     /// `width`×`height` is the size in points; `scale` (1 or 2) is the backing scale factor.
-    init(width: UInt32, height: UInt32, scale: UInt32) throws {
-        // Skip a serial another home's display already uses (a hash clash): it can't be created twice.
-        let inUse = Set(activeDisplays().filter(isOurDisplay).map { CGDisplaySerialNumber($0) })
-        var created: (CGVirtualDisplay, UInt32)?
-        for serial in displaySerials() where !inUse.contains(serial) {
+    /// Which slot to take: the home's (BACKSTAGE_DISPLAY, or 1 for the default home, else the
+    /// lowest free shared one), exactly one (an extra display asked for by number), or the
+    /// lowest free of some (`launch --display new`).
+    enum SlotChoice { case home, exactly(Int), lowestFree([Int]) }
+
+    init(width: UInt32, height: UInt32, scale: UInt32, choice: SlotChoice = .home) throws {
+        // One display identity per slot: choose and create under a lock shared by every home,
+        // held until the new display is online, so two daemons can't take the same slot.
+        guard let lock = UserLock("displays.lock") else { throw CLIError("cannot lock the backstage displays for this user") }
+        defer { lock.release() }
+        func make(_ slot: Int) -> CGVirtualDisplay? {
             let d = CGVirtualDisplayDescriptor()
             d.queue = DispatchQueue.main
             d.name = "Backstage (agent display)"
@@ -158,20 +190,58 @@ final class AgentDisplay {
             d.sizeInMillimeters = CGSize(width: Double(width) * 0.254, height: Double(height) * 0.254)
             d.vendorID = kVendor
             d.productID = kProduct
-            d.serialNum = serial
+            d.serialNum = displaySerial(slot: slot)
             d.terminationHandler = { _, _ in eprint("virtual display terminated by system") }
-            if let vd = CGVirtualDisplay(descriptor: d) { created = (vd, serial); break }
+            return CGVirtualDisplay(descriptor: d)
         }
-        guard let (vd, serial) = created else { throw CLIError("CGVirtualDisplay init failed") }
+        func lowestFree(_ slots: [Int]) throws -> (CGVirtualDisplay, Int)? {
+            guard let inUse = displaySlotsInUse() else { throw CLIError("cannot list the online displays") }
+            for slot in slots where !inUse.contains(slot) { if let vd = make(slot) { return (vd, slot) } }
+            return nil
+        }
+        func exactly(_ wanted: Int, wait: Double) throws -> (CGVirtualDisplay, Int)? {
+            // Right after a stop, the old display can still be online for a moment.
+            try waitFor(timeout: wait, interval: 0.25) { () throws -> (CGVirtualDisplay, Int)? in
+                guard let inUse = displaySlotsInUse() else { throw CLIError("cannot list the online displays") }
+                guard !inUse.contains(wanted), let vd = make(wanted) else { return nil }
+                return (vd, wanted)
+            }
+        }
+        var created: (CGVirtualDisplay, Int)?
+        switch choice {
+        case .home:
+            if let wanted = try requestedDisplaySlot() {
+                created = try exactly(wanted, wait: 5)
+                guard created != nil else { throw CLIError("display \(wanted) is in use") }
+            } else {
+                created = try lowestFree(Array(sharedDisplaySlots))
+                guard created != nil else {
+                    throw CLIError("displays \(sharedDisplaySlots.lowerBound)-\(sharedDisplaySlots.upperBound) are all in use (BACKSTAGE_DISPLAY picks one)")
+                }
+            }
+        case .exactly(let wanted):
+            created = try exactly(wanted, wait: 0)
+            guard created != nil else { throw CLIError("display \(wanted) is in use") }
+        case .lowestFree(let slots):
+            created = try lowestFree(slots)
+            guard created != nil else { throw CLIError("no free display left (\(slots.map(String.init).joined(separator: ", ")) are in use)") }
+        }
+        guard let (vd, slot) = created else { throw CLIError("CGVirtualDisplay init failed") }
         let s = CGVirtualDisplaySettings()
         s.hiDPI = scale > 1 ? 1 : 0
         s.modes = [CGVirtualDisplayMode(width: width, height: height, refreshRate: 30)]
         guard vd.apply(s) else { throw CLIError("CGVirtualDisplay applySettings failed") }
+        // A virtual display comes online once it has a mode; only then can others see the slot taken.
+        guard waitFor(timeout: 5, { (onlineDisplays() ?? []).contains(vd.displayID) ? true : nil }) != nil else {
+            throw CLIError("could not bring the agent display online")
+        }
         display = vd
-        self.serial = serial
+        self.slot = slot
+        self.serial = displaySerial(slot: slot)
         size = (width, height, scale)
     }
     let size: (width: UInt32, height: UInt32, scale: UInt32)
+    let slot: Int
     let serial: UInt32
 
     /// macOS remembers the last mode used for this display (vendor/product/serial), so a display

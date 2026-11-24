@@ -28,6 +28,8 @@ struct LaunchRecord: Codable {
     /// Set by a `launch` that gave up because the app's process hadn't appeared in time: the
     /// daemon registers the app to `session` if it turns up later, instead of quitting it.
     var handedOver: Bool? = nil
+    /// The display the app goes on (a slot); nil: the primary display.
+    var display: Int? = nil
 
     var cliAlive: Bool { processBirth(cliPID) == cliStart }
     var receipt: URL { Paths.appLogs.appendingPathComponent("\(id).pid") }

@@ -1,0 +1,125 @@
+#!/bin/bash
+# Several displays per daemon (docs/MULTI_DISPLAY_PLAN.md, phase 2): `launch --display new`,
+# reservations and their expiry, session affinity, coordinates on a second display, the window
+# guard keeping each app on its own display, `move`, `crowded`, and an empty extra display going
+# away. Runs on displays 7 (primary) and 8 (extra) only, with a small display so it crowds fast.
+set -uo pipefail
+cd "$(dirname "$0")"
+ROOT="$(cd .. && pwd)"
+if [[ -z ${BACKSTAGE_BIN:-} ]]; then
+    (cd "$ROOT" && make build) || exit 1
+    BACKSTAGE_BIN="$(cd "$ROOT" && swift build -c release --show-bin-path)/backstage"
+fi
+BS="$BACKSTAGE_BIN"
+WORK="$(mktemp -d /tmp/backstage-multidisplay.XXXX)" || exit 1
+export BACKSTAGE_HOME="$WORK/state" BACKSTAGE_DISPLAY=7 BACKSTAGE_EXTRA_DISPLAYS=8
+export BACKSTAGE_RESERVATION_SECONDS=10 BACKSTAGE_EXTRA_DISPLAY_GRACE=3 BACKSTAGE_WIDTH=900 BACKSTAGE_HEIGHT=600
+mkdir -p "$BACKSTAGE_HOME"
+WATCH=
+FAIL=0
+pass() { echo "  ok   $*"; }
+fail() { echo "  FAIL $*"; FAIL=1; }
+cleanup() {
+    local result=$?
+    trap - EXIT
+    [[ -f "$BACKSTAGE_HOME/daemon.json" ]] && "$BS" stop --all > /dev/null 2>&1
+    if [[ -n $WATCH ]]; then touch "$WORK/watch.stop"; wait "$WATCH" || result=1; cat "$WORK/watch.out"; fi
+    echo "artifacts: $WORK"
+    exit "$result"
+}
+trap cleanup EXIT
+trap 'exit 130' INT
+trap 'exit 143' TERM
+
+echo "== build fixtures"
+APP="$WORK/BackstageTestApp.app"
+mkdir -p "$APP/Contents/MacOS"
+swiftc -O TestApp.swift -o "$APP/Contents/MacOS/BackstageTestApp" || exit 1
+BID="dev.backstage.testapp.${WORK##*.}"
+cat > "$APP/Contents/Info.plist" <<PLIST
+<?xml version="1.0" encoding="UTF-8"?><!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd"><plist version="1.0"><dict>
+<key>CFBundleExecutable</key><string>BackstageTestApp</string><key>CFBundleIdentifier</key><string>$BID</string><key>CFBundleName</key><string>BackstageTestApp</string><key>CFBundlePackageType</key><string>APPL</string><key>NSPrincipalClass</key><string>NSApplication</string></dict></plist>
+PLIST
+swiftc -O watch.swift -o "$WORK/watch" || exit 1
+swiftc -O csdevices.swift -o "$WORK/csdevices" || exit 1
+"$WORK/watch" "$BID" 300 "$WORK/watch.stop" > "$WORK/watch.out" 2>&1 &
+WATCH=$!
+DEVICES0=$("$WORK/csdevices")
+
+as() { local who=$1; shift; BACKSTAGE_SESSION="$who" "$BS" "$@"; }
+launch() {  # session, pad colour, extra args… ; prints the launch JSON
+    local who=$1 pad=$2; shift 2
+    as "$who" launch "$APP" --env "TESTAPP_LOG=$WORK/$who-$pad.log" --env "TESTAPP_PAD=$pad" "$@"
+}
+displays() { "$BS" status | jq -c '[.daemon.displays[]? | .display]'; }
+
+echo "== one display: nothing changes"
+OUT=$(launch A blue)
+PA=$(echo "$OUT" | jq -r .pid)
+[[ $(echo "$OUT" | jq -r .display) == 7 ]] && pass "A's app is on display 7 (the primary)" || fail "A's launch: $OUT"
+
+echo "== a display of your own"
+OUT=$(launch B green --display new)
+PB=$(echo "$OUT" | jq -r .pid)
+[[ $(echo "$OUT" | jq -r .display) == 8 ]] && pass "B's --display new got display 8" || fail "B's launch: $OUT"
+"$BS" status | jq -e '.daemon.displays[] | select(.display == 8) | .reservedBy == "B"' > /dev/null \
+    && pass "status shows display 8 reserved for B" || fail "status: $("$BS" status | jq -c .daemon.displays)"
+as B list | jq -e --argjson p "$PB" '.apps[] | select(.pid == $p) | .display == 8' > /dev/null && pass "list shows B's app on 8" || fail "list: $(as B list | jq -c .apps)"
+
+echo "== coordinates on display 8 are display 8's"
+PADXY=$(as B find --pid "$PB" --role window --text BackstageTestApp | jq -r '.elements[0].frame | "\(.x + 100) \(.y + .h - 40)"')
+as B click $PADXY --pid "$PB" > /dev/null
+for _ in $(seq 1 40); do grep -q "pad click 1" "$WORK/B-green.log" 2>/dev/null && break; sleep 0.1; done
+grep -q "pad click 1" "$WORK/B-green.log" && pass "a coordinate click at ($PADXY) on display 8 hit B's pad" || fail "click on display 8 missed"
+SHOT=$(as B screenshot --pid "$PB")
+[[ $(echo "$SHOT" | jq -r '.width > 0') == true ]] && pass "B's screenshot comes from display 8" || fail "screenshot: $SHOT"
+FULL=$(as B screenshot --full)
+[[ $(echo "$FULL" | jq -r .display) == 8 ]] && pass "screenshot --full picks B's only display" || fail "--full: $FULL"
+FILL=$(as B window fill --pid "$PB")
+echo "$FILL" | jq -e '.frame.x >= 0 and .frame.y >= 0 and .frame.x + .frame.w <= 900 and .frame.y + .frame.h <= 600' > /dev/null \
+    && pass "window fill stays inside display 8" || fail "window fill: $FILL"
+
+echo "== each app stays on its own display"
+sleep 2
+as B windows --pid "$PB" | jq -e '.windows[0].frame | .x >= 0 and .y >= 0 and .x < 900 and .y < 600' > /dev/null \
+    && pass "the window guard left B's window on display 8" || fail "B's window moved: $(as B windows --pid "$PB" | jq -c .windows)"
+as A windows --pid "$PA" | jq -e '.windows[0].frame | .x >= 0 and .y >= 0 and .x < 900 and .y < 600' > /dev/null \
+    && pass "A's window is still on display 7" || fail "A's window: $(as A windows --pid "$PA" | jq -c .windows)"
+
+echo "== session affinity and crowding"
+OUT=$(launch B red)
+PB2=$(echo "$OUT" | jq -r .pid)
+[[ $(echo "$OUT" | jq -r .display) == 8 ]] && pass "B's next launch (no --display) joins B's display 8" || fail "affinity: $OUT"
+[[ $(echo "$OUT" | jq -r '.crowded // false') == true ]] && pass "and says display 8 is crowded: $(echo "$OUT" | jq -r .warning | cut -c1-70)…" \
+    || fail "crowded not reported: $OUT"
+
+echo "== reservations"
+OUT=$(launch C blue --display 8 2>&1)
+echo "$OUT" | jq -e '.ok == false and (.error | test("reserved for another session"))' > /dev/null \
+    && pass "C can't launch on B's reserved display: $(echo "$OUT" | jq -r .error)" || fail "C on 8: $OUT"
+OUT=$(launch C blue)
+PC=$(echo "$OUT" | jq -r .pid)
+OUT=$(as C move --pid "$PC" --display 8 2>&1)
+echo "$OUT" | jq -e '.ok == false and (.error | test("reserved"))' > /dev/null && pass "C can't move onto it either" || fail "C move: $OUT"
+echo "   (waiting for the reservation to expire)"
+sleep 10
+OUT=$(as C move --pid "$PC" --display 8)
+[[ $(echo "$OUT" | jq -r .display) == 8 ]] && pass "after it expired, C moved its app to display 8" || fail "C move after expiry: $OUT"
+as C windows --pid "$PC" | jq -e '.windows[0].frame | .x >= 0 and .y >= 0 and .x < 900 and .y < 600' > /dev/null \
+    && pass "C's window followed it to display 8" || fail "C's window: $(as C windows --pid "$PC" | jq -c .windows)"
+
+echo "== an empty extra display goes away"
+as B quit --pid "$PB" > /dev/null; as B quit --pid "$PB2" > /dev/null; as C move --pid "$PC" --display 7 > /dev/null
+for _ in $(seq 1 30); do [[ $(displays) == '[]' || $(displays) == '[7]' ]] && break; sleep 0.25; done
+[[ $(displays) == '[]' || $(displays) == '[7]' ]] && pass "display 8 was removed once nothing was on it" || fail "displays left: $(displays)"
+DEVICES1=$("$WORK/csdevices")
+[[ $DEVICES1 -le $((DEVICES0 + 1)) ]] && pass "ColorSync's backstage displays: $DEVICES0 before, $DEVICES1 after" \
+    || fail "ColorSync's backstage displays grew from $DEVICES0 to $DEVICES1"
+
+echo "== bad values"
+OUT=$(launch A blue --display 5 2>&1)
+echo "$OUT" | jq -e '.ok == false and (.error | test("isn.t one this daemon runs"))' > /dev/null && pass "a display this daemon can't run is refused" || fail "display 5: $OUT"
+
+"$BS" stop --all > /dev/null
+[[ $FAIL == 0 ]] && echo "multidisplay: all passed"
+exit $FAIL

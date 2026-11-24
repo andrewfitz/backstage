@@ -3,6 +3,8 @@
 # of the fixture and must stay out of each other's way. A watchdog asserts that nothing reaches the
 # user's screens while this runs.
 set -uo pipefail
+# backstage's own tests use displays 7-8, never the ones agents use (docs/MULTI_DISPLAY_PLAN.md).
+export BACKSTAGE_DISPLAY=${BACKSTAGE_DISPLAY:-7}
 cd "$(dirname "$0")"
 ROOT="$(cd .. && pwd)"
 if [[ -z ${BACKSTAGE_BIN:-} ]]; then
@@ -28,7 +30,7 @@ cleanup() {
         "$BS" stop --all >/dev/null 2>&1 || "$BS" stop >/dev/null 2>&1 || result=1
     fi
     if [[ -f "$HOME2/daemon.json" || -f "$HOME2/apps.json" ]]; then
-        BACKSTAGE_HOME="$HOME2" "$BS" stop --all >/dev/null 2>&1 || result=1
+        BACKSTAGE_HOME="$HOME2" BACKSTAGE_DISPLAY=8 "$BS" stop --all >/dev/null 2>&1 || result=1
     fi
     if [[ -n "$SLEEPER" ]]; then kill "$SLEEPER" 2>/dev/null; wait "$SLEEPER" 2>/dev/null; fi
     if [[ -n "$WATCH" ]]; then
@@ -254,7 +256,7 @@ sleep 0.5
 ! alive "$PD" && ! daemon_up && pass "the last session's stop stopped the daemon" || fail "daemon or app left running"
 
 echo "== two homes: two daemons at once, displays apart, each guarding its own windows"
-h2() { BACKSTAGE_HOME="$HOME2" BACKSTAGE_SESSION=A "$BS" "$@"; }
+h2() { BACKSTAGE_HOME="$HOME2" BACKSTAGE_DISPLAY=8 BACKSTAGE_SESSION=A "$BS" "$@"; }
 # Succeeds once every display of the two homes meets every other display (the user's, each
 # other's, any other backstage display) at most at a corner point.
 layout_ok() {

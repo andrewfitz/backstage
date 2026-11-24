@@ -2,6 +2,8 @@
 # End-to-end test: drives a fixture app entirely through backstage while a watchdog asserts that
 # nothing appears on the user's screens, the fixture stays in the background, and the cursor stays on a user display.
 set -euo pipefail
+# backstage's own tests use displays 7-8, never the ones agents use (docs/MULTI_DISPLAY_PLAN.md).
+export BACKSTAGE_DISPLAY=${BACKSTAGE_DISPLAY:-7}
 cd "$(dirname "$0")"
 ROOT="$(cd .. && pwd)"
 if [[ -z ${BACKSTAGE_BIN:-} ]]; then

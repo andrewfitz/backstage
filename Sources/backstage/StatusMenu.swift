@@ -37,6 +37,13 @@ final class StatusMenu: NSObject, NSMenuDelegate {
     private var hero: MenuHeroView?
     private var heroItem: NSMenuItem?
     private var heroShape = ""
+    /// Several displays: which page of pictures is showing (two per page), the display each
+    /// picture shows, the last picture of each display (shown faded at once when paging to it),
+    /// and the pictures still to capture this round (one capture at a time).
+    private var page = 0
+    private var visibleSlots: [Int] = []
+    private var lastImages: [Int: CGImage] = [:]
+    private var captureQueue: [(index: Int, slot: Int)] = []
     /// Each app's row, and what the rows were built from (to notice apps coming and going).
     private var rows: [pid_t: NSMenuItem] = [:]
     private var rowsKey: [String] = []
@@ -226,7 +233,7 @@ final class StatusMenu: NSObject, NSMenuDelegate {
     /// "Running for 12 min", plus only what's worth a second look: no windows, or sound. If
     /// that's too long for the menu's width, how long it has run is the part that goes.
     /// `sent`: the user sent it backstage (launchedAt is when), so its age is "Sent … ago".
-    static func detail(launchedAt: Double, now: Double, windows: Int, playing: Bool, sent: Bool = false) -> String {
+    static func detail(launchedAt: Double, now: Double, windows: Int, playing: Bool, sent: Bool = false, display: Int? = nil) -> String {
         let minutes = max(0, Int(now - launchedAt)) / 60, hours = minutes / 60
         var age: String
         switch minutes {
@@ -243,6 +250,11 @@ final class StatusMenu: NSObject, NSMenuDelegate {
         let font = NSFont.menuFont(ofSize: NSFont.smallSystemFontSize)
         func fits(_ text: String) -> Bool { (text as NSString).size(withAttributes: [.font: font]).width <= detailWidth }
         if parts.count > 1, !fits(parts.joined(separator: " · ")) { parts.removeFirst() }
+        // With several displays, which one leads (it's what pointing at the row is about).
+        if let display {
+            parts.insert("Display \(display)", at: 0)
+            while parts.count > 1, !fits(parts.joined(separator: " · ")) { parts.remove(at: 1) }
+        }
         return parts.joined(separator: " · ")
     }
 
@@ -292,7 +304,9 @@ final class StatusMenu: NSObject, NSMenuDelegate {
         refreshTimer?.invalidate()
         refreshTimer = nil
         thumbnailGeneration += 1
-        if let preview = hero?.preview {
+        captureQueue = []
+        page = 0
+        for preview in hero?.previews ?? [] {
             preview.highlighted = []
             preview.resetPointer()
             preview.message = nil
@@ -303,30 +317,103 @@ final class StatusMenu: NSObject, NSMenuDelegate {
     deinit { refreshTimer?.invalidate() }
 
     /// Pointing at an app's row picks its windows out in the picture.
+    /// With several displays, only its display's picture; one that's on another page lights the
+    /// arrow toward it instead (the menu doesn't page by itself).
     func menu(_ menu: NSMenu, willHighlight item: NSMenuItem?) {
         let pid = item.flatMap { item in rows.first { $0.value === item }?.key }
-        hero?.preview?.highlighted = pid.map { [$0] } ?? []
+        let slot = pid.flatMap { p in daemon?.registry.first { $0.pid == p } }.map { $0.display ?? (daemon?.display.slot ?? 1) }
+        for (i, preview) in (hero?.previews ?? []).enumerated() {
+            preview.highlighted = pid != nil && visibleSlots.indices.contains(i) && visibleSlots[i] == slot ? [pid!] : []
+        }
+        var toward = 0
+        if let slot, !visibleSlots.contains(slot), let all = daemon?.allDisplays.map({ $0.slot }),
+           let at = all.firstIndex(of: slot), let first = visibleSlots.first, let firstAt = all.firstIndex(of: first) {
+            toward = at < firstAt ? -1 : 1
+        }
+        updatePager(toward: toward)
     }
 
     private func rebuild() {
         thumbnailGeneration += 1
         menu.removeAllItems()
         guard let d = daemon else { return }
-        // This daemon's display only: other homes' daemons show theirs in their own menus.
+        // This daemon's displays only: other homes' daemons show theirs in their own menus.
         let id = d.display.id
         let b = CGDisplayBounds(id)
         let area = CGSize(width: b.width, height: b.height - Self.menuBarHeight(id))
-        let shape = CGDisplayIsActive(id) != 0 && area.width > 0 && area.height > 0 ? "\(area.width)x\(area.height)" : "none"
+        let count = d.allDisplays.count
+        let shape = (CGDisplayIsActive(id) != 0 && area.width > 0 && area.height > 0 ? "\(area.width)x\(area.height)" : "none")
+            + (count > 2 ? "|paged" : count > 1 ? "|stacked" : "")
         if hero == nil || shape != heroShape {
             let item = NSMenuItem()
-            let view = MenuHeroView(previewWidth: Self.thumbWidth, aspect: shape == "none" ? nil : area.width / area.height)
+            let view = MenuHeroView(previewWidth: Self.thumbWidth, aspect: shape.hasPrefix("none") ? nil : area.width / area.height,
+                                    stacked: count > 1, paged: count > 2, onPage: { [weak self] delta in self?.turnPage(delta) })
             item.view = view
             hero = view
             heroItem = item
             heroShape = shape
         }
         if let heroItem { menu.addItem(heroItem) }
+        showPage()
         rebuildRows()
+    }
+
+    /// Which displays a page shows, `perPage` at a time.
+    struct Page: Equatable {
+        let page: Int, visible: [Int], first: Int, last: Int, total: Int, canBack: Bool, canForward: Bool
+    }
+    static func page(_ requested: Int, of slots: [Int], perPage: Int) -> Page {
+        guard perPage > 0, !slots.isEmpty else { return Page(page: 0, visible: [], first: 0, last: 0, total: slots.count, canBack: false, canForward: false) }
+        let pages = (slots.count + perPage - 1) / perPage
+        let p = min(max(requested, 0), pages - 1)
+        let visible = Array(slots[(p * perPage)..<min(slots.count, p * perPage + perPage)])
+        return Page(page: p, visible: visible, first: p * perPage + 1, last: p * perPage + visible.count, total: slots.count,
+                    canBack: p > 0, canForward: p < pages - 1)
+    }
+
+    /// Point the pictures at the current page's displays (labels, cached pictures, pager).
+    private func showPage() {
+        guard let d = daemon, let hero else { return }
+        let slots = d.allDisplays.map { $0.slot }
+        guard slots.count > 1 else { visibleSlots = [d.display.slot]; return }
+        let perPage = hero.previews.count
+        let shown = Self.page(page, of: slots, perPage: perPage)
+        page = shown.page
+        visibleSlots = shown.visible
+        let apps = d.registry.filter { $0.matchesProcess }
+        for i in 0..<perPage {
+            guard i < visibleSlots.count else { hero.setLabel(nil, at: i); continue }
+            let slot = visibleSlots[i]
+            let n = apps.filter { ($0.display ?? d.display.slot) == slot }.count
+            var text = "Display \(slot) · \(n == 1 ? "1 app" : "\(n) apps")"
+            if d.reservations[slot].map({ $0.until > Date().timeIntervalSince1970 }) == true { text += " · reserved" }
+            hero.setLabel(text, at: i)
+            let preview = hero.previews[i]
+            if let image = lastImages[slot], preview.shownSlot != slot {
+                preview.setImage(image)
+                preview.isStale = true
+            } else if preview.shownSlot != slot {
+                preview.clearImage()
+            }
+            preview.shownSlot = slot
+        }
+        updatePager()
+    }
+
+    private func updatePager(toward: Int = 0) {
+        guard let d = daemon, let hero else { return }
+        let slots = d.allDisplays.map { $0.slot }
+        guard slots.count > 2 else { return }
+        let shown = Self.page(page, of: slots, perPage: hero.previews.count)
+        hero.setPage(first: shown.first, last: shown.last, of: shown.total, canBack: shown.canBack, canForward: shown.canForward, toward: toward)
+    }
+
+    private func turnPage(_ delta: Int) {
+        page += delta
+        thumbnailGeneration += 1
+        captureQueue = []
+        showPage()
+        refreshThumbnails()
     }
 
     /// Everything below the picture. Also run while the menu is open, when apps come or go.
@@ -443,8 +530,9 @@ final class StatusMenu: NSObject, NSMenuDelegate {
         let now = Date().timeIntervalSince1970
         for app in apps {
             guard let row = rows[app.pid] else { continue }
+            let multi = d.allDisplays.count > 1
             let detail = Self.detail(launchedAt: app.launchedAt, now: now, windows: windows[app.pid] ?? 0, playing: playing.contains(app.pid),
-                                     sent: Session.isUser(app.session))
+                                     sent: Session.isUser(app.session), display: multi ? (app.display ?? d.display.slot) : nil)
             if #available(macOS 14.4, *) {
                 if row.subtitle != detail { row.subtitle = detail }
             } else if row.toolTip != detail {
@@ -452,12 +540,15 @@ final class StatusMenu: NSObject, NSMenuDelegate {
             }
         }
 
+        if d.allDisplays.count > 1 { showPage() }
         // A picture that has stopped updating says so, rather than passing for live.
-        if refreshTimer != nil, let preview = hero?.preview {
+        if refreshTimer != nil {
             let since = max(lastFrame, openedAt)
-            if ProcessInfo.processInfo.systemUptime - since > 3.5 {
-                preview.isStale = false
-                preview.message = preview.hasImage ? "Preview paused" : "Preview unavailable"
+            if ProcessInfo.processInfo.systemUptime - since > 3.5 + Double(visibleSlots.count - 1) {
+                for preview in hero?.previews ?? [] where !preview.isHidden {
+                    preview.isStale = false
+                    preview.message = preview.hasImage ? "Preview paused" : "Preview unavailable"
+                }
             }
         }
     }
@@ -466,26 +557,26 @@ final class StatusMenu: NSObject, NSMenuDelegate {
     /// window list: no call into the apps, so a hung app can't hold up the menu.
     private func managedWindows(of apps: [ManagedApp]) -> [(pid: pid_t, bounds: CGRect)] {
         guard let d = daemon, !apps.isEmpty else { return [] }
-        let display = d.display.bounds
+        let displays = d.allDisplays.map { $0.bounds }
         let pids = Set(apps.map { $0.pid })
         return onscreenWindows().compactMap { window in
             guard let pid = window[kCGWindowOwnerPID as String] as? pid_t, pids.contains(pid),
                   (window[kCGWindowLayer as String] as? Int) == 0 else { return nil }
             let bounds = cgBounds(window)
-            guard display.intersects(bounds) else { return nil }
+            guard displays.contains(where: { $0.intersects(bounds) }) else { return nil }
             return (pid, bounds)
         }
     }
 
     /// Where each managed window is in the picture, front to back.
-    private func regions() -> [DisplayPreviewView.Region] {
-        guard let d = daemon else { return [] }
-        let id = d.display.id
+    private func regions(slot: Int) -> [DisplayPreviewView.Region] {
+        guard let d = daemon, let shown = d.allDisplays.first(where: { $0.slot == slot }) else { return [] }
+        let id = shown.id
         let display = CGDisplayBounds(id)
         let bar = Self.menuBarHeight(id)
         let area = CGRect(x: display.minX, y: display.minY + bar, width: display.width, height: display.height - bar)
         guard area.width > 0, area.height > 0 else { return [] }
-        let apps = d.registry.filter { $0.matchesProcess }
+        let apps = d.registry.filter { $0.matchesProcess && ($0.display ?? d.display.slot) == slot }
         let names = Dictionary(apps.map { ($0.pid, $0.name) }, uniquingKeysWith: { first, _ in first })
         return managedWindows(of: apps).compactMap { window in
             let r = window.bounds.intersection(area)
@@ -501,8 +592,19 @@ final class StatusMenu: NSObject, NSMenuDelegate {
     /// The picture is captured at its own size in the pixels of the screen the menu is on, so
     /// it's as sharp as that screen can show it.
     private func refreshThumbnails() {
-        guard !capturing, let d = daemon, let preview = hero?.preview else { return }
-        let id = d.display.id
+        guard captureQueue.isEmpty else { return }   // last round still going
+        captureQueue = visibleSlots.enumerated().map { (index: $0.offset, slot: $0.element) }
+        captureNext()
+    }
+
+    /// One capture in flight at a time; a result for a picture that now shows another display
+    /// (the page turned) is dropped.
+    private func captureNext() {
+        guard !capturing, !captureQueue.isEmpty, let d = daemon, let hero else { return }
+        let (index, slot) = captureQueue.removeFirst()
+        guard hero.previews.indices.contains(index), let shown = d.allDisplays.first(where: { $0.slot == slot }) else { captureNext(); return }
+        let preview = hero.previews[index]
+        let id = shown.id
         var executable = [CChar](repeating: 0, count: Int(MAXPATHLEN))
         guard proc_pidpath(getpid(), &executable, UInt32(executable.count)) > 0 else { return }
         let size = preview.bounds.size
@@ -529,7 +631,9 @@ final class StatusMenu: NSObject, NSMenuDelegate {
             DispatchQueue.main.async { [weak self] in
                 guard let self else { return }
                 self.capturing = false
-                guard self.refreshTimer != nil, generation == self.thumbnailGeneration else { return }
+                guard self.refreshTimer != nil else { return }
+                defer { self.captureNext() }
+                guard generation == self.thumbnailGeneration else { return }
                 guard let image else {
                     // Status 0 without a picture: another capture had the lock, so this one was skipped.
                     if status != 0, !self.captureFailureLogged {
@@ -538,11 +642,14 @@ final class StatusMenu: NSObject, NSMenuDelegate {
                     }
                     return
                 }
-                guard let preview = self.hero?.preview else { return }
+                self.lastImages[slot] = image
+                guard self.visibleSlots.indices.contains(index), self.visibleSlots[index] == slot,
+                      let preview = self.hero?.previews[safe: index] else { return }
                 self.lastFrame = ProcessInfo.processInfo.systemUptime
                 preview.message = nil
                 preview.setImage(image)
-                preview.regions = self.regions()
+                preview.shownSlot = slot
+                preview.regions = self.regions(slot: slot)
             }
         }
     }
@@ -628,7 +735,8 @@ func runMenuThumbnail(_ args: Args) throws {
           let height = args.pos(3).flatMap(Int.init), (1...4096).contains(height) else {
         throw CLIError("invalid thumbnail dimensions")
     }
-    guard let daemon = liveDaemon(), daemon.pid == getppid(), daemon.displayID == id, daemon.stopping != true else {
+    guard let daemon = liveDaemon(), daemon.pid == getppid(), daemon.stopping != true,
+          daemon.displayID == id || daemon.displays?.contains(where: { $0.displayID == id }) == true else {
         throw CLIError("thumbnail capture must target the parent daemon's live backstage display")
     }
     guard let lock = try? StateLock("capture.lock", nonblocking: true),
@@ -658,4 +766,36 @@ func runMenuThumbnail(_ args: Args) throws {
         catch { exit(1) }
         exit(0)
     }
+}
+
+/// TEST ONLY (`__menu-render`): the top of the menu with `--displays N` synthetic displays on
+/// page `--page P`, rendered to `-o file.png`, so layouts for 1-8 displays are checked without
+/// creating any. Prints the view's size, each picture's frame and what's shown.
+func runMenuRender(_ args: Args) throws -> [String: Any] {
+    _ = NSApplication.shared
+    let n = max(1, min(8, args.int("displays") ?? 1))
+    let slots = Array(1...n)
+    let view = MenuHeroView(previewWidth: StatusMenu.thumbWidth, aspect: 16.0 / 10, stacked: n > 1, paged: n > 2)
+    // Offscreen there's no window to take the appearance from; the menu's own follows the system.
+    view.appearance = NSAppearance(named: args.opt("appearance") == "dark" ? .darkAqua : .aqua)
+    let shown = StatusMenu.page(args.int("page") ?? 0, of: n > 1 ? slots : [1], perPage: view.previews.count)
+    let colors: [NSColor] = [.systemBlue, .systemGreen, .systemOrange, .systemPurple, .systemPink, .systemTeal, .systemYellow, .systemRed]
+    for (i, preview) in view.previews.enumerated() {
+        if n > 1 { view.setLabel(i < shown.visible.count ? "Display \(shown.visible[i]) · \(i + 1) apps" : nil, at: i) }
+        guard i < shown.visible.count else { continue }
+        let size = CGSize(width: 64, height: 40)
+        let image = NSImage(size: size, flipped: false) { r in colors[(shown.visible[i] - 1) % colors.count].setFill(); r.fill(); return true }
+        var rect = CGRect(origin: .zero, size: size)
+        if let cg = image.cgImage(forProposedRect: &rect, context: nil, hints: nil) { preview.setImage(cg) }
+    }
+    if n > 2 { view.setPage(first: shown.first, last: shown.last, of: shown.total, canBack: shown.canBack, canForward: shown.canForward) }
+    view.layoutSubtreeIfNeeded()
+    if let out = args.opt("o"), let rep = view.bitmapImageRepForCachingDisplay(in: view.bounds) {
+        view.cacheDisplay(in: view.bounds, to: rep)
+        try rep.representation(using: .png, properties: [:])?.write(to: URL(fileURLWithPath: out))
+    }
+    return ["width": view.bounds.width, "height": view.bounds.height, "visible": shown.visible,
+            "first": shown.first, "last": shown.last, "canBack": shown.canBack, "canForward": shown.canForward,
+            "previews": view.previews.map { ["y": $0.frame.minY, "height": $0.frame.height, "hidden": $0.isHidden] },
+            "pager": view.pagerFrames ?? NSNull()]
 }

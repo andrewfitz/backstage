@@ -21,15 +21,20 @@ Default: your session's most recently launched app. Apps the user sent backstage
 
 LIFECYCLE
   launch <App.app|bundle.id|Name|/path/to/executable> [--env K=V]... [--timeout S] [--dock]
-         [--audio | --inaudible] [-- args…]
+         [--audio | --inaudible] [--display N|new] [-- args…]
                                     hidden, muted, no Dock tile or ⌘-Tab entry (--dock: with one).
                                     Dev builds and test runners are also made inaudible everywhere,
                                     screen sharing and recordings included ("audio": "inaudible");
                                     other apps are muted on this Mac only ("audio": "muted").
                                     --audio: measure its sound (screen sharing can hear it);
                                     --inaudible: fail unless it can be made inaudible
+                                    --display new: a display of your own (reserved for your session
+                                    for 30 min; it goes away when its apps quit); --display N: that
+                                    one. Without it: your session's display, else display 1. A result
+                                    with "crowded": true means the window found no free spot
   list [--all]                      your session's apps + their windows (--all: every session)
   quit [--pid P] [--force]          quit a managed app
+  move --display N|new [--pid P]    move an app to another display (coordinates follow it)
   status | doctor                   daemon/display/permission status, and the display's
                                     `screencapture -D` index (to record it with standard tools);
                                     doctor also runs the audio self-test (inaudible, muted probe)
@@ -42,6 +47,7 @@ LIFECYCLE
   settings hotkey <combo|off>       Send Front Window Backstage shortcut (default ctrl+opt+cmd+b);
                                     two or more modifiers incl. cmd or ctrl, plus a letter, digit or F-key
   logs [--pid P] [--lines N]        tail the app's stdout/stderr
+  cleanup-displays                  (sudo) remove leftover backstage displays from ColorSync
   version                           print the version (also `status`'s "version")
 
 HIDDEN OR SHOWN? Use launch for your own work (build checks, tests, debugging, screenshots).
@@ -58,7 +64,7 @@ AGENT INTEGRATION
                                     (bypass for a user-requested open: BACKSTAGE_SHOW=1 <cmd>)
 
 SEE
-  screenshot [-o out.png] [--window I] [--full] [--scale S]
+  screenshot [-o out.png] [--window I] [--full [--display N]] [--scale S]
                                     (--full: the whole display, showing all of your session's apps
                                     and nothing else)
   tree [--window I] [--depth N] [--json]           accessibility tree with element refs
@@ -142,6 +148,18 @@ func requireDaemon() throws -> DaemonInfo {
     return d
 }
 
+/// The daemon as seen from a managed app's display: bounds and display ID are that display's,
+/// so coordinates, crops and placement are relative to it (docs/MULTI_DISPLAY_PLAN.md).
+func requireDaemon(for pid: pid_t) throws -> DaemonInfo { try daemonView(requireDaemon(), for: pid) }
+
+func daemonView(_ d: DaemonInfo, for pid: pid_t) throws -> DaemonInfo {
+    let slot = AppStore.load().first { $0.pid == pid }?.display
+    guard let view = d.on(slot) else {
+        throw CLIError("display \(slot.map(String.init) ?? "?") of pid \(pid) is gone; move it with `backstage move --pid \(pid) --display \(d.primarySlot)`")
+    }
+    return view
+}
+
 /// Input that can open a menu (a right-click, a pressed pop-up button or menu bar item) hands
 /// the app the keyboard focus; only the daemon's input guard keeps the user's typing out of it.
 /// Without the guard, refuse rather than risk it.
@@ -210,8 +228,7 @@ func doClick(global p: CGPoint, pid: pid_t, args: Args) throws -> [String: Any] 
 }
 
 func cmdScreenshot(_ args: Args) throws -> [String: Any] {
-    let d = try requireDaemon()
-    let vd = d.bounds
+    let base = try requireDaemon()
     let scale = args.double("scale") ?? 1
     let me = try Session.current().id
     let outArg: String
@@ -226,13 +243,30 @@ func cmdScreenshot(_ args: Args) throws -> [String: Any] {
     if args.has("full") {
         // The display is shared: capture every window of this session's apps (and nothing
         // else, from the same window snapshot), over the whole display.
-        let pids = Set(try AppStore.read(matching: { Session.sameID($0.session, me) }).map(\.pid))
-        guard !pids.isEmpty else { throw CLIError("no managed apps in this session; --full captures all of your session's apps, so launch one first") }
-        let size = try capture(.apps(pids, display: d.displayID, crop: vd), to: out, scale: scale)
+        let mine = try AppStore.read(matching: { Session.sameID($0.session, me) })
+        guard !mine.isEmpty else { throw CLIError("no managed apps in this session; --full captures all of your session's apps, so launch one first") }
+        // One display at a time: --display N, or the one display this session's apps are on.
+        let slots = Set(mine.map { $0.display ?? base.primarySlot })
+        let slot: Int
+        if let raw = args.opt("display") {
+            guard let n = Int(raw) else { throw CLIError("--display takes a display number") }
+            slot = n
+        } else {
+            guard slots.count == 1, let only = slots.first else {
+                throw CLIError("your session's apps are on displays \(slots.sorted().map(String.init).joined(separator: ", ")); pick one with --display N")
+            }
+            slot = only
+        }
+        guard let d = base.on(slot) else { throw CLIError("display \(slot) isn't running") }
+        let pids = Set(mine.filter { ($0.display ?? base.primarySlot) == slot }.map(\.pid))
+        guard !pids.isEmpty else { throw CLIError("none of your session's apps are on display \(slot)") }
+        let size = try capture(.apps(pids, display: d.displayID, crop: d.bounds), to: out, scale: scale)
         return ["path": out.path, "width": Int(size.width), "height": Int(size.height), "origin": ["x": 0, "y": 0], "scale": scale,
-                "pids": pids.sorted()]
+                "pids": pids.sorted(), "display": slot]
     }
     let pid = try managedPid(args)
+    let d = try daemonView(base, for: pid)
+    let vd = d.bounds
     if let ws = args.opt("window") {
         let w = try resolveWindow(pid, ws)
         guard let wid = w.windowID, let f = w.frame else { throw CLIError("window \(ws) has no id/frame") }
@@ -267,7 +301,7 @@ func agentVisibleFrame(_ d: DaemonInfo) -> CGRect {
 /// `window fill` / `window size <w> <h>`: resize one of the app's windows (default: its frontmost)
 /// with AX, staying inside the agent display.
 func cmdWindow(_ args: Args, pid: pid_t) throws -> [String: Any] {
-    let d = try requireDaemon()
+    let d = try requireDaemon(for: pid)
     let spec = args.opt("window") ?? "0"
     let w = try resolveWindow(pid, spec)
     guard let current = w.frame else { throw CLIError("window \(spec) has no frame") }
@@ -309,8 +343,9 @@ func cmdWindow(_ args: Args, pid: pid_t) throws -> [String: Any] {
 }
 
 func cmdTree(_ args: Args) throws {
-    let d = try requireDaemon()
+    let base = try requireDaemon()
     let pid = try managedPid(args)
+    let d = try daemonView(base, for: pid)
     let depth = args.int("depth") ?? 40
     if args.has("json") {
         var nodes: [[String: Any]] = []
@@ -333,8 +368,9 @@ func matches(_ i: ElementInfo, role: String?, text: String?) -> Bool {
 }
 
 func cmdFind(_ args: Args) throws -> [String: Any] {
-    let d = try requireDaemon()
+    let base = try requireDaemon()
     let pid = try managedPid(args)
+    let d = try daemonView(base, for: pid)
     let role = args.opt("role")?.lowercased(), text = (args.opt("text") ?? args.pos(0))?.lowercased()
     var out: [[String: Any]] = []
     try walkTree(pid: pid, window: args.opt("window"), maxDepth: 60) { i, _ in
@@ -347,8 +383,9 @@ func cmdFind(_ args: Args) throws -> [String: Any] {
 func cmdWait(_ args: Args) throws -> [String: Any] {
     let role = args.opt("role"), text = args.opt("text") ?? args.pos(0)
     guard role != nil || text != nil else { throw CLIError("wait needs --text and/or --role") }
-    let d = try requireDaemon()
+    let base = try requireDaemon()
     let pid = try managedPid(args)
+    let d = try daemonView(base, for: pid)
     let normalizedRole = role?.lowercased(), normalizedText = text?.lowercased()
     let timeout = args.double("timeout") ?? 10
     let gone = args.has("gone")
@@ -367,12 +404,14 @@ func cmdWait(_ args: Args) throws -> [String: Any] {
 }
 
 func cmdList(_ args: Args) throws -> [String: Any] {
-    let origin = liveDaemon()?.bounds.origin ?? .zero
+    let live = liveDaemon()
     let me = try Session.current().id
     let all = args.has("all")
     let apps = try AppStore.read(matching: { all || Session.sameID($0.session, me) }).map { a -> [String: Any] in
+        let view = live?.on(a.display)
         var d: [String: Any] = ["pid": a.pid, "name": a.name, "path": a.path, "session": a.owner,
-                                "windows": axWindowsSummary(a.pid, origin: origin)]
+                                "windows": axWindowsSummary(a.pid, origin: view?.bounds.origin ?? .zero)]
+        if let live { d["display"] = a.display ?? live.primarySlot }
         if let b = a.bundleID { d["bundleID"] = b }
         if let s = a.stdout { d["log"] = s }
         d["audio"] = a.audioMode.rawValue
@@ -419,6 +458,7 @@ func cmdStatus(doctor: Bool = false) throws -> [String: Any] {
         var daemon: [String: Any] = ["pid": d.pid, "displayID": d.displayID, "size": ["w": Int(d.width), "h": Int(d.height)],
                                      "globalOrigin": ["x": Int(d.x), "y": Int(d.y)]]
         if let source = d.sizeSource { daemon["sizeSource"] = source }
+        if let slot = displaySlot(serial: CGDisplaySerialNumber(d.displayID)) { daemon["display"] = slot }
         daemon["inputGuard"] = d.inputGuard == true
         if let mode = CGDisplayCopyDisplayMode(d.displayID) {
             daemon["pixels"] = ["w": mode.pixelWidth, "h": mode.pixelHeight]
@@ -431,6 +471,7 @@ func cmdStatus(doctor: Bool = false) throws -> [String: Any] {
             daemon["screencaptureDisplay"] = i + 1
             daemon["ffmpegScreen"] = "Capture screen \(i)"
         }
+        if (d.displays?.count ?? 1) > 1 || d.displays?.contains(where: { $0.reservedBy != nil }) == true { daemon["displays"] = displaysStatus(d) }
         s["daemon"] = daemon
     } else {
         s["daemon"] = NSNull()
@@ -454,6 +495,13 @@ func cmdStatus(doctor: Bool = false) throws -> [String: Any] {
     if !accessibility { problems.append("Accessibility not granted: System Settings > Privacy & Security > Accessibility — enable the app that runs this CLI (your terminal / agent host).") }
     if let d = live, d.inputGuard != true {
         problems.append("The daemon's input guard isn't running (see \(Paths.log.path)), so input commands refuse to run. Check Accessibility, then `backstage stop --all`.")
+    }
+    if doctor {
+        let leftovers = DisplayRegistry.leftovers().count
+        s["leftoverDisplays"] = leftovers
+        if leftovers > DisplayRegistry.warnAbove {
+            problems.append("ColorSync has \(leftovers) leftover backstage displays registered (older versions used a new display identity per BACKSTAGE_HOME); it slows down as that list grows. Remove them once: \(DisplayRegistry.cleanupCommand)")
+        }
     }
     if !recording { problems.append("Screen Recording not granted: System Settings > Privacy & Security > Screen & System Audio Recording — enable the terminal / agent host, then restart it.") }
     s["ok"] = problems.isEmpty
@@ -617,6 +665,9 @@ func run() throws {
         emit(result)
         if result["ok"] as? Bool == false { exit(1) }
     case "status", "doctor": emit(try cmdStatus(doctor: cmd == "doctor"))
+    case "cleanup-displays": emit(try cmdCleanupDisplays())
+    case "__menu-render": emit(try runMenuRender(args))
+    case "move": emit(try cmdMove(args))
     case "audio": emit(try cmdAudio(args))
     case "launch", "open": emit(try launch(args))
     case "list", "ps": emit(try cmdList(args))
@@ -634,7 +685,7 @@ func run() throws {
     case "logs": try cmdLogs(args)
     case "window": emit(try cmdWindow(args, pid: try inputTarget()))
     case "windows":
-        let d = try requireDaemon(); let pid = try managedPid(args)
+        let base = try requireDaemon(); let pid = try managedPid(args); let d = try daemonView(base, for: pid)
         emit(["pid": pid, "windows": axWindowsSummary(pid, origin: d.bounds.origin)])
     case "screenshot", "shot": emit(try cmdScreenshot(args))
     case "tree": try cmdTree(args)
@@ -663,7 +714,7 @@ func run() throws {
         pump(0.15)
         emit(["ok": true])
     case "click":
-        let d = try requireDaemon(); let pid = try inputTarget()
+        let base = try requireDaemon(); let pid = try inputTarget(); let d = try daemonView(base, for: pid)
         var res: [String: Any]
         var location: CGPoint?
         if let ref = args.opt("ref") {
@@ -686,7 +737,7 @@ func run() throws {
         pump(0.15)
         emit(res)
     case "hover":
-        let d = try requireDaemon(); let pid = try inputTarget()
+        let base = try requireDaemon(); let pid = try inputTarget(); let d = try daemonView(base, for: pid)
         let p = try point(args, 0, d.bounds)
         guard let hit = hitTest(p, pids: [pid]) else { throw CLIError("no window of pid \(pid) at that point") }
         if let w = axApp(pid).windows.first(where: { $0.windowID == hit.windowID }), (w.attr(kAXMainAttribute) as? Bool) != true {
@@ -699,12 +750,12 @@ func run() throws {
         }
         pump(0.1); emit(["ok": true])
     case "drag":
-        let d = try requireDaemon(); let pid = try inputTarget()
+        let base = try requireDaemon(); let pid = try inputTarget(); let d = try daemonView(base, for: pid)
         let a = try point(args, 0, d.bounds), b = try point(args, 2, d.bounds)
         guard let hit = hitTest(a, pids: [pid]) else { throw CLIError("no window of pid \(pid) at start point") }
         postDrag(from: a, to: b, hit: hit, steps: args.int("steps") ?? 20); pump(0.15); emit(["ok": true])
     case "scroll":
-        let d = try requireDaemon(); let pid = try inputTarget()
+        let base = try requireDaemon(); let pid = try inputTarget(); let d = try daemonView(base, for: pid)
         let p = try point(args, 0, d.bounds)
         guard let hit = hitTest(p, pids: [pid]) else { throw CLIError("no window of pid \(pid) at that point") }
         postScroll(at: p, hit: hit, dx: Int32(args.int("dx") ?? 0), dy: Int32(args.int("dy") ?? -100)); pump(0.15); emit(["ok": true])
