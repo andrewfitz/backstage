@@ -105,6 +105,12 @@ private func adoptVisibleWindows(pid: pid_t, display b: CGRect) -> Int {
     return moved
 }
 
+/// A duration from the environment: finite, at least 0, at most a day (tests shorten them).
+private func boundedSeconds(_ key: String, default value: Double) -> Double {
+    guard let raw = ProcessInfo.processInfo.environment[key], let v = Double(raw), v.isFinite, v >= 0, v <= 86_400 else { return value }
+    return v
+}
+
 final class Daemon {
     let owner: StateLock
     let startedAt = Date().timeIntervalSince1970
@@ -159,8 +165,8 @@ final class Daemon {
     }()
     /// How long a reservation lasts, and how long an empty extra display waits before it goes
     /// (a launch may be about to put its app there). Shortened by tests.
-    let reservationSeconds = Double(ProcessInfo.processInfo.environment["BACKSTAGE_RESERVATION_SECONDS"] ?? "") ?? 1800
-    let extraGraceSeconds = Double(ProcessInfo.processInfo.environment["BACKSTAGE_EXTRA_DISPLAY_GRACE"] ?? "") ?? 30
+    let reservationSeconds = boundedSeconds("BACKSTAGE_RESERVATION_SECONDS", default: 1800)
+    let extraGraceSeconds = boundedSeconds("BACKSTAGE_EXTRA_DISPLAY_GRACE", default: 30)
     var creatingDisplay = false
     var nextExtrasCheck = 0.0
     var nextRemovalCheck = 0.0
@@ -361,22 +367,35 @@ final class Daemon {
             changed = true
         }
         if let names = try? FileManager.default.contentsOfDirectory(atPath: Paths.requests.path) {
-            for name in names.sorted() where name.hasSuffix(".json") {
+            for name in names.sorted() {
                 let url = Paths.requests.appendingPathComponent(name)
-                guard let request = readJSON(url, DisplayRequest.self) else { continue }
+                // Only <uuid>.json requests and <uuid>.reply answers belong here; the reply's name
+                // comes from the request's file name, never from its contents.
+                let parts = name.split(separator: ".", maxSplits: 1).map(String.init)
+                guard parts.count == 2, let uuid = UUID(uuidString: parts[0]), uuid.uuidString == parts[0],
+                      parts[1] == "json" || parts[1] == "reply" else { try? FileManager.default.removeItem(at: url); continue }
+                if parts[1] == "reply" {
+                    // A CLI that gave up leaves its answer: drop it after a minute.
+                    let age = (try? FileManager.default.attributesOfItem(atPath: url.path)[.modificationDate] as? Date).map { -$0.timeIntervalSinceNow } ?? 0
+                    if age > 60 { try? FileManager.default.removeItem(at: url) }
+                    continue
+                }
+                let decoded = readJSON(url, DisplayRequest.self)
                 try? FileManager.default.removeItem(at: url)
-                guard wall - request.at < 30 else { continue }   // its CLI gave up long ago
+                guard var request = decoded, wall - request.at < 30 else { continue }   // malformed, or its CLI gave up long ago
+                request.id = parts[0]
                 let reply = answer(request, wall: wall)
-                do { try writeJSON(Paths.requests.appendingPathComponent("\(request.id).reply"), reply) }
-                catch { log("cannot answer display request \(request.id): \(error)") }
+                do { try writeJSON(Paths.requests.appendingPathComponent("\(parts[0]).reply"), reply) }
+                catch { log("cannot answer display request \(parts[0]): \(error)") }
                 changed = true
             }
         }
         if now >= nextRemovalCheck || changed {
             nextRemovalCheck = now + 1
             let pending = Launching.records()
+            let apps = AppStore.load()   // fresh: a launch may have just moved from pending to registered
             for slot in extras.keys.sorted() {
-                guard !registry.contains(where: { $0.display == slot && $0.matchesProcess }),
+                guard !apps.contains(where: { $0.display == slot && $0.matchesProcess }),
                       !pending.contains(where: { $0.display == slot }),
                       now - (extraCreated[slot] ?? now) >= extraGraceSeconds else { continue }
                 extras[slot] = nil
@@ -411,6 +430,9 @@ final class Daemon {
                 let until = DateFormatter.localizedString(from: Date(timeIntervalSince1970: r.until), dateStyle: .none, timeStyle: .short)
                 return refuse("display \(n) is reserved for another session until \(until)")
             }
+            // A grant is a lease: the display stays at least the grace period from now, while
+            // the caller writes its launch record or moves its app.
+            extraCreated[n] = ProcessInfo.processInfo.systemUptime
             return DisplayReply(ok: true, slot: n, error: nil)
         }
         guard extraSlots.contains(n) else {
@@ -635,7 +657,9 @@ final class Daemon {
     func revealRegistered(now: Double) {
         for (pid, entry) in toReveal {
             guard processBirth(pid) == entry.birth else { toReveal[pid] = nil; continue }
-            let b = displayFor(pid: pid).bounds
+            // Registered a moment ago: the cached registry may not have it yet.
+            let slot = AppStore.load().first { $0.pid == pid }?.display
+            let b = (slot.flatMap { extras[$0] } ?? display).bounds
             let app = AXUIElementCreateApplication(pid)
             AXUIElementSetMessagingTimeout(app, 0.25)   // never stall the guard loop on a busy app
             guard let windows = try? app.readElements(kAXWindowsAttribute) else {

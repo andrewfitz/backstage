@@ -111,6 +111,9 @@ struct Args {
         switch command {
         case "launch", "open":
             allowed = ["env", "timeout", "dock", "audio", "inaudible", "display"]; arity = 1...1
+            if let d = opt("display"), d != "new", !(Int(d).map { displaySlots.contains($0) } ?? false) {
+                throw CLIError("--display takes a display number (1-8) or new")
+            }
             for entry in multi("env") {
                 guard let equals = entry.firstIndex(of: "="), equals != entry.startIndex else {
                     throw CLIError("--env needs NAME=value")
@@ -178,7 +181,11 @@ struct Args {
         case "drag": allowed = target + ["scale", "steps"]; arity = 4...4
         case "__menu-thumbnail": allowed = []; arity = 4...4
         case "__menu-render": allowed = ["displays", "page", "o", "appearance"]; arity = 0...0
-        case "move": allowed = target + ["display"]; arity = 0...0
+        case "move":
+            allowed = target + ["display"]; arity = 0...0
+            if let d = opt("display"), d != "new", !(Int(d).map { displaySlots.contains($0) } ?? false) {
+                throw CLIError("--display takes a display number (1-8) or new")
+            }
         case "cleanup-displays": allowed = []; arity = 0...0
         case "settings": allowed = []; arity = 0...2
         case "__send-backstage": allowed = ["pid", "focus-to"]; arity = 0...0

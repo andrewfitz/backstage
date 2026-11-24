@@ -111,9 +111,10 @@ guard, audio and the menu stay in one process. Agents choose; nothing overflows 
 
 - `launch --display N` puts the app on display N (created if needed). `launch --display new`
   takes the lowest free display and **reserves** it for the caller's session.
-- A **reservation expires** 30 minutes after it was made or after 10 minutes without a command
-  from that session, whichever comes first. Expiry only ends exclusivity; the display goes away
-  when its apps quit. A reserved display refuses other sessions' numbered launches, `move`s and
+- A **reservation expires** 30 minutes after it was made (built simpler than first planned: no
+  separate idle rule, since tracking each session's last command would mean writing state on
+  every command). Expiry only ends exclusivity; the display goes away once no app or pending
+  launch is on it, after a grace period that each grant renews. A reserved display refuses other sessions' numbered launches, `move`s and
   Send Front Window Backstage.
 - Without `--display`, a launch goes where the caller's session already has apps, else display 1.
 - **Crowded:** when placement finds no free spot and cascades, `launch` says so

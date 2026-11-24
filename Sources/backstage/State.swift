@@ -109,7 +109,7 @@ struct DaemonInfo: Codable {
 /// it: a virtual display lives as long as the process that made it), in requests/<id>.json, and
 /// the daemon answers in requests/<id>.reply.
 struct DisplayRequest: Codable {
-    var id: String
+    var id: String          // the daemon uses the request's file name instead
     var session: String
     var want: String        // "new", or a slot number
     var at: Double

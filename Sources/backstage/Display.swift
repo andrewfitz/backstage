@@ -178,8 +178,17 @@ final class AgentDisplay {
     init(width: UInt32, height: UInt32, scale: UInt32, choice: SlotChoice = .home) throws {
         // One display identity per slot: choose and create under a lock shared by every home,
         // held until the new display is online, so two daemons can't take the same slot.
-        guard let lock = UserLock("displays.lock") else { throw CLIError("cannot lock the backstage displays for this user") }
-        defer { lock.release() }
+        // Each attempt locks only while it chooses and creates; a successful one keeps the lock
+        // until the display is online. Waiting for a busy slot never holds it, so other homes
+        // and the daemon's own extra displays aren't stalled meanwhile.
+        var held: UserLock?
+        defer { held?.release() }
+        func locked(_ body: () throws -> (CGVirtualDisplay, Int)?) throws -> (CGVirtualDisplay, Int)? {
+            guard let lock = UserLock("displays.lock") else { throw CLIError("cannot lock the backstage displays for this user") }
+            let result = try body()
+            if result != nil { held = lock } else { lock.release() }
+            return result
+        }
         func make(_ slot: Int) -> CGVirtualDisplay? {
             let d = CGVirtualDisplayDescriptor()
             d.queue = DispatchQueue.main
@@ -195,16 +204,20 @@ final class AgentDisplay {
             return CGVirtualDisplay(descriptor: d)
         }
         func lowestFree(_ slots: [Int]) throws -> (CGVirtualDisplay, Int)? {
-            guard let inUse = displaySlotsInUse() else { throw CLIError("cannot list the online displays") }
-            for slot in slots where !inUse.contains(slot) { if let vd = make(slot) { return (vd, slot) } }
-            return nil
+            try locked {
+                guard let inUse = displaySlotsInUse() else { throw CLIError("cannot list the online displays") }
+                for slot in slots where !inUse.contains(slot) { if let vd = make(slot) { return (vd, slot) } }
+                return nil
+            }
         }
         func exactly(_ wanted: Int, wait: Double) throws -> (CGVirtualDisplay, Int)? {
             // Right after a stop, the old display can still be online for a moment.
             try waitFor(timeout: wait, interval: 0.25) { () throws -> (CGVirtualDisplay, Int)? in
-                guard let inUse = displaySlotsInUse() else { throw CLIError("cannot list the online displays") }
-                guard !inUse.contains(wanted), let vd = make(wanted) else { return nil }
-                return (vd, wanted)
+                try locked {
+                    guard let inUse = displaySlotsInUse() else { throw CLIError("cannot list the online displays") }
+                    guard !inUse.contains(wanted), let vd = make(wanted) else { return nil }
+                    return (vd, wanted)
+                }
             }
         }
         var created: (CGVirtualDisplay, Int)?

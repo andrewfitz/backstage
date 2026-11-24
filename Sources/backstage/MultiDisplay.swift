@@ -59,11 +59,15 @@ func cmdMove(_ args: Args) throws -> [String: Any] {
     if slot == from { return ["pid": app.pid, "display": slot, "moved": 0] }
     let lock = try Locks.app(app)
     defer { lock.release() }
+    // `show` may have handed the app to the user meanwhile: then it's theirs, leave it alone.
+    var updated = 0
     try AppStore.update { apps in
-        for i in apps.indices where apps[i].pid == app.pid && apps[i].processStart == app.processStart {
+        for i in apps.indices where apps[i].pid == app.pid && apps[i].processStart == app.processStart && apps[i].owner == app.owner {
             apps[i].display = slot == live.primarySlot ? nil : slot
+            updated += 1
         }
     }
+    guard updated > 0 else { throw CLIError("pid \(app.pid) is no longer a managed app (it was shown on the user's screen or quit)") }
     // Place its windows on the new display; the daemon's guard keeps them there from now on.
     var placed: [CGRect] = []
     var moved = 0

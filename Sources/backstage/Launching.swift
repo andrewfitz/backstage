@@ -287,7 +287,7 @@ func registerHandedOver(_ launch: LaunchRecord, pid: pid_t, birth: UInt64) -> Ha
     let record = ManagedApp(pid: pid, name: (bundle?.infoDictionary?["CFBundleName"] as? String) ?? url.deletingPathExtension().lastPathComponent,
                             bundleID: bundle?.bundleIdentifier, path: launch.bundle, launchedAt: Date().timeIntervalSince1970,
                             stdout: launch.log, processStart: birth, agent: launch.agent, agentPID: launch.agentPID,
-                            session: launch.session, audio: mode.rawValue)
+                            session: launch.session, audio: mode.rawValue, display: launch.display)
     do { try AppStore.add(record) } catch { return processBirth(pid) == birth ? .busy : .gone }
     try? FileManager.default.removeItem(at: ack)
     return .registered

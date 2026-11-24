@@ -15,7 +15,7 @@ FAIL=0
 pass() { echo "  ok   $*"; }
 fail() { echo "  FAIL $*"; FAIL=1; }
 HOMES=()
-home() { local h="$WORK/$1"; mkdir -p "$h"; chmod 700 "$h"; HOMES+=("$h"); echo "$h"; }
+home() { local h="$WORK/$1"; mkdir -p "$h"; chmod 700 "$h"; HOMES+=("$h"); }   # sets HOMES in this shell
 cleanup() {
     local result=$?
     trap - EXIT
@@ -33,7 +33,8 @@ swiftc -O csdevices.swift -o "$WORK/csdevices" || exit 1
 devices() { "$WORK/csdevices"; }
 slot() { BACKSTAGE_HOME="$1" "$BS" status | jq -r '.daemon.display // empty'; }
 
-A=$(home a); B=$(home b); C=$(home c); D=$(home d)
+home a; home b; home c; home d
+A="$WORK/a"; B="$WORK/b"; C="$WORK/c"; D="$WORK/d"
 
 cycle() {  # one round: two homes at once on 7 and 8, a busy request, a shared slot, restarts
     (BACKSTAGE_HOME="$A" BACKSTAGE_DISPLAY=7 "$BS" start > "$WORK/a.json" 2>&1) &

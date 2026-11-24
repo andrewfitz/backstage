@@ -48,7 +48,8 @@ final class StatusMenu: NSObject, NSMenuDelegate {
     private var rows: [pid_t: NSMenuItem] = [:]
     private var rowsKey: [String] = []
     private var openedAt = 0.0
-    private var lastFrame = 0.0
+    /// When each display's picture last updated (each is checked for freshness on its own).
+    private var lastFrames: [Int: Double] = [:]
     private var captureFailureLogged = false
 
     init(daemon: Daemon) {
@@ -540,12 +541,21 @@ final class StatusMenu: NSObject, NSMenuDelegate {
             }
         }
 
-        if d.allDisplays.count > 1 { showPage() }
+        // A display came or went while the menu is open: one picture, two stacked, or paged.
+        let count = d.allDisplays.count
+        let layout = count > 2 ? "|paged" : count > 1 ? "|stacked" : ""
+        if !heroShape.hasSuffix(layout) || (layout.isEmpty && (heroShape.hasSuffix("|paged") || heroShape.hasSuffix("|stacked"))) {
+            rebuild()
+            return
+        }
+        if count > 1 { showPage() }
         // A picture that has stopped updating says so, rather than passing for live.
         if refreshTimer != nil {
-            let since = max(lastFrame, openedAt)
-            if ProcessInfo.processInfo.systemUptime - since > 3.5 + Double(visibleSlots.count - 1) {
-                for preview in hero?.previews ?? [] where !preview.isHidden {
+            let now = ProcessInfo.processInfo.systemUptime
+            for (i, preview) in (hero?.previews ?? []).enumerated() where !preview.isHidden {
+                guard let slot = visibleSlots[safe: i] else { continue }
+                let since = max(lastFrames[slot] ?? 0, openedAt)
+                if now - since > 3.5 + Double(visibleSlots.count - 1) {
                     preview.isStale = false
                     preview.message = preview.hasImage ? "Preview paused" : "Preview unavailable"
                 }
@@ -645,7 +655,7 @@ final class StatusMenu: NSObject, NSMenuDelegate {
                 self.lastImages[slot] = image
                 guard self.visibleSlots.indices.contains(index), self.visibleSlots[index] == slot,
                       let preview = self.hero?.previews[safe: index] else { return }
-                self.lastFrame = ProcessInfo.processInfo.systemUptime
+                self.lastFrames[slot] = ProcessInfo.processInfo.systemUptime
                 preview.message = nil
                 preview.setImage(image)
                 preview.shownSlot = slot

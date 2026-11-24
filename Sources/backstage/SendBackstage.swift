@@ -90,7 +90,8 @@ func sendBackstage(pid: pid_t, focusTo: pid_t?) -> [String: Any] {
         return refuse("\(name) runs backstage itself; you need it on your screen")
     }
     if AppStore.load().contains(where: { $0.pid == pid }) { return refuse("\(name) is already backstage") }
-    let others = otherAgentDisplayBounds(excluding: d.displayID)
+    let own = Set([d.displayID] + (d.displays ?? []).map { $0.displayID })
+    let others = activeDisplays().filter { isOurDisplay($0) && !own.contains($0) }.map { CGDisplayBounds($0) }
     if onscreenWindows().contains(where: { ($0[kCGWindowOwnerPID as String] as? pid_t) == pid && others.contains(where: cgBounds($0).intersects) }) {
         return refuse("\(name) is on another backstage display")
     }

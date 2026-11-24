@@ -497,7 +497,7 @@ func cmdStatus(doctor: Bool = false) throws -> [String: Any] {
         problems.append("The daemon's input guard isn't running (see \(Paths.log.path)), so input commands refuse to run. Check Accessibility, then `backstage stop --all`.")
     }
     if doctor {
-        let leftovers = DisplayRegistry.leftovers().count
+        let leftovers = DisplayRegistry.leftovers()?.count ?? 0
         s["leftoverDisplays"] = leftovers
         if leftovers > DisplayRegistry.warnAbove {
             problems.append("ColorSync has \(leftovers) leftover backstage displays registered (older versions used a new display identity per BACKSTAGE_HOME); it slows down as that list grows. Remove them once: \(DisplayRegistry.cleanupCommand)")
