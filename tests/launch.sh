@@ -6,6 +6,7 @@
 set -uo pipefail
 # backstage's own tests use displays 7-8, never the ones agents use (docs/MULTI_DISPLAY_PLAN.md).
 export BACKSTAGE_DISPLAY=${BACKSTAGE_DISPLAY:-7}
+export BACKSTAGE_EXTRA_DISPLAYS=8   # `--display new` below takes 8, never an agent's display
 cd "$(dirname "$0")"
 ROOT="$(cd .. && pwd)"
 if [[ -z ${BACKSTAGE_BIN:-} ]]; then
@@ -135,6 +136,22 @@ for target in "$APP" "$BARE"; do
         "$BS" quit --pid "$P" > /dev/null && gone "$P" && pass "quit reached it" || fail "quit pid $P"
     fi
 done
+
+echo "== launch --display new gives up: the daemon registers the app on that display"
+LOGF="$WORK/handover-display.log"
+BACKSTAGE_TEST_LS=no-callback,no-find BACKSTAGE_LAUNCH_DEADLINE=2 "$BS" launch "$APP" --display new --env "TESTAPP_LOG=$LOGF" > "$WORK/h.json" 2>&1
+APPLOG=$(python3 -c "import sys,re; m=re.search(r'Launch log: (\S+\.log)', open(sys.argv[1]).read()); print(m.group(1) if m else '')" "$WORK/h.json")
+P=$(pid_for_log "$APPLOG" 15)
+if [[ -n "$P" ]]; then
+    [[ $("$BS" list | jq -r --argjson p "$P" '.apps[] | select(.pid == $p) | .display') == 8 ]] && pass "registered on display 8, as launched" \
+        || fail "registered on the wrong display: $("$BS" list | jq -c .apps)"
+    for _ in $(seq 1 30); do "$BS" windows --pid "$P" | jq -e '.windows | length > 0' > /dev/null 2>&1 && break; sleep 0.1; done
+    "$BS" windows --pid "$P" | jq -e '.windows[0].frame | .x >= 0 and .y >= 0' > /dev/null && pass "its window is on display 8" \
+        || fail "window: $("$BS" windows --pid "$P" | jq -c .windows)"
+    "$BS" quit --pid "$P" > /dev/null && gone "$P" && pass "quit reached it" || fail "quit pid $P"
+else
+    fail "no registered app for $APPLOG: $(cat "$WORK/h.json" | head -5)"
+fi
 
 # Hand-written handed-over records: a dead CLI, and a process that appears only after the
 # CLI's old grace period (15 s after it died) would have dropped the record.

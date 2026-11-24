@@ -53,6 +53,17 @@ launch() {  # session, pad colour, extra args… ; prints the launch JSON
 }
 displays() { "$BS" status | jq -c '[.daemon.displays[]? | .display]'; }
 
+echo "== menu layouts (synthetic: no displays created)"
+R1=$("$BS" __menu-render --displays 1); R2=$("$BS" __menu-render --displays 2)
+R3=$("$BS" __menu-render --displays 3 --page 1); R6=$("$BS" __menu-render --displays 6 --page 2)
+echo "$R1" | jq -e '(.previews | length) == 1 and .pager == null' > /dev/null && pass "1 display: one picture, no pager" || fail "1: $R1"
+echo "$R2" | jq -e '(.previews | length) == 2 and .pager == null and all(.previews[]; .height <= 150 and (.hidden | not))' > /dev/null \
+    && pass "2 displays: two stacked pictures, no pager" || fail "2: $R2"
+echo "$R3" | jq -e '.visible == [3] and .previews[1].hidden and .canBack and (.canForward | not) and .height == ('"$(echo "$R2" | jq .height)"' + 24)' > /dev/null \
+    && pass "3 displays, page 2: display 3 alone, same height as page 1, back only" || fail "3: $R3"
+echo "$R6" | jq -e '.visible == [5, 6] and .first == 5 and .last == 6 and .canBack and (.canForward | not)' > /dev/null \
+    && pass "6 displays, page 3: displays 5-6" || fail "6: $R6"
+
 echo "== one display: nothing changes"
 OUT=$(launch A blue)
 PA=$(echo "$OUT" | jq -r .pid)
