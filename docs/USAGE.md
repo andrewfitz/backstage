@@ -195,6 +195,9 @@ When something's missing, `problems` lists what to grant and where. `settings` s
 settings (see [`settings`](#settings)), and with a daemon running, `hotkeyRegistered` (and
 `hotkeyError` if the shortcut couldn't be registered).
 
+`backstage version` (or `--version`) prints the CLI's version as plain text; `status` reports it
+as `version`.
+
 `audio` describes muting and measuring:
 
 ```json
@@ -399,7 +402,10 @@ too (see `launch`'s `audio`).
 IO (so no recording indicator), and only measured apps drive the menu bar meter. A measured app
 is muted on the Mac's outputs but not in system-wide captures, so use `--audio` only when you
 need to check sound. `show` hands an app over unmuted. Needs macOS 14.2+; measuring (not
-muting) needs **System Audio Recording** for the daemon's host (see `doctor`).
+muting) needs **System Audio Recording** for the daemon's host (see `doctor`). Without it, muting still
+covers helper processes that start audio later: macOS refuses to change an existing tap then, so
+the daemon replaces the tap with one covering every process (the new one is in place before the
+old one goes).
 
 A Play/Stop check:
 

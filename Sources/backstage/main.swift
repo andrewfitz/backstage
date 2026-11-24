@@ -42,6 +42,7 @@ LIFECYCLE
   settings hotkey <combo|off>       Send Front Window Backstage shortcut (default ctrl+opt+cmd+b);
                                     two or more modifiers incl. cmd or ctrl, plus a letter, digit or F-key
   logs [--pid P] [--lines N]        tail the app's stdout/stderr
+  version                           print the version (also `status`'s "version")
 
 HIDDEN OR SHOWN? Use launch for your own work (build checks, tests, debugging, screenshots).
 Use show only when the user explicitly wants it on their screen.

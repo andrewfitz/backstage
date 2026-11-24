@@ -29,7 +29,8 @@ backstage show                        # you asked to see it: hand it over, state
   Privacy & Security: **Accessibility** and **Screen & System Audio Recording** (Screen
   Recording). For agents to check what an app plays (`launch --audio`, then `backstage audio`,
   `wait --sound`, `audio record`), the host also needs **System Audio Recording Only**: a
-  separate switch from Screen Recording, in the same Settings pane. Muting works without it.
+  separate switch from Screen Recording, in the same Settings pane. Muting works without it,
+  helper processes included.
   - **Which host.** The audio grant is checked against the app that started the backstage
     daemon (the terminal or agent host that ran the first `backstage` command), not the
     `backstage` binary. If agents run from several hosts, the one that started the running
@@ -64,6 +65,7 @@ backstage quit                        # or `backstage stop` to quit all of this 
 ```
 
 The full command reference is in **[docs/USAGE.md](docs/USAGE.md)**, or run `backstage help`.
+What changed in each version: [CHANGELOG.md](CHANGELOG.md).
 
 ## How it works
 
