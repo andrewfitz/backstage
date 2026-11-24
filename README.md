@@ -20,6 +20,13 @@ backstage press w8432.0.3             # agent uses it
 backstage show                        # you asked to see it: hand it over, state intact
 ```
 
+<p align="center">
+  <img src="docs/images/menu-bar.png" width="345"
+       alt="The backstage menu: a live picture of the hidden display, then the apps each agent session is running (Claude, Codex and Grok), with the version and a GitHub link at the bottom">
+  <br>
+  <sub>The <a href="#menu-bar-indicator">menu bar indicator</a> while three agents test apps out of sight.</sub>
+</p>
+
 ## Requirements
 
 - macOS 14.2 or later (tested on macOS 27.0.1, Apple Silicon). Agent apps are always muted,

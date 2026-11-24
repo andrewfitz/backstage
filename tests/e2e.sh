@@ -59,7 +59,10 @@ WATCH=$!
 sleep 0.3
 
 echo "== daemon startup"
-D1=$("$BS" start | jget "['pid']")
+# Started by bare name through PATH from a folder holding an unrelated `backstage` (a checkout):
+# the daemon must be spawned from the running binary, not from ./backstage.
+mkdir -p "$WORK/cwd/backstage"
+D1=$(cd "$WORK/cwd" && PATH="$(dirname "$BS"):$PATH" "$(basename "$BS")" start | jget "['pid']")
 D2=$("$BS" start | jget "['pid']")
 [[ "$D1" == "$D2" ]] && pass "start reused daemon" || fail "daemon identity changed"
 

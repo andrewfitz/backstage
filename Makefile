@@ -19,7 +19,7 @@ build:
 	# otherwise fail to start (dyld terminates a process whose inserted library can't load).
 	# Replaced by rename, never in place: running apps have it mapped.
 	xcrun clang -dynamiclib -O2 -arch arm64 -arch x86_64 -mmacosx-version-min=14.0 -framework CoreAudio \
-		-install_name @rpath/$(DYLIB_NAME) -o "$(DYLIB).new" Sources/BackstageInaudible/inaudible.c
+		-install_name @rpath/$(DYLIB_NAME) -Wl,-headerpad_max_install_names -o "$(DYLIB).new" Sources/BackstageInaudible/inaudible.c
 	codesign -f -s - "$(DYLIB).new" 2>/dev/null
 	mv -f "$(DYLIB).new" "$(DYLIB)"
 

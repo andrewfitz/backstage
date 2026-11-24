@@ -798,8 +798,9 @@ private func settleDaemon() throws {
 private func startDaemon() throws -> DaemonInfo {
     if let d = liveDaemon() { return d }
     try Paths.ensure()
-    let exe = URL(fileURLWithPath: CommandLine.arguments[0]).resolvingSymlinksInPath().path
-    let selfPath = FileManager.default.fileExists(atPath: exe) ? exe : (Bundle.main.executablePath ?? exe)
+    // The running binary itself. Not argv[0]: invoked by bare name through PATH, that resolves
+    // against the working directory, which may hold an unrelated `backstage` (a checkout).
+    let selfPath = URL(fileURLWithPath: Bundle.main.executablePath ?? CommandLine.arguments[0]).resolvingSymlinksInPath().path
 
     var attr: posix_spawnattr_t?
     posix_spawnattr_init(&attr)

@@ -1,5 +1,14 @@
 # Changelog
 
+## 1.2.2
+
+- **Fix:** the daemon didn't start when `backstage` was run by bare name from a folder holding
+  anything named `backstage` (a checkout of this repo, say): it tried to spawn that instead of
+  itself ("failed to spawn daemon: Permission denied").
+- The injected library is linked with room for its install name to be rewritten, which
+  Homebrew's bottles need.
+- README: a picture of the menu bar indicator.
+
 ## 1.2.1
 
 - **Fix:** an agent's app was quit when one of its helper processes (an `xctest` runner, a
