@@ -18,6 +18,8 @@
 //                            TESTAPP_TONE_DEVICE=<uid> plays to that device instead of the default output.
 //                            Actions > Tone Burst plays one TESTAPP_BURST_MS (default 100) burst with output started
 //                            just for it; Actions > Stop Tone stops output.
+//      TESTAPP_CHILD_AFTER_MS=N -> N ms after start, spawns a bare copy of itself as a child (same TESTAPP_TONE
+//                            settings, so a second audio client of the app), logging "child=<pid>"; it exits in 30 s.
 import Cocoa
 import CoreAudio
 import AVFoundation
@@ -306,6 +308,20 @@ final class Tone {
 
 // The probe starts on the process's first line, before any window (TESTAPP_TONE).
 Tone.startIfRequested()
+
+// A helper process that joins the app's audio later (TESTAPP_CHILD_AFTER_MS).
+if let ms = Double(ProcessInfo.processInfo.environment["TESTAPP_CHILD_AFTER_MS"] ?? "") {
+    DispatchQueue.global().asyncAfter(deadline: .now() + ms / 1000) {
+        var env = ProcessInfo.processInfo.environment
+        env["TESTAPP_CHILD_AFTER_MS"] = nil
+        env["TESTAPP_BARE"] = "1"
+        env["TESTAPP_LOG"] = (env["TESTAPP_LOG"] ?? "/dev/null") + ".child"
+        let child = Process()
+        child.executableURL = Bundle.main.executableURL
+        child.environment = env
+        do { try child.run(); log("child=\(child.processIdentifier)") } catch { log("child failed: \(error)") }
+    }
+}
 
 // The executable-wrapper fixture registers with AppKit without creating any windows.
 if ProcessInfo.processInfo.environment["TESTAPP_BARE"] == "1" {

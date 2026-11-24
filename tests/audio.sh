@@ -179,6 +179,22 @@ echo "$OUT" | jq -e '.ok == false and (.error | test("System Audio Recording"))'
 OUT=$("$BS" audio record --pid "$PID" 2>&1)
 echo "$OUT" | jq -e '.ok == false and (.error | test("System Audio Recording"))' > /dev/null && pass "audio record explains it too" || fail "audio record: $OUT"
 [[ -z $DEV ]] || { [[ $(jq -r .tap "$BACKSTAGE_HOME/audio/$PID-"*.json) == muted ]] && pass "the app is muted all the same" || fail "app not muted"; }
+# A helper joining later: macOS refuses to change a tap without the grant ('!hog'), so the tap
+# is replaced by one covering both. This used to quit the app.
+if [[ -n $DEV ]]; then
+    CLOG="$WORK/child-parent.log"
+    CP=$(FLOG="$CLOG" launch --env TESTAPP_TONE=18500 --env TESTAPP_TONE_DEVICE="$DEV" --env TESTAPP_CHILD_AFTER_MS=1000) || fail "launch the child fixture"
+    CHILD=""
+    for _ in $(seq 1 60); do CHILD=$(sed -n 's/^child=//p' "$CLOG" 2> /dev/null | head -1); [[ -n $CHILD ]] && grep -qw "includes pid $CHILD" "$BACKSTAGE_HOME/daemon.log" && break; sleep 0.1; done
+    STATUS=$(cat "$BACKSTAGE_HOME/audio/$CP-"*.json 2> /dev/null)
+    if [[ -n $CHILD ]] && echo "$STATUS" | jq -e --argjson c "$CHILD" '.tap == "muted" and (.processes | index($c))' > /dev/null \
+        && grep -qw "replaced it with one that includes pid $CHILD" "$BACKSTAGE_HOME/daemon.log" && kill -0 "$CP" 2> /dev/null; then
+        pass "a helper joining later is muted by a replacement tap; the app keeps running"
+    else
+        fail "helper join without the grant: child=${CHILD:-none} status=$STATUS log=$(grep -E "pid ${CHILD:-x}([^0-9]|$)|FAILED" "$BACKSTAGE_HOME/daemon.log" | tail -3)"
+    fi
+    "$BS" quit --pid "$CP" > /dev/null
+fi
 # Without --audio the commands refuse at once, before the permission check.
 QP=$(LAUNCH_AUDIO=default launch) || fail "default launch"
 "$BS" list | jq -e --argjson p "$QP" '.apps[] | select(.pid == $p) | .audio == "inaudible"' > /dev/null \

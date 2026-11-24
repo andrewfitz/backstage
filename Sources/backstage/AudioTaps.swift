@@ -508,6 +508,8 @@ final class AudioTapManager: AudioTapControl, AudioLevelSource {
             }
         } else if let desc = app.desc {
             func update(_ list: [AudioObjectID]) -> OSStatus {
+                // What macOS does without System Audio Recording (see replaceTap).
+                if testMode == "no-capture" { return kAudioDevicePermissionsError }
                 desc.processes = list
                 var a = HAL.address(kAudioTapPropertyDescription)
                 var d: CATapDescription = desc
@@ -528,9 +530,16 @@ final class AudioTapManager: AudioTapControl, AudioLevelSource {
                 }
                 if alive.count < objects.count { objects = alive; err = update(objects) }
             }
-            guard err == noErr else {
-                fail(app, "couldn't add pid \(pid) to the app's tap: \(fourCC(err))")
-                return
+            if err != noErr {
+                // Without System Audio Recording, macOS refuses every change to an existing
+                // tap's process list ('!hog', even re-setting the same list) but still creates
+                // taps: replace the tap with one covering every process.
+                let why = fourCC(err)
+                if let failure = replaceTap(app, objects: objects) {
+                    fail(app, "couldn't add pid \(pid) to the app's tap: \(why); replacing the tap failed too: \(failure)")
+                    return
+                }
+                log("audio: changing the tap of pid \(app.key.pid) was refused (\(why)); replaced it with one that includes pid \(pid)")
             }
         }
         let ms = (audioClock() - sight) * 1000
@@ -567,6 +576,39 @@ final class AudioTapManager: AudioTapControl, AudioLevelSource {
         }
         prepareIO(app)
         evaluateIO(app)
+    }
+
+    /// Swap the app's tap for a new one muting `objects`. The new tap exists before the old one
+    /// is destroyed, so the app's processes are never unmuted. Measuring moves to the new
+    /// aggregate; the ring and meter carry over unless the format changed. Returns why it failed.
+    private func replaceTap(_ app: AppTap, objects: [AudioObjectID]) -> String? {
+        let made: Made
+        switch makeTap(objects: objects, name: "backstage-\(app.key.pid)") {
+        case .failure(let why): return why.description
+        case .success(let m): made = m
+        }
+        let oldTap = app.tapID, oldAggregate = app.aggID
+        stopIO(app)
+        if let proc = app.ioProc { AudioDeviceDestroyIOProcID(oldAggregate, proc) }
+        app.ioProc = nil
+        app.ioProcRequested = false   // an IOProc still being created for the old aggregate is discarded
+        app.listeners.removeAll { entry in
+            guard entry.0 == oldTap else { return false }
+            var a = entry.1
+            AudioObjectRemovePropertyListenerBlock(entry.0, &a, tapQueue, entry.2)
+            return true
+        }
+        AudioHardwareDestroyAggregateDevice(oldAggregate)
+        AudioHardwareDestroyProcessTap(oldTap)
+        app.tapID = made.tap; app.aggID = made.aggregate; app.desc = made.desc
+        if let f = HAL.tapFormat(made.tap), f.mSampleRate != app.sampleRate || Int(f.mChannelsPerFrame) != app.channels {
+            dismantleIO(app)
+            app.sampleRate = f.mSampleRate
+            app.channels = Int(f.mChannelsPerFrame)
+        }
+        addFormatListener(app)
+        app.version += 1
+        return nil
     }
 
     private func addRunningListener(_ app: AppTap, _ object: AudioObjectID) {
