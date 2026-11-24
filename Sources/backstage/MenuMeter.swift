@@ -1,23 +1,33 @@
 import Foundation
 import AppKit
+import QuartzCore
 
 /// The menu bar meter: while any managed app is making sound, the status item's icon is
-/// replaced by five rounded bars drawn in the icon's own box, so the item never changes width.
-/// The bars are the last five peak readings of the loudest playing app, newest on the right, on a
-/// -60...0 dBFS scale. A 12 fps timer runs only while the meter shows; otherwise a 10 Hz poll
+/// replaced by five rounded bars in the icon's own box, so the item never changes width. The
+/// bars are the last five peak readings of the loudest playing app, newest on the right, on a
+/// -60...0 dBFS scale. A 12 fps timer runs only while the meter shows; otherwise a 20 Hz poll
 /// (only while the item is visible) watches for sound. 1 s after the sound stops the icon fades
 /// back. With Reduce Motion, a static `waveform` symbol shows instead and nothing animates.
+///
+/// Cost: changing the button's image makes AppKit redraw it and re-snapshot it for the status
+/// item's copy on every other display's menu bar (agent displays included), about 6% CPU at
+/// 12 fps. So the bars are Core Animation layers in a layer-hosting view over a blank image of
+/// the icon's size: a frame only moves five layers, and nothing is redrawn or re-snapshotted.
+/// The copies on other displays are refreshed once a second instead.
 final class AudioMeter {
     static let barCount = 5
     static let floorDb: Float = -60
     static let frameInterval = 1.0 / 12
-    static let pollInterval = 0.1
+    static let pollInterval = 0.05
     static let holdAfterSilence = 1.0
     static let fadeDuration = 0.35
+    static let copyRefreshInterval = 1.0
 
     private weak var button: NSStatusBarButton?
-    /// The idle icon; its size is the box every meter image is drawn in.
+    /// The idle icon; its size is the box the meter occupies.
     private let icon: NSImage
+    /// Holds the icon's place in the button (same size, so the same width) while bars show.
+    private let blank: NSImage
     private let source: () -> AudioLevelSource?
     private let log: (String) -> Void
     /// Called when `playingApp` changes (for the accessibility label and tooltip).
@@ -25,23 +35,30 @@ final class AudioMeter {
 
     /// The loudest playing app's name while the meter shows sound; nil otherwise.
     private(set) var playingApp: String?
-    private var showing = false
+    private enum Phase { case idle, showing, fading }
+    private var phase = Phase.idle
     private var readings = [Float](repeating: -.infinity, count: AudioMeter.barCount)
-    private var lastDrawn: [Float]?
+    private var lastFractions: [CGFloat]?
     private var silentSince: Double?
-    private var fadeStart: Double?
+    private var fadeToken = 0
+    private var nextCopyRefresh = 0.0
     private var timer: Timer?
     private var timerInterval = 0.0
     private var active = false
     private(set) var reduceMotion: Bool
     private let reduceMotionOverride: Bool?
     private var observer: NSObjectProtocol?
+    private var barsView: NSView?
+    private var bars: [CALayer] = []
 
     init(button: NSStatusBarButton, icon: NSImage, source: @escaping () -> AudioLevelSource?, log: @escaping (String) -> Void) {
         self.button = button
         self.icon = icon
         self.source = source
         self.log = log
+        let blank = NSImage(size: icon.size, flipped: false) { _ in true }
+        blank.isTemplate = true
+        self.blank = blank
         // Test-only: BACKSTAGE_REDUCE_MOTION=1/0 forces the mode instead of the system setting.
         switch ProcessInfo.processInfo.environment["BACKSTAGE_REDUCE_MOTION"] {
         case "1": reduceMotionOverride = true
@@ -63,7 +80,7 @@ final class AudioMeter {
     func setActive(_ on: Bool) {
         guard on != active else { return }
         active = on
-        if on { schedule(Self.pollInterval) } else { stopShowing(); setTimer(nil) }
+        if on { schedule(Self.pollInterval) } else { hide(); setTimer(nil) }
     }
 
     /// The current per-app levels, or nil when there's no audio source.
@@ -74,11 +91,12 @@ final class AudioMeter {
         guard now != reduceMotion else { return }
         reduceMotion = now
         log("audio meter: reduce motion \(now ? "on" : "off")")
-        guard showing else { return }
-        fadeStart = nil
-        lastDrawn = nil
-        draw()
-        schedule(reduceMotion ? Self.pollInterval : Self.frameInterval)
+        switch phase {
+        case .showing: show()
+        case .fading: hide()
+        case .idle: break
+        }
+        if active { schedule(phase == .showing && !reduceMotion ? Self.frameInterval : Self.pollInterval) }
     }
 
     // MARK: state
@@ -89,61 +107,172 @@ final class AudioMeter {
         let loudest = (samples() ?? []).filter { $0.playing }.max { $0.peakDb < $1.peakDb }
         if let loudest {
             silentSince = nil
-            fadeStart = nil
-            if !showing {
-                showing = true
-                log(String(format: "audio meter on: %@ at %.3f", loudest.name, Date().timeIntervalSince1970))
-                schedule(reduceMotion ? Self.pollInterval : Self.frameInterval)
-            }
+            if phase == .idle { log(String(format: "audio meter on: %@ at %.3f", loudest.name, Date().timeIntervalSince1970)) }
+            if phase != .showing { show() }
             if playingApp != loudest.name { playingApp = loudest.name; onChange?() }
-        } else if showing, fadeStart == nil {
+        } else if phase == .showing {
             let since = silentSince ?? now
             silentSince = since
             if now - since >= Self.holdAfterSilence {
-                if playingApp != nil {
-                    log(String(format: "audio meter off at %.3f", Date().timeIntervalSince1970))
-                    playingApp = nil
-                    onChange?()
-                }
-                if reduceMotion { stopShowing(); schedule(Self.pollInterval); return }
-                fadeStart = now
+                log(String(format: "audio meter off at %.3f", Date().timeIntervalSince1970))
+                silentSince = nil
+                if playingApp != nil { playingApp = nil; onChange?() }
+                if reduceMotion { hide() } else { fade() }
             }
         }
-        guard showing else { return }
-        if !reduceMotion, fadeStart == nil {
+        if phase == .showing, !reduceMotion {
             readings.removeFirst()
             readings.append(loudest?.peakDb ?? -.infinity)
+            updateBars()
+            // Refresh the copies on other displays' menu bars once a second.
+            if now >= nextCopyRefresh, let button {
+                nextCopyRefresh = now + Self.copyRefreshInterval
+                button.needsDisplay = true
+            }
         }
-        if let start = fadeStart, now - start >= Self.fadeDuration {
-            stopShowing()
-            schedule(Self.pollInterval)
-            return
-        }
-        draw(now: now)
+        schedule(phase == .showing && !reduceMotion ? Self.frameInterval : Self.pollInterval)
     }
 
-    private func stopShowing() {
-        let was = showing
-        showing = false
+    /// Bars (or the Reduce Motion symbol) in place of the icon. Also cancels a fade.
+    private func show() {
+        guard let button else { return }
+        fadeToken += 1
+        phase = .showing
+        button.layer?.removeAnimation(forKey: "meterFade")
+        if reduceMotion {
+            removeBars()
+            button.image = Self.waveformImage(box: icon.size)
+            return
+        }
+        let view = barsView ?? makeBars(in: button)
+        view.frame = iconRect(in: button)
+        CATransaction.begin()
+        CATransaction.setDisableActions(true)
+        view.layer?.removeAllAnimations()
+        view.layer?.opacity = 1
+        CATransaction.commit()
+        if button.image !== blank { button.image = blank }
+        lastFractions = nil
+        updateBars()
+    }
+
+    /// The icon fades back in while the bars fade out, both run by the render server.
+    private func fade() {
+        guard let button, let layer = barsView?.layer else { hide(); return }
+        phase = .fading
+        fadeToken += 1
+        let token = fadeToken
+        CATransaction.begin()
+        CATransaction.setDisableActions(true)
+        let out = CABasicAnimation(keyPath: "opacity")
+        out.fromValue = 1
+        out.toValue = 0
+        out.duration = Self.fadeDuration
+        layer.opacity = 0
+        layer.add(out, forKey: "fade")
+        let crossfade = CATransition()
+        crossfade.type = .fade
+        crossfade.duration = Self.fadeDuration
+        button.layer?.add(crossfade, forKey: "meterFade")
+        CATransaction.commit()
+        button.image = icon
+        DispatchQueue.main.asyncAfter(deadline: .now() + Self.fadeDuration) { [weak self] in
+            guard let self, self.fadeToken == token else { return }
+            self.hide()
+        }
+    }
+
+    /// Back to the plain icon at once.
+    private func hide() {
+        fadeToken += 1
+        phase = .idle
         silentSince = nil
-        fadeStart = nil
-        lastDrawn = nil
         readings = [Float](repeating: -.infinity, count: Self.barCount)
-        if was { button?.image = icon }
+        lastFractions = nil
+        removeBars()
+        if let button, button.image !== icon { button.image = icon }
         if playingApp != nil { playingApp = nil; onChange?() }
     }
 
-    private func draw(now: Double = ProcessInfo.processInfo.systemUptime) {
-        guard let button else { return }
-        if reduceMotion {
-            if lastDrawn == nil { button.image = Self.waveformImage(box: icon.size); lastDrawn = [] }
-            return
+    // MARK: bars
+
+    /// A layer-hosting view: AppKit never draws it, so moving its layers redraws nothing.
+    private final class BarsView: NSView {
+        var appearanceChanged: (() -> Void)?
+        override func hitTest(_ point: NSPoint) -> NSView? { nil }   // clicks go to the button
+        // The menu bar switches between light and dark with the wallpaper: recolour the bars.
+        override func viewDidChangeEffectiveAppearance() {
+            super.viewDidChangeEffectiveAppearance()
+            appearanceChanged?()
         }
-        let fade = fadeStart.map { CGFloat(min(1, (now - $0) / Self.fadeDuration)) } ?? 0
-        let key = readings.map { Self.fraction($0) } + [Float(fade)]
-        if key == lastDrawn { return }   // nothing moved: skip the redraw
-        lastDrawn = key
-        button.image = Self.barsImage(readings, box: icon.size, fade: fade, icon: icon)
+    }
+
+    private func makeBars(in button: NSStatusBarButton) -> NSView {
+        let view = BarsView(frame: iconRect(in: button))
+        view.appearanceChanged = { [weak self] in self?.updateColors() }
+        let root = CALayer()
+        view.layer = root
+        view.wantsLayer = true
+        bars = (0..<Self.barCount).map { _ in
+            let bar = CALayer()
+            root.addSublayer(bar)
+            return bar
+        }
+        button.addSubview(view)
+        barsView = view
+        updateColors()
+        return view
+    }
+
+    private func removeBars() {
+        barsView?.removeFromSuperview()
+        barsView = nil
+        bars = []
+    }
+
+    /// Where the button draws its image.
+    private func iconRect(in button: NSStatusBarButton) -> NSRect {
+        let size = icon.size
+        if let r = button.cell?.imageRect(forBounds: button.bounds), r.width > 0, r.height > 0 {
+            return NSRect(x: r.midX - size.width / 2, y: r.midY - size.height / 2, width: size.width, height: size.height)
+        }
+        return NSRect(x: 0, y: (button.bounds.height - size.height) / 2, width: size.width, height: size.height)
+    }
+
+    /// Template images in the menu bar are drawn in its label colour; match it.
+    private func updateColors() {
+        guard let button, !bars.isEmpty else { return }
+        var color = NSColor.labelColor.cgColor
+        button.effectiveAppearance.performAsCurrentDrawingAppearance { color = NSColor.labelColor.cgColor }
+        CATransaction.begin()
+        CATransaction.setDisableActions(true)
+        for bar in bars { bar.backgroundColor = color }
+        CATransaction.commit()
+    }
+
+    private func updateBars() {
+        guard let view = barsView, bars.count == readings.count else { return }
+        let fractions = readings.map { CGFloat(Self.fraction($0)) }
+        if fractions == lastFractions { return }   // nothing moved (silence): no commit
+        lastFractions = fractions
+        let scale = view.window?.backingScaleFactor ?? 2
+        func px(_ v: CGFloat) -> CGFloat { (v * scale).rounded() / scale }
+        let rect = view.bounds
+        let usable = min(rect.width, rect.height * 1.2)
+        let barW = px(usable / 8.2)            // 5 bars and 4 gaps of 0.8 bar
+        let gap = px(barW * 0.8)
+        let total = barW * 5 + gap * 4
+        let maxH = rect.height * 0.8
+        var x = px(rect.midX - total / 2)
+        CATransaction.begin()
+        CATransaction.setDisableActions(true)
+        for (bar, f) in zip(bars, fractions) {
+            let h = px(barW + f * (maxH - barW))
+            bar.frame = CGRect(x: x, y: px(rect.midY - h / 2), width: barW, height: h)
+            bar.cornerRadius = barW / 2
+            x += barW + gap
+        }
+        CATransaction.commit()
     }
 
     // MARK: timers
@@ -164,34 +293,11 @@ final class AudioMeter {
         timerInterval = interval
     }
 
-    // MARK: drawing (template images, so they follow light, dark and tinted menu bars)
+    // MARK: images
 
     static func fraction(_ db: Float) -> Float {
         guard db.isFinite else { return 0 }
         return max(0, min(1, (db - floorDb) / -floorDb))
-    }
-
-    /// Five rounded bars centred in `box`; `fade` (0...1) crossfades to `icon`.
-    static func barsImage(_ levels: [Float], box: NSSize, fade: CGFloat, icon: NSImage) -> NSImage {
-        let fractions = levels.map { CGFloat(fraction($0)) }
-        let img = NSImage(size: box, flipped: false) { rect in
-            let usable = min(rect.width, rect.height * 1.2)
-            let barW = usable / 8.2            // 5 bars and 4 gaps of 0.8 bar
-            let gap = barW * 0.8
-            let maxH = rect.height * 0.8
-            var x = rect.midX - usable / 2
-            NSColor.black.withAlphaComponent(1 - fade).setFill()
-            for f in fractions {
-                let h = barW + f * (maxH - barW)
-                let bar = NSRect(x: x, y: rect.midY - h / 2, width: barW, height: h)
-                NSBezierPath(roundedRect: bar, xRadius: barW / 2, yRadius: barW / 2).fill()
-                x += barW + gap
-            }
-            if fade > 0 { icon.draw(in: rect, from: .zero, operation: .sourceOver, fraction: fade) }
-            return true
-        }
-        img.isTemplate = true
-        return img
     }
 
     /// The static Reduce Motion symbol, fitted into the icon's box.

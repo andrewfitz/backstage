@@ -1,6 +1,7 @@
 // Input from "someone else" for tests/focus.sh: posts one character as a key down/up pair straight
 // to one process (CGEventPostToPid, never the HID system, so it can't reach any other app) without
 // backstage's tag. The daemon's input guard must drop it before it reaches a managed app.
+// tests/computer-use.sh also runs copies at computer-use helpers' paths, whose keys must pass.
 // usage: untagged <pid> <character>
 import CoreGraphics
 import Foundation
@@ -16,3 +17,6 @@ for down in [true, false] {
     e.postToPid(pid)
     usleep(15_000)
 }
+// Stay alive until the events are delivered: the guard looks up the posting process's path then
+// (computer-use helpers are long-lived processes).
+usleep(300_000)

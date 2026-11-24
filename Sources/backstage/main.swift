@@ -19,11 +19,19 @@ APP SELECTION: --pid P, or --app NAME (managed app name/bundle id), within your 
 Default: your session's most recently launched app.
 
 LIFECYCLE
-  launch <App.app|bundle.id|Name|/path/to/executable> [--env K=V]... [--timeout S] [-- args…]
+  launch <App.app|bundle.id|Name|/path/to/executable> [--env K=V]... [--timeout S] [--dock]
+         [--audio | --inaudible] [-- args…]
+                                    hidden, muted, no Dock tile or ⌘-Tab entry (--dock: with one).
+                                    Dev builds and test runners are also made inaudible everywhere,
+                                    screen sharing and recordings included ("audio": "inaudible");
+                                    other apps are muted on this Mac only ("audio": "muted").
+                                    --audio: measure its sound (screen sharing can hear it);
+                                    --inaudible: fail unless it can be made inaudible
   list [--all]                      your session's apps + their windows (--all: every session)
   quit [--pid P] [--force]          quit a managed app
   status | doctor                   daemon/display/permission status, and the display's
-                                    `screencapture -D` index (to record it with standard tools)
+                                    `screencapture -D` index (to record it with standard tools);
+                                    doctor also runs the audio self-test (inaudible, muted probe)
   start                             start the daemon
   stop                              quit your session's apps (and the daemon, if no apps are left)
   stop --all                        quit every session's apps and stop the daemon
@@ -52,6 +60,19 @@ SEE
   window fill [--window I]                          make a window fill the display (below its menu bar)
   window size <w> <h> [--window I]                  resize a window (points); default window: frontmost
   wait --text T [--role R] [--gone] [--timeout S]   wait for an element to appear/disappear
+
+HEAR (apps are always muted: nothing they play reaches the speakers; `show` unmutes)
+  Only apps launched with --audio are measured; these commands refuse any other app.
+  audio                             the app's audio: tap state, playing, levels (dBFS), dominant
+                                    frequency, recent sounds, and `time` (the clock for --since)
+  wait --sound [--gone] [--since T] [--min-db D] [--timeout S]
+                                    wait until the app plays sound (or, with --gone, stops);
+                                    --since T also counts a sound that started at/after T and is
+                                    already over
+  audio record [-o out.wav] [--seconds N]
+                                    WAV (float32, as tapped) of the last N s (default and max 15)
+                                    the app's output ran; without -o, into the screenshots folder
+  These need System Audio Recording for the daemon's host (see doctor); muting doesn't.
 
 ACT (all delivered in the background)
   press <ref>                       AXPress an element (buttons, checkboxes, menu items…)
@@ -333,12 +354,20 @@ func cmdList(_ args: Args) throws -> [String: Any] {
                                 "windows": axWindowsSummary(a.pid, origin: origin)]
         if let b = a.bundleID { d["bundleID"] = b }
         if let s = a.stdout { d["log"] = s }
+        d["audio"] = a.audioMode.rawValue
+        if let audio = readAudioStatus(a.pid, a.processStart) {
+            d["tap"] = audio.tap
+            if let reason = audio.reason { d["tapReason"] = reason }
+        }
         return d
     }
-    return ["session": me, "apps": apps]
+    var out: [String: Any] = ["session": me, "apps": apps]
+    let failures = recentAudioFailures(session: me, live: Set(apps.compactMap { $0["pid"] as? Int32 }))
+    if !failures.isEmpty { out["audioFailures"] = failures }
+    return out
 }
 
-func cmdStatus() throws -> [String: Any] {
+func cmdStatus(doctor: Bool = false) throws -> [String: Any] {
     let accessibility = AXIsProcessTrusted()
     let recording = CGPreflightScreenCaptureAccess()
     var s: [String: Any] = [
@@ -373,7 +402,11 @@ func cmdStatus() throws -> [String: Any] {
         s["session"] = ["error": "\(error)"]
     }
     s["managedApps"] = try AppStore.read().map { ["pid": $0.pid, "name": $0.name, "session": $0.owner] }
+    let audio = doctor ? audioDoctor() : audioSummary(liveDaemon())
+    s["audio"] = audio
     var problems: [String] = []
+    if doctor { problems += audioProblems(audio) }
+    else if !audioProblems(audio).isEmpty { s["warnings"] = audioProblems(audio) }
     if !accessibility { problems.append("Accessibility not granted: System Settings > Privacy & Security > Accessibility — enable the app that runs this CLI (your terminal / agent host).") }
     if let d = liveDaemon(), d.inputGuard != true {
         problems.append("The daemon's input guard isn't running (see \(Paths.log.path)), so input commands refuse to run. Check Accessibility, then `backstage stop --all`.")
@@ -470,6 +503,46 @@ func run() throws {
         let result = guardSelfTest()
         emit(result)
         if result["ok"] as? Bool != true { exit(1) }
+    case "__audio-taps":
+        // Diagnostics: the tap manager alone (no display), muting what apps.json and pending
+        // launch records name, publishing to $BACKSTAGE_HOME/audio, until SIGTERM/SIGINT.
+        guard #available(macOS 14.2, *) else { throw CLIError("needs macOS 14.2") }
+        try Paths.ensure()
+        let taps = AudioTapManager(log: { eprint($0) }, quit: { pid, birth, _ in if processBirth(pid) == birth { kill(pid, SIGTERM) } })
+        if let failure = taps.start() { throw CLIError(failure) }
+        eprint("audio taps up")
+        var last: [AudioRegistryEntry] = []
+        var stop = false
+        for sig in [SIGTERM, SIGINT] { signal(sig) { _ in exit(0) } }
+        while !stop {
+            let entries = AppStore.load().map(AudioRegistryEntry.init)
+            if entries != last { last = entries; taps.updateRegistry(entries) }
+            pump(0.25)
+            stop = FileManager.default.fileExists(atPath: Paths.dir.appendingPathComponent("audio-taps.stop").path)
+        }
+        taps.shutdown()
+    case "__inaudible-check":
+        // Tests: what `launch` would do about an app's sound (no launch, no daemon).
+        guard let target = args.pos(0) else { throw CLIError("usage: backstage __inaudible-check <app|path>") }
+        let url = try resolveApp(target)
+        var isDir: ObjCBool = false
+        _ = FileManager.default.fileExists(atPath: url.path, isDirectory: &isDir)
+        guard let exe = isDir.boolValue ? Bundle(url: url)?.executableURL : url else { throw CLIError("no executable in \(url.path)") }
+        var out: [String: Any] = ["executable": exe.resolvingSymlinksInPath().path]
+        if let library = InaudibleLibrary.locate() {
+            let check = inaudibleEligibility(exe, library: library)
+            out["library"] = library.path
+            out["eligible"] = check.eligible
+            out["detail"] = check.detail
+        } else {
+            out["library"] = NSNull(); out["eligible"] = false
+        }
+        out["audio"] = (try? planAudio(args, executable: exe, name: url.lastPathComponent).mode.rawValue) ?? NSNull()
+        emit(out)
+    case "__dock-restore":
+        // Tests: give a managed app its Dock tile back as `show` does, without moving or activating it.
+        let app = try managedApp(args)
+        emit(["ok": true, "pid": app.pid, "dock": restoreDock(app.pid), "type": LaunchServices.applicationType(app.pid) ?? "unknown"])
     case "__daemon":
         try Paths.ensure()
         let d = try Daemon()
@@ -481,7 +554,8 @@ func run() throws {
         let result = try args.has("all") ? stopAll() : stopSession()
         emit(result)
         if result["ok"] as? Bool == false { exit(1) }
-    case "status", "doctor": emit(try cmdStatus())
+    case "status", "doctor": emit(try cmdStatus(doctor: cmd == "doctor"))
+    case "audio": emit(try cmdAudio(args))
     case "launch", "open": emit(try launch(args))
     case "list", "ps": emit(try cmdList(args))
     case "show": emit(try cmdShow(args))
@@ -503,7 +577,7 @@ func run() throws {
     case "screenshot", "shot": emit(try cmdScreenshot(args))
     case "tree": try cmdTree(args)
     case "find": emit(try cmdFind(args))
-    case "wait": emit(try cmdWait(args))
+    case "wait": emit(try args.has("sound") ? cmdWaitSound(args) : cmdWait(args))
     case "press", "focus", "action", "set":
         let pid = try inputTarget()
         guard let ref = args.pos(0) else { throw CLIError("usage: backstage \(cmd) <ref>") }

@@ -24,7 +24,9 @@ extension AXUIElement {
     func readElements(_ attribute: String) throws -> [AXUIElement] {
         var result: CFTypeRef?
         let status = AXUIElementCopyAttributeValue(self, attribute as CFString, &result)
-        if status == .noValue || (attribute == kAXChildrenAttribute && status == .attributeUnsupported) { return [] }
+        // Children an element can't list (unsupported, or a failure some SwiftUI and AppKit
+        // elements report instead of an empty list) are treated as none.
+        if status == .noValue || (attribute == kAXChildrenAttribute && (status == .attributeUnsupported || status == .failure)) { return [] }
         guard status == .success, let elements = result as? [AXUIElement] else {
             throw CLIError("cannot read \(attribute) (AXError \(status.rawValue))")
         }
@@ -182,8 +184,11 @@ func info(_ e: AXUIElement, ref: String, depth: Int) throws -> ElementInfo {
     }
     for value in values where CFGetTypeID(value) == AXValueGetTypeID() {
         var error = AXError.success
+        // A failure for one attribute is a missing value: SwiftUI and AppKit elements report it
+        // for attributes they don't have (Calculator's toolbar buttons' subrole, an open panel's
+        // sidebar value). Errors about the element itself (gone, app not responding) still fail.
         if AXValueGetValue(value as! AXValue, .axError, &error),
-           error != .noValue, error != .attributeUnsupported, error != .notImplemented {
+           error != .noValue, error != .attributeUnsupported, error != .notImplemented, error != .failure {
             throw CLIError("cannot read attributes of '\(ref)' (AXError \(error.rawValue))")
         }
     }

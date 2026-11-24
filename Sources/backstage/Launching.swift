@@ -1,7 +1,7 @@
 import Foundation
 import AppKit
 
-/// A launch in flight. `launch` writes one before `open` and removes it once the app is
+/// A launch in flight. `launch` writes one before opening the app and removes it once the app is
 /// registered (or nothing was started). If the CLI dies in between (an agent's tool timeout,
 /// Ctrl-C), the app it started belongs to no session. The daemon then finds that app from
 /// this record, quits it, and drops the record. While any record exists the daemon isn't idle.
@@ -14,6 +14,9 @@ struct LaunchRecord: Codable {
     var executable: String?     // the bare executable, if any
     var log: String
     var startedAt: Double
+    /// AudioMode: the tap manager taps the app on sight, before registration, and measures it
+    /// only when metered. Absent in records from before modes (and hand-written test records): metered.
+    var audio: String? = nil
 
     var cliAlive: Bool { processBirth(cliPID) == cliStart }
     var receipt: URL { Paths.appLogs.appendingPathComponent("\(id).pid") }
@@ -72,31 +75,32 @@ struct LaunchTarget {
         return pid_t(value.trimmingCharacters(in: .whitespacesAndNewlines))
     }
 
-    /// The new process: an instance of the bundle carrying this launch's token or log, or, for a
-    /// bare executable, the PID its wrapper reported, running that executable. `isNew` filters
-    /// out processes that existed before the launch.
+    /// The new process: an instance of the bundle carrying this launch's token or log (for a
+    /// bare executable, also running that executable), found by the PID in the receipt when there
+    /// is one. `isNew` filters out processes that existed before the launch.
     func find(isNew: (pid_t) -> Bool) -> (app: NSRunningApplication?, pid: pid_t, birth: UInt64)? {
-        let candidate: NSRunningApplication?
-        let pid: pid_t
-        if executable != nil {
-            guard let reported = receiptPID(), reported > 0, isNew(reported) else { return nil }
-            pid = reported
-            candidate = NSRunningApplication(processIdentifier: pid)
-        } else {
-            candidate = NSWorkspace.shared.runningApplications.first {
-                isNew($0.processIdentifier) && !$0.isTerminated
-                    && $0.bundleURL?.resolvingSymlinksInPath().standardizedFileURL == bundle
-                    && (ownsLog($0.processIdentifier) || hasLaunchToken($0.processIdentifier, assignment: assignment))
-            }
-            guard let candidate else { return nil }
-            pid = candidate.processIdentifier
+        if executable != nil, let reported = receiptPID() {
+            guard reported > 0, isNew(reported) else { return nil }
+            return verify(reported)
         }
+        let candidate = NSWorkspace.shared.runningApplications.first {
+            isNew($0.processIdentifier) && !$0.isTerminated
+                && $0.bundleURL?.resolvingSymlinksInPath().standardizedFileURL == bundle
+                && (ownsLog($0.processIdentifier) || hasLaunchToken($0.processIdentifier, assignment: assignment))
+        }
+        return candidate.flatMap { verify($0.processIdentifier) }
+    }
+
+    /// `pid` is this launch's process: it carries the token or owns the log (and, for a bare
+    /// executable, runs it). The receipt, when there is one, names it.
+    func verify(_ pid: pid_t) -> (app: NSRunningApplication?, pid: pid_t, birth: UInt64)? {
         guard let birth = processBirth(pid) else { return nil }
+        let candidate = NSRunningApplication(processIdentifier: pid)
         let app = candidate.flatMap { $0.processIdentifier == pid && !$0.isTerminated ? $0 : nil }
+        guard ownsLog(pid) || hasLaunchToken(pid, assignment: assignment) else { return nil }
         if let target = executable {
-            guard receiptPID() == pid, matchesExecutable(pid, target),
-                  ownsLog(pid) || hasLaunchToken(pid, assignment: assignment) else { return nil }
-        } else if app == nil { return nil }
+            guard receiptPID().map({ $0 == pid }) ?? true, matchesExecutable(pid, target) else { return nil }
+        } else if app == nil || app?.bundleURL?.resolvingSymlinksInPath().standardizedFileURL != bundle { return nil }
         guard processBirth(pid) == birth else { return nil }
         return (app, pid, birth)
     }

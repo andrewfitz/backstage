@@ -51,6 +51,13 @@ struct DaemonInfo: Codable {
     var sizeSource: String? = nil
     /// The daemon's input guard (InputGuard.swift) is running. Input commands refuse without it.
     var inputGuard: Bool? = nil
+    /// The daemon's audio tap manager passed its mute self-test (AudioTaps.swift). `launch`
+    /// refuses without it; absent in daemons from before audio.
+    var audio: Bool? = nil
+    var audioReason: String? = nil
+    /// The tap manager measures only apps launched with --audio (AudioMode). Absent in daemons
+    /// that measure every app.
+    var audioModes: Bool? = nil
 
     static let currentProtocol = 2
     var protocolMismatch: Bool { (self.protocol ?? 1) != DaemonInfo.currentProtocol }
@@ -75,8 +82,12 @@ struct ManagedApp: Codable {
     var agentPID: Int32? = nil
     /// The session that launched the app (see Session). nil for records from before sessions.
     var session: String? = nil
+    /// How launch handled its sound: "inaudible", "muted" or "metered" (AudioMode). nil for
+    /// records from before modes, which were metered.
+    var audio: String? = nil
 
     var owner: String { session ?? Session.legacy }
+    var audioMode: AudioMode { AudioMode(audio) }
 
     /// LaunchServices may have no application object for a wrapped executable.
     func requestTermination(force: Bool) throws {

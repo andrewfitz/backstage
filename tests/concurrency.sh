@@ -170,7 +170,7 @@ assert all(0 <= f[0] and 0 <= f[1] and f[0] + f[2] <= W and f[1] + f[3] <= H for
 assert apart(a, b) and apart(a, c) and apart(b, c), "overlap"
 assert a[1] == b[1] and c[1] >= a[1] + a[3], "rows"
 PYTHON
-[[ $FAIL == 0 ]] || { echo "  windows on the agent display:"; "$WORK/zorder" --display | sed 's/^/    /'; }
+[[ $FAIL == 0 ]] || { echo "  windows on the agent display:"; "$WORK/zorder" --display "$("$BS" status | jget "['daemon']['displayID']")" | sed 's/^/    /'; }
 BACKSTAGE_SESSION=C "$BS" quit --pid "$PC" >/dev/null && ! alive "$PC" && pass "C quit" || fail "C quit"
 
 echo "== baseline screenshots, windows apart"

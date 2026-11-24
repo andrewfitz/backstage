@@ -7,8 +7,9 @@ messages say what to do next.
 ## Concepts
 
 **Agent display.** A virtual monitor that only backstage's daemon can see. It's created on
-first use and parked touching only the bottom-right corner of your desktop. Apps launched
-through backstage live there. By default it's the size of your main display in points, so
+first use and parked touching only the bottom-right corner of your desktop, never along an
+edge, so neither your cursor nor the Dock can drift onto it. Apps launched through backstage
+live there. By default it's the size of your main display in points, so
 screenshots have its shape (a 4K monitor at the usual 2x is 1920×1080 points), and it's a
 Retina display, drawn at 2x (3840×2160 pixels for that size), so apps render as they would on
 a Retina screen. The size is read when the daemon starts; changing your displays later doesn't
@@ -80,26 +81,79 @@ window ref (`w8432`) or a front-to-back index (`0` = frontmost).
 
 ## Lifecycle
 
-### `launch <target> [--env K=V]… [--timeout S] [-- app args…]`
+### `launch <target> [--env K=V]… [--timeout S] [--dock] [--audio | --inaudible] [-- app args…]`
 Starts the daemon if needed, then launches `target` hidden on the agent display. `target` can
 be an `.app` path, a bundle id (`com.apple.calculator`), an app name (`Calculator`), or a bare
 executable such as a `swift build` product. A bare executable is wrapped in a throwaway
-`.app` so it can launch hidden. Every launch is a new instance (`open -n`), so an existing
-copy of the app is never touched.
+`.app` so it can launch hidden; it starts in `/` (not its own directory), so give it absolute
+paths. Every launch is a new instance (like `open -n`), so an existing copy of the app is never
+touched.
 
 ```json
 {"pid": 80562, "name": "Calculator", "bundleID": "com.apple.calculator",
  "path": "/System/Applications/Calculator.app",
  "windows": [{"ref": "w9435", "index": 0, "title": "Calculator", "frame": {"x": 40, "y": 60, "w": 230, "h": 408}}],
- "log": "~/.backstage/logs/….log"}
+ "log": "~/.backstage/logs/….log", "dock": "hidden", "audio": "muted",
+ "audioReason": "/System/Applications/Calculator.app/Contents/MacOS/Calculator is protected by System Integrity Protection (dyld ignores DYLD_INSERT_LIBRARIES for it); muted on this Mac's outputs only, so screen sharing and recordings can still hear it"}
 ```
+`dock`: the app has no Dock tile and isn't in ⌘-Tab (`"hidden"`). An app that makes itself a
+regular app at startup gets one anyway: `"visible (app made itself a regular app)"` (it
+still runs hidden on the agent display; only the tile shows). `--dock` launches it with a Dock
+tile on purpose: `"visible (--dock)"`. Qt apps are kept out of the Dock with
+`QT_MAC_DISABLE_FOREGROUND_APPLICATION_TRANSFORM=1`, which `launch` adds to their environment.
 `--timeout` (default 15 s) is how long to wait for the first window. A windowless app still
 launches; you get a `warning`, and any window it opens later is still pulled onto the agent
 display.
 
+`audio` is how the app's sound is handled (see [Hear](#hear)):
+
+| `audio` | When | Speakers | Screen sharing, remote desktop, recordings | `audio`, `wait --sound`, `audio record` |
+|---|---|---|---|---|
+| `"inaudible"` | default, for a target that accepts the injected library: dev builds and test runners (`xctest`, ad-hoc signed, unsigned or development-signed binaries, bare executables) | silent | silent | refused |
+| `"muted"` | default, for everything else (signed for distribution, hardened runtime, Apple, SIP-protected, scripts), or when the library is missing | silent | **hear it** | refused |
+| `"metered"` | `--audio` | silent | **hear it** | measured |
+
+- `audioReason` says why an app isn't inaudible (or what `--audio` means).
+- `--audio`: keep the sound inspectable. Use it only when you need to check sound: remote and
+  capture listeners (the user's screen sharing or remote-desktop session) can hear the app.
+- `--inaudible`: insist on the inaudible mode. `launch` fails before starting anything for a
+  target that won't accept the library, and quits the app if it didn't become inaudible.
+- **How inaudible works:** `DYLD_INSERT_LIBRARIES` loads `libbackstage-inaudible.dylib` into
+  the app before its own code runs. It sets `kAudioHardwarePropertyProcessIsAudible` to 0 for
+  the process, so Core Audio zeroes its output before any tap or capture sees it. `launch`
+  confirms the app did it (or that the library is mapped into it); otherwise the launch is
+  reported `muted` with the reason. A `DYLD_INSERT_LIBRARIES` you pass with `--env` is kept
+  (the library is put first).
+- **Which targets qualify:** the process's real executable (a bundle's `CFBundleExecutable`, or
+  the bare executable itself) must be a Mach-O that dyld honours DYLD variables for: not
+  SIP-protected (`/System`, `/usr`, `/bin`, `/sbin`), not an Apple platform binary, not
+  setuid, no `__RESTRICT` segment or restrict flag, and either no hardened runtime or both the
+  `com.apple.security.cs.allow-dyld-environment-variables` and
+  `com.apple.security.cs.disable-library-validation` entitlements. It must also be a dev build
+  rather than released software: unsigned, ad-hoc signed, or carrying `get-task-allow`, but
+  not signed by Apple or for Developer ID or the Mac App Store without `get-task-allow`. A
+  script (`#!`) doesn't qualify: its interpreter is a system binary that drops DYLD variables.
+- **Children** inherit the variable and load the library when they qualify. macOS's own tools
+  (`/bin/sh`, `/usr/bin/env`, `xcodebuild`…) drop DYLD variables, so whatever they start
+  doesn't get it: launch the test runner itself (`xctest`), not a script or `xcodebuild` around
+  it. A child that qualifies connects to Core Audio as it starts (about 30 ms each). Sound an
+  app plays through services macOS starts for it (WKWebView's WebKit GPU process, other XPC
+  services) isn't covered: those are muted only.
+- `audioWarning` appears when the running daemon is from an older build, which measures every
+  app; `backstage stop --all` replaces it.
+
+The app is **muted** in every mode. Muting is unconditional: `launch` refuses, before
+starting anything, on macOS older than 14.2 or when the daemon's tap manager isn't healthy
+(its mute self-test failed). If the app's audio can't be muted later, when it first uses Core
+Audio, the daemon quits it at once; a `launch` still waiting fails with that reason, and `list`
+shows it under `audioFailures`.
+
 ### `list [--all]`
 Your session's apps with their windows. `--all` lists every session's apps; each entry has a
-`session` field (`legacy` for apps from before sessions).
+`session` field (`legacy` for apps from before sessions). `audio` is the launch's mode
+(`inaudible`, `muted` or `metered`, as in `launch`). `tap` is the app's audio tap
+(`muted`, `armed` or `failed`); apps the daemon quit because their audio couldn't be muted are
+listed under `audioFailures` for 10 minutes.
 
 ### `quit [--force]`
 Quits the app. If it refuses, for example because of a "Save changes?" sheet, you get
@@ -113,6 +167,34 @@ The last N lines (default 100) of the app's stdout and stderr.
 Shows the permissions (Accessibility, Screen Recording), the daemon and display, the current
 session (`id`, and `from`: which rule above produced it), and every session's managed apps.
 When something's missing, `problems` lists what to grant and where.
+
+`audio` describes muting and measuring:
+
+```json
+"audio": {"muting": "ok", "capture": "granted", "floorDb": -80,
+          "host": {"pid": 1777, "name": "Terminal", "path": "/System/Applications/Utilities/Terminal.app/Contents/MacOS/Terminal"},
+          "selfTest": {"captured": true, "levelDb": -60, "expectedDb": -60, "hz": 18500,
+                       "device": "Mac Studio Speakers", "ioSetupMs": 1.8}}
+```
+- `muting`: `ok`, or `unavailable` with a `reason` (macOS before 14.2, a daemon from an older
+  build, or a tap manager that failed its start-up check). While it's `unavailable`, `launch`
+  refuses. With no daemon running, `status` shows `{"daemon": "not running"}` here instead.
+- `capture`: `granted` or `not granted`: whether the daemon's host has System Audio Recording,
+  which `audio`, `wait --sound` and `audio record` need (muting doesn't).
+- `host`: the daemon's responsible process (`pid`, `name`, `path`), the app that must hold that
+  grant: the terminal or agent host that started the daemon.
+- `floorDb`: the level a sound must reach to count as playing (-80 dBFS).
+- In `status`, a missing grant is a `warning`, not a problem: launching still works.
+
+`doctor` also starts the daemon if needed and runs its **audio self-test**: the daemon plays an
+inaudible probe (18.5 kHz, -60 dBFS, 0.5 s) from its own process to an output-only device,
+muted by a tap on itself, and checks the tap captured it. `audio.selfTest` has `captured`,
+`levelDb` (what the tap measured), `expectedDb` and `hz` (the probe's), `device` (where it
+played), `ioSetupMs`, and `error` when it didn't capture (no output-only device, measuring not
+permitted, an API error); `selfTest` is just `{"error": …}` if the daemon couldn't run it
+within 60 s. The first run is when macOS asks the daemon's host for System Audio Recording, so
+`doctor` is how to grant it, and `capture` then reflects the answer. Anything but a captured
+probe is reported in `problems`, with where to grant it.
 
 While the daemon runs, `daemon` describes the agent display:
 
@@ -153,15 +235,38 @@ has no apps. If it still has apps, commands that need the daemon fail and ask yo
 ### `show --pid P` / `show --app NAME` / `show` (most recent)
 Hands one of your session's hidden apps over to the user. Its windows move to the centre of
 the main display, the app comes to the front, and backstage stops managing it, so it leaves
-your session. Its state is kept: no relaunch.
+your session. Its state is kept: no relaunch. Its audio tap is removed, so the user hears it:
+the result has `"audio": "unmuted"` once the daemon confirmed that. An app launched inaudible
+stays inaudible (`"audio": "inaudible"`): it silenced itself, and only relaunching it undoes
+that (`show <app>`, or `launch --audio` then `show --pid`). An app `launch` kept out of
+the Dock becomes a regular app again first: `"dock": "restored"` (or `"visible"` if it already
+had a Dock tile). Menu bar apps whose own Info.plist sets `LSUIElement` have no Dock tile to
+restore; `dock` then says why.
 
 ### `show <app|file|url>`
 Opens anything on the user's screen, the way `open` would. If backstage is running a hidden
 instance of the app that would open it (in any session), `show` opens a new instance for the
 user instead of handing the request to the hidden one.
 
-Use `show` only when the user asked to see something. Each use is logged to
+Use `show` only when the user asked to see something, or to drive the app with computer-use
+tools that work on the user's screen (below). Each use is logged to
 `~/.backstage/shown.log`.
+
+### Computer-use tools
+Computer-use tools that work on the user's screen (Claude desktop's full-screen `screenshot`,
+`left_click`, `type`…) can't see the hidden display: to drive an app with them, put it on the
+user's screen with `show <app>`, or `show --pid P` for one you launched hidden. After that
+backstage doesn't manage it, so its input guard and cursor guard leave it alone. Never pick the
+monitor "Backstage (agent display)" with them: clicks there are dropped and the pointer is moved
+back to the user's screens.
+
+Per-app background tools (Claude's `app_*` tools, Codex's `get_app_state`, `click`,
+`type_text`…) capture one window wherever it is and post input to that app's process, so they
+can also drive a hidden app. The input guard lets input from their helpers into managed apps
+(`Claude.app/Contents/Helpers/app-cu-helper`, `…/Contents/MacOS/SkyComputerUseService`).
+Name the app unambiguously when the user runs their own copy too. Don't drive one app with
+backstage's input commands and computer-use input at the same time. See the README section
+"Using with computer use".
 
 ## See
 
@@ -216,6 +321,136 @@ size, or a fixed-size window), `requested` shows what was asked for and `note` s
 ### `wait --text T [--role R] [--gone] [--timeout S]`
 Polls until a matching element appears (or, with `--gone`, disappears). Default timeout
 10 s. Returns the element and the time it took.
+
+## Hear
+
+Every app backstage launches is muted: the daemon puts it (and its helper processes) under a
+private, muted Core Audio process tap the moment it first uses Core Audio, so nothing it plays
+reaches the speakers, whichever output device it picks. The user's own apps, the default output
+device and the volume are never touched. Dev builds and test runners are also made
+**inaudible** from inside, so they're silent in screen sharing, remote desktop and recordings
+too (see `launch`'s `audio`).
+
+**Measuring is opt-in: launch with `--audio`.** Only those apps are measured: `audio`,
+`wait --sound` and `audio record` refuse any other app at once (`launched inaudible` or
+`launched without --audio`: relaunch with `--audio`), the tap of an unmeasured app never runs
+IO (so no recording indicator), and only measured apps drive the menu bar meter. A measured app
+is muted on the Mac's outputs but not in system-wide captures, so use `--audio` only when you
+need to check sound. `show` hands an app over unmuted. Needs macOS 14.2+; measuring (not
+muting) needs **System Audio Recording** for the daemon's host (see `doctor`).
+
+A Play/Stop check:
+
+```bash
+backstage launch ./MyPlayer.app --audio  # opt in to measuring
+T=$(backstage audio | jq .time)          # the clock, before acting
+backstage click --ref w8432.0.7          # Play
+backstage wait --sound --since "$T"      # it played
+backstage audio                          # playing, peakDb, hz: is it the right sound?
+backstage click --ref w8432.0.8          # Stop
+backstage wait --sound --gone            # it stopped
+backstage audio record --seconds 5       # optional: the WAV, for any other tool
+```
+
+### `audio`
+```json
+{"pid": 80562, "tap": "muted", "processes": [80562, 80571], "ioRunning": true,
+ "playing": true, "peakDb": -6.1, "rmsDb": -9.0, "hz": 440,
+ "sampleRate": 48000, "channels": 2, "floorDb": -80, "time": 81234.52,
+ "sounds": [{"start": 81232.21, "seconds": 2.31, "peakDb": -6.0, "rmsDb": -9.2, "ongoing": true}]}
+```
+- `tap`: `muted`, or `armed` (the app hasn't used Core Audio yet; it's muted the moment it
+  does). A failed tap is an error: the daemon quit the app.
+- `ioRunning` and `playing` tell apart no audio output at all, output running but silent, and
+  sound. `playing` means the peak reached `floorDb` (-80 dBFS) within the last 0.3 s.
+- `peakDb`/`rmsDb` (dBFS) and `hz` (the strongest frequency: meaningful for tones, not for
+  music or speech) cover the last second. -200 dBFS means digital silence.
+- `sounds`: the last 16 stretches of sound, split where the level stays under the floor for
+  0.3 s. `start` is on the `time` clock.
+- `time`: now, on the clock `--since` uses (system uptime in seconds).
+- On an output device with more than 2 channels, `outputChannels` and `levelGainDb` appear:
+  see [levels](#levels-on-multichannel-devices).
+- Fails with a clear error when System Audio Recording isn't granted to the daemon's host, and
+  at once for an app launched without `--audio`.
+
+### `wait --sound [--gone] [--since T] [--min-db D] [--timeout S]`
+Waits until the app plays sound: a sound that's playing now or starts during the wait.
+`--since T` instead counts a sound that started at or after `T`, even if it's already over,
+so short sounds aren't missed. The pattern: read `time` from `audio`, act (click Play), then
+`wait --sound --since T`. `--min-db D` counts only sounds whose peak reaches `D` dBFS.
+`--gone` waits until the app is silent, and returns the sound that ended. Default timeout 10 s.
+
+```json
+{"ok": true, "sound": {"start": 81232.21, "seconds": 0.1, "peakDb": -60.0, "rmsDb": -63.1, "ongoing": false}, "seconds": 0.42, "time": 81233.4}
+```
+A timeout exits 1 and says which case it was: `no audio output running`, `output running but
+silent`, or `loudest sound peaked at -40.0 dBFS, below --min-db -30.0`. `--text` and `--sound`
+can't be combined.
+
+### `audio record [-o out.wav] [--seconds N]`
+Writes a WAV of the last `N` seconds (default and maximum 15) of what the app played, from the
+15 s ring the daemon keeps of its muted tap. Without `-o`, the file goes to the session's
+screenshots folder, `~/.backstage/shots/<session>/audio-….wav`; an `-o` path must end in
+`.wav`.
+
+```json
+{"ok": true, "pid": 80562, "path": "~/.backstage/shots/claude_3503a10a-…/audio-….wav",
+ "seconds": 5, "sampleRate": 48000, "channels": 2, "format": "float32",
+ "start": 81229.52, "end": 81234.52}
+```
+- **What's in it:** the tap's stereo mixdown, 32-bit float (`WAVE_FORMAT_IEEE_FLOAT`), the
+  samples exactly as tapped. The multichannel compensation `audio` applies to its levels
+  isn't applied: on a device with more than 2 channels the result has `levelGainDb`, and the
+  WAV reads that much below `audio`'s `peakDb`/`rmsDb`.
+- **Which seconds:** the ring is a continuous timeline of the app's output (pauses are stored
+  as silence) that ends where output last ran. While the app's output runs, that's now; after
+  it stops (output is considered stopped 1 s after the app stops it), the WAV still ends at
+  that point, so recording after `wait --sound --gone` still gets the sound. `start` and `end`
+  are on `audio`'s `time` clock, so they line up with `sounds`.
+- **`seconds`** is what the file holds: less than asked if the app started playing less than
+  that long ago. While output runs, a full 15 s request returns about 14.9 s: the newest
+  writes may overwrite the oldest frames during the read, and those are dropped.
+- **Errors:** `nothing to record` if the app hasn't played any sound since launch (no output
+  ever ran), the System Audio Recording error if the grant is missing (nothing is captured
+  then), and the usual ones for an app of another session or one that's gone.
+
+### Levels on multichannel devices
+A tap delivers a stereo mixdown, which averages a device's odd channels into left and its even
+channels into right (measured on a 10-channel interface: a stereo sound on channels 1-2 reads
+-14 dB, one on all 10 channels reads true). backstage compensates by N/2 for the widest device
+the app plays to, which is exact for the usual case of stereo on one channel pair; sound
+spread over more channels then reads high, by up to 20·log10(N/2) dB.
+
+### Audio limits
+- **Muted isn't inaudible.** macOS hands a muted app's sound to system-wide captures before
+  the mute: screen sharing, remote desktop (Parsec uses ScreenCaptureKit), recordings, and
+  global or device taps all carry it. Only the app can keep its sound out of them, which is
+  what the inaudible mode makes it do; signed, hardened and Apple apps can't be made to.
+- **Inaudible apps are silent to backstage too**: there's nothing to measure, so the audio
+  commands refuse them, and `show` can't make them audible.
+- **Alert sounds and beeps** (`NSBeep`, `AudioServicesPlaySystemSound`) are played by macOS's
+  shared `systemsoundserverd`, not the app: they stay audible and unmeasured (tapping it would
+  mute the user's own alerts). AppKit beeps on an unhandled keystroke, so typing into an app
+  can cause one.
+- **Shared playback daemons** may work the same way: speech (`AVSpeechSynthesizer`) probably
+  plays outside the app (unmeasured), so it may be audible and invisible to `audio`.
+- **`kill -9` of the daemon** unmutes its apps within milliseconds (a crash it can catch kills
+  the apps first). A `coreaudiod` restart rebuilds the taps; sound may be heard until then.
+- **macOS 14.0 and 14.1** have no process taps: `launch` refuses there.
+- **The grant belongs to the daemon's host** (whichever terminal or agent started it), keyed
+  to that host's binary path: a host upgrade may need it granted again. While an app plays,
+  macOS's audio-recording indicator names that host.
+- **An app may ask for the Microphone** the first time it plays to an audio device that has
+  input streams (an audio interface, a loopback): macOS 27 asks that for output-only playback.
+  The prompt appears on the user's screen in the app's name.
+- Muting is in place about 16 ms (median) after the app becomes an audio client (13-89 ms over
+  24 measured runs); every app measured so far took longer than that to start playing.
+
+### The published files
+The daemon writes `$BACKSTAGE_HOME/audio/<pid>-<birth>.json` (the state above) and, from the
+app's first sound, `<pid>-<birth>.pcm`: a ring of the last 15 s of the tap (float32 stereo,
+interleaved, after a 64-byte header; the format is documented in
+`Sources/CBackstageAudio/include/CBackstageAudio.h`). Both are mode 0600 and removed with the tap.
 
 ## Recording the agent display
 
@@ -304,11 +539,17 @@ Two environment variables change it:
 - `BACKSTAGE_SHOW=1 <command>` lets one deliberate, user-requested command through.
 - `BACKSTAGE_HOOK=off` disables the hook entirely.
 
+Every deny message also tells a computer-use agent to use `show` (or its tool's own
+open-application action) when it will drive the app with screen tools. In the Claude desktop app
+(`CLAUDE_CODE_ENTRYPOINT` is `claude-desktop`, `claude-desktop-3p` or `local-agent`) or the
+Codex desktop app (`CODEX_INTERNAL_ORIGINATOR_OVERRIDE` is set), that advice comes first. These
+variables only reorder the advice: nothing extra is allowed.
+
 ## Environment variables
 
 | Variable | Default | Effect |
 |---|---|---|
-| `BACKSTAGE_HOME` | `~/.backstage` | State, logs, screenshots |
+| `BACKSTAGE_HOME` | `~/.backstage` | State, logs, screenshots. Each home has its own daemon and agent display; daemons of different homes run side by side, their displays chained diagonally off the corner, each touching the next only at a corner point |
 | `BACKSTAGE_SESSION` | derived | The session this command belongs to (see Sessions); `legacy` is reserved |
 | `BACKSTAGE_WIDTH` / `BACKSTAGE_HEIGHT` | main display's size | Agent display size in points (set before the daemon starts) |
 | `BACKSTAGE_SCALE` | 2 | Agent display backing scale: `2` is Retina, `1` gives a 1x display (set before the daemon starts) |
@@ -316,3 +557,5 @@ Two environment variables change it:
 | `BACKSTAGE_MENUBAR` | on | `off` hides the menu bar indicator (set before the daemon starts) |
 | `BACKSTAGE_HOOK` | on | `off` disables the hook |
 | `BACKSTAGE_SHOW` | — | `1` as a command prefix lets that command past the hook |
+| `BACKSTAGE_TEST_AUDIO` | — | Tests only (set before the daemon starts): `mute-fail`, `tap-fail` or `no-capture` simulate those failures |
+| `BACKSTAGE_INAUDIBLE_DYLIB` | next to the binary, else `../lib/backstage/` | Path of `libbackstage-inaudible.dylib` for `launch`; empty means none (tests: the fallback to muted) |

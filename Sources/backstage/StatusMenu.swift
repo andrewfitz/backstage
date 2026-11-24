@@ -3,7 +3,7 @@ import AppKit
 import ScreenCaptureKit
 
 /// Menu bar indicator owned by the daemon. Visible only while agents have apps running;
-/// the menu shows live thumbnails of the agent display(s) and basic stats.
+/// the menu shows a live thumbnail of this daemon's agent display and basic stats.
 final class StatusMenu: NSObject, NSMenuDelegate {
     private let item: NSStatusItem
     private let menu = NSMenu()
@@ -12,6 +12,7 @@ final class StatusMenu: NSObject, NSMenuDelegate {
     private var refreshTimer: Timer?
     private var capturing = false
     private var thumbLock: StateLock?
+    private var thumbUserLock: UserLock?
     static let thumbWidth: CGFloat = 320
     /// The agent display has its own copy of the menu bar; leave it out of the thumbnail.
     static func menuBarHeight(_ id: CGDirectDisplayID) -> CGFloat {
@@ -54,7 +55,10 @@ final class StatusMenu: NSObject, NSMenuDelegate {
     func update(apps: Int) {
         let visible = apps > 0
         if item.isVisible != visible { item.isVisible = visible }
-        if visible { item.button?.title = " \(apps)" }
+        // Only on change: setting the title redraws the item and its copy on every other
+        // display's menu bar, about 1% CPU at this rate even when the text is the same.
+        let title = " \(apps)"
+        if visible, item.button?.title != title { item.button?.title = title }
         meter?.setActive(visible)
         if apps != appCount { appCount = apps; updateLabel() }
     }
@@ -113,7 +117,8 @@ final class StatusMenu: NSObject, NSMenuDelegate {
         statsItem = stats
         menu.addItem(.separator())
 
-        for id in activeDisplays().filter(isOurDisplay) {
+        // This daemon's display only: other homes' daemons show theirs in their own menus.
+        for id in [d.display.id] where CGDisplayIsActive(id) != 0 {
             let b = CGDisplayBounds(id)
             let h = (Self.thumbWidth * (b.height - Self.menuBarHeight(id)) / max(b.width, 1)).rounded()
             let container = NSView(frame: NSRect(x: 0, y: 0, width: Self.thumbWidth + 28, height: h + 12))
@@ -170,7 +175,7 @@ final class StatusMenu: NSObject, NSMenuDelegate {
         guard let d = daemon else { return "" }
         let apps = d.registry.filter { $0.matchesProcess }
         let sessions = Set(apps.map { $0.owner }).count
-        let ours = activeDisplays().filter(isOurDisplay).map { CGDisplayBounds($0) }
+        let ours = [d.display.bounds]
         let pids = Set(apps.map { $0.pid })
         let windows = onscreenWindows().filter {
             guard let pid = $0[kCGWindowOwnerPID as String] as? pid_t, pids.contains(pid),
@@ -184,13 +189,19 @@ final class StatusMenu: NSObject, NSMenuDelegate {
 
     private func refreshStatsLine() { statsItem?.title = statsText() }
 
-    /// Appends a speaker symbol and "playing" or "silent" to each app's line. Without an audio
-    /// source (no taps), the lines stay as they are.
+    /// Appends a speaker symbol and "playing" or "silent" to each measured app's line (launched
+    /// with --audio; the others aren't measured, so their lines stay as they are). Without an
+    /// audio source (no taps), every line stays as it is.
     private func refreshAudioLines() {
         guard !appLines.isEmpty, let samples = meter?.samples() else { return }
         let playing = Set(samples.filter { $0.playing }.map { $0.pid })
+        let measured = Set(samples.map { $0.pid })
         let font = NSFont.menuFont(ofSize: 0)
         for (pid, line) in appLines {
+            guard measured.contains(pid) else {
+                if line.item.attributedTitle != nil { line.item.attributedTitle = nil; line.item.title = line.text }
+                continue
+            }
             let on = playing.contains(pid)
             let text = NSMutableAttributedString(string: line.text + " · ", attributes: [.font: font])
             let symbol = NSImage(systemSymbolName: on ? "speaker.wave.2.fill" : "speaker.fill",
@@ -222,8 +233,10 @@ final class StatusMenu: NSObject, NSMenuDelegate {
         // capture that doesn't return gives the lock back after 5 s, since the daemon can't exit
         // to clear it.
         guard let lock = try? StateLock("capture.lock", nonblocking: true) else { return }
+        guard let userLock = UserLock("capture.lock", nonblocking: true) else { lock.release(); return }
         thumbLock = lock
-        DispatchQueue.main.asyncAfter(deadline: .now() + 5) { lock.release() }
+        thumbUserLock = userLock
+        DispatchQueue.main.asyncAfter(deadline: .now() + 5) { lock.release(); userLock.release() }
         capturing = true
         let targets = thumbViews.map { ($0.key, $0.value.frame.size, Self.menuBarHeight($0.key)) }
         Task.detached { [weak self] in
@@ -245,6 +258,7 @@ final class StatusMenu: NSObject, NSMenuDelegate {
                 guard let self else { return }
                 self.capturing = false
                 self.thumbLock?.release(); self.thumbLock = nil
+                self.thumbUserLock?.release(); self.thumbUserLock = nil
                 for (id, img) in images { self.thumbViews[id]?.image = NSImage(cgImage: img, size: .zero) }
             }
         }

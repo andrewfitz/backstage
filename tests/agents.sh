@@ -57,6 +57,32 @@ printf '%s' '{"tool_name":"Write","tool_input":{"command":"open -a X"}}' | "$bin
 printf 'not json' | "$bin" hook pre-tool-use && ok "garbage input fails open" || bad "garbage input"
 printf '%s' '{"tool_name":"Bash","tool_input":{"command":"open -a X"}}' | BACKSTAGE_HOOK=off "$bin" hook pre-tool-use && ok "BACKSTAGE_HOOK=off disables" || bad "BACKSTAGE_HOOK=off"
 
+echo "== hook in computer-use hosts (Claude / Codex desktop apps)"
+# Every deny message tells a computer-use agent to put the app on the user's screen; inside a
+# desktop app that has computer-use tools that advice comes first. Nothing is allowed for it.
+# The host variables are set or cleared explicitly, so this passes from any session.
+deny() { # deny <expected first-advice regex> <env assignments...>
+    local want=$1 msg code=0; shift
+    msg=$(printf '%s' '{"tool_name":"Bash","tool_input":{"command":"open -a Calculator"}}' \
+        | env -u CLAUDE_CODE_ENTRYPOINT -u CODEX_INTERNAL_ORIGINATOR_OVERRIDE "$@" "$bin" hook pre-tool-use 2>&1 >/dev/null) || code=$?
+    local ctx="${*:-no host env}"
+    [ "$code" = 2 ] || { bad "[$ctx] open not blocked (exit $code)"; return; }
+    printf '%s\n' "$msg" | grep -q 'backstage launch' || { bad "[$ctx] no launch advice"; return; }
+    printf '%s\n' "$msg" | grep -q 'computer-use tools that work on the user.s screen' || { bad "[$ctx] no computer-use advice"; return; }
+    printf '%s\n' "$msg" | grep -q 'backstage show --pid P' || { bad "[$ctx] no show --pid advice"; return; }
+    printf '%s\n' "$msg" | sed -n 2p | grep -qE "$want" && ok "[$ctx] blocked, first advice: $want" || bad "[$ctx] first advice isn't '$want': $(printf '%s\n' "$msg" | sed -n 2p)"
+}
+deny 'Checking your own work'
+deny 'Checking your own work' CLAUDE_CODE_ENTRYPOINT=cli
+deny 'computer-use' CLAUDE_CODE_ENTRYPOINT=claude-desktop
+deny 'computer-use' CLAUDE_CODE_ENTRYPOINT=claude-desktop-3p
+deny 'computer-use' CLAUDE_CODE_ENTRYPOINT=local-agent
+deny 'computer-use' CODEX_INTERNAL_ORIGINATOR_OVERRIDE=codex_work_desktop
+for c in 'backstage show Calculator' 'backstage show --pid 123' 'backstage launch Calculator'; do
+    printf '%s' "$(jq -n --arg c "$c" '{tool_name:"Bash",tool_input:{command:$c}}')" \
+        | env CLAUDE_CODE_ENTRYPOINT=claude-desktop "$bin" hook pre-tool-use 2>/dev/null && ok "[claude-desktop] allowed: $c" || bad "[claude-desktop] blocked: $c"
+done
+
 echo "== install / uninstall (throwaway HOME)"
 H=$(mktemp -d)
 mkdir -p "$H/.claude" "$H/.codex" "$H/.grok"

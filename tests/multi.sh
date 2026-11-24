@@ -13,6 +13,8 @@ BS="$BACKSTAGE_BIN"
 WORK="$(mktemp -d /tmp/backstage-multi.XXXX)"
 export BACKSTAGE_HOME="$WORK/state"
 unset BACKSTAGE_SESSION
+# A second BACKSTAGE_HOME, for two daemons side by side.
+HOME2="$WORK/state2"
 WATCH=
 SLEEPER=
 cleanup() {
@@ -21,6 +23,9 @@ cleanup() {
     wait 2>/dev/null
     if [[ -f "$BACKSTAGE_HOME/daemon.json" || -f "$BACKSTAGE_HOME/apps.json" ]]; then
         "$BS" stop --all >/dev/null 2>&1 || "$BS" stop >/dev/null 2>&1 || result=1
+    fi
+    if [[ -f "$HOME2/daemon.json" || -f "$HOME2/apps.json" ]]; then
+        BACKSTAGE_HOME="$HOME2" "$BS" stop --all >/dev/null 2>&1 || result=1
     fi
     if [[ -n "$SLEEPER" ]]; then kill "$SLEEPER" 2>/dev/null; wait "$SLEEPER" 2>/dev/null; fi
     if [[ -n "$WATCH" ]]; then
@@ -73,6 +78,8 @@ cat > "$WORK/BackstageTestApp.app/Contents/Info.plist" <<PLIST
 PLIST
 swiftc -O watch.swift -o "$WORK/watch" || exit 1
 swiftc -O pixels.swift -o "$WORK/pixels" || exit 1
+swiftc -O probe.swift -o "$WORK/probe" || exit 1
+swiftc -O axmove.swift -o "$WORK/axmove" || exit 1
 "$WORK/watch" "dev.backstage.testapp.${WORK##*.}" 600 "$WORK/watch.stop" > "$WORK/watch.out" 2>&1 &
 WATCH=$!
 sleep 0.3
@@ -242,6 +249,76 @@ sleep 0.5
 b stop >/dev/null
 sleep 0.5
 ! alive "$PD" && ! daemon_up && pass "the last session's stop stopped the daemon" || fail "daemon or app left running"
+
+echo "== two homes: two daemons at once, displays apart, each guarding its own windows"
+h2() { BACKSTAGE_HOME="$HOME2" BACKSTAGE_SESSION=A "$BS" "$@"; }
+# Succeeds once every display of the two homes meets every other display (the user's, each
+# other's, any other backstage display) at most at a corner point.
+layout_ok() {
+    "$BS" status > "$WORK/h1-status.json" && h2 status > "$WORK/h2-status.json" && "$WORK/probe" displays > "$WORK/displays.json" || return 1
+    python3 - "$WORK/h1-status.json" "$WORK/h2-status.json" "$WORK/displays.json" <<'PYTHON'
+import json, sys
+s1, s2, ds = (json.load(open(p)) for p in sys.argv[1:])
+d1, d2 = s1["daemon"], s2["daemon"]
+assert d1 and d2, "both daemons up"
+assert d1["pid"] != d2["pid"] and d1["displayID"] != d2["displayID"], "each home has its own daemon and display"
+rect = {d["id"]: (d["points"]["x"], d["points"]["y"], d["points"]["w"], d["points"]["h"]) for d in ds["displays"]}
+def contact(a, b):
+    dx = min(a[0] + a[2], b[0] + b[2]) - max(a[0], b[0]); dy = min(a[1] + a[3], b[1] + b[3]) - max(a[1], b[1])
+    return "apart" if dx < 0 or dy < 0 else "overlap" if dx > 0 and dy > 0 else "corner" if dx == 0 and dy == 0 else "edge"
+for mine in (d1["displayID"], d2["displayID"]):
+    for other, r in rect.items():
+        if other != mine:
+            c = contact(rect[mine], r)
+            assert c in ("apart", "corner"), f"display {mine} {rect[mine]} meets display {other} {r}: {c}"
+print(f"home 1 display {rect[d1['displayID']]}, home 2 display {rect[d2['displayID']]}, all: {sorted(rect.values())}")
+PYTHON
+}
+# Succeeds once every window of the PID lies inside its home's display (status JSON given).
+own_windows() {
+    "$WORK/axmove" --frames "$1" > "$WORK/frames.txt"
+    python3 - "$2" "$WORK/frames.txt" <<'PYTHON'
+import json, sys
+d = json.load(open(sys.argv[1]))["daemon"]
+x, y, w, h = d["globalOrigin"]["x"], d["globalOrigin"]["y"], d["size"]["w"], d["size"]["h"]
+frames = [tuple(map(int, line.split())) for line in open(sys.argv[2]) if line.strip()]
+assert frames and all(x <= f[0] and y <= f[1] and f[0] + f[2] <= x + w and f[1] + f[3] <= y + h for f in frames), frames
+PYTHON
+}
+wait_own() { for _ in $(seq 1 40); do own_windows "$1" "$2" 2>/dev/null && return 0; sleep 0.1; done; own_windows "$1" "$2"; }
+PH1=$(a launch "$WORK/BackstageTestApp.app" --env "TESTAPP_LOG=$WORK/h1.log" --env TESTAPP_PAD=red | jget "['pid']")
+PH2=$(h2 launch "$WORK/BackstageTestApp.app" --env "TESTAPP_LOG=$WORK/h2.log" --env TESTAPP_PAD=green | jget "['pid']")
+if [[ -n "$PH1" && -n "$PH2" ]]; then
+    pass "home 1 launched $PH1, home 2 launched $PH2"
+    OK=
+    for _ in $(seq 1 20); do layout_ok > "$WORK/layout.txt" 2>&1 && { OK=1; break; }; sleep 0.2; done
+    [[ -n $OK ]] && pass "displays apart: $(cat "$WORK/layout.txt")" || fail "display layout: $(tail -1 "$WORK/layout.txt")"
+    wait_own "$PH1" "$WORK/h1-status.json" && pass "home 1's app is on home 1's display" || fail "home 1's windows: $(cat "$WORK/frames.txt")"
+    wait_own "$PH2" "$WORK/h2-status.json" && pass "home 2's app is on home 2's display" || fail "home 2's windows: $(cat "$WORK/frames.txt")"
+    # Put a window of each home's app on the other home's display (never on the user's screens):
+    # its own daemon must take it back.
+    read -r X1 Y1 <<< "$(jget "['daemon']['globalOrigin']['x'], d['daemon']['globalOrigin']['y']" < "$WORK/h1-status.json" | tr -d '(),')"
+    read -r X2 Y2 <<< "$(jget "['daemon']['globalOrigin']['x'], d['daemon']['globalOrigin']['y']" < "$WORK/h2-status.json" | tr -d '(),')"
+    "$WORK/axmove" "$PH2" $((X1 + 100)) $((Y1 + 100)) >/dev/null
+    wait_own "$PH2" "$WORK/h2-status.json" && pass "home 2's daemon took its window back from home 1's display" || fail "home 2's windows: $(cat "$WORK/frames.txt")"
+    "$WORK/axmove" "$PH1" $((X2 + 100)) $((Y2 + 100)) >/dev/null
+    wait_own "$PH1" "$WORK/h1-status.json" && pass "home 1's daemon took its window back from home 2's display" || fail "home 1's windows: $(cat "$WORK/frames.txt")"
+    [[ $(a list | pids) == "[$PH1]" && $(h2 list | pids) == "[$PH2]" ]] && pass "each home lists only its own app" || fail "lists: $(a list | pids) / $(h2 list | pids)"
+    # One binary, two daemons: each home's screenshot shows its own app (red in 1, green in 2).
+    if a screenshot -o "$WORK/h1.png" > "$WORK/h1-shot.json" && h2 screenshot -o "$WORK/h2.png" > "$WORK/h2-shot.json"; then
+        read -r R1 G1 <<< "$(colors "$WORK/h1.png")"; read -r R2 G2 <<< "$(colors "$WORK/h2.png")"
+        (( R1 > 10000 && G1 < 1000 && G2 > 10000 && R2 < 1000 )) && pass "each home's screenshot shows its own app" \
+            || fail "screenshots: home 1 $R1 red $G1 green, home 2 $R2 red $G2 green"
+    else
+        fail "screenshots in two homes: $(cat "$WORK/h1-shot.json" "$WORK/h2-shot.json" 2>/dev/null)"
+    fi
+else
+    fail "launch in two homes: '$PH1' '$PH2'"
+fi
+h2 stop >/dev/null; a stop >/dev/null
+sleep 0.5
+! alive "$PH1" && ! alive "$PH2" && ! daemon_up && [[ $(h2 status | jget "['daemon'] is None") == True ]] \
+    && pass "both homes' stops quit their apps and daemons" || fail "a home's app or daemon is left"
 
 touch "$WORK/watch.stop"
 wait "$WATCH" || fail "watchdog detected interference"

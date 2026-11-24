@@ -51,6 +51,21 @@ reject 'width and height' window size 800 inf
 reject 'not an option' window fill --scale 2
 reject 'managed' window fill --pid "$child"
 reject 'managed' quit --force --pid "$child"
+reject "can't be combined" wait --sound --text ready
+reject 'since' wait --sound --since nan
+reject 'min-db' wait --sound --min-db inf
+reject 'not an option' wait --sound --window 0
+reject 'not an option' audio --window 0
+reject 'arguments' audio extra
+reject 'managed' audio --pid "$child"
+reject 'arguments' audio record extra
+reject 'not an option' audio --seconds 3
+reject 'not an option' audio record --window 0
+reject 'seconds' audio record --seconds 16
+reject 'seconds' audio record --seconds 0
+reject 'seconds' audio record --seconds nan
+reject 'one output path' audio record -o a.wav --out b.wav
+reject 'managed' audio record --pid "$child"
 kill -0 "$child"
 
 # Exercise a reused PID and a legacy record with no process identity.
@@ -195,4 +210,27 @@ wait "$child" 2>/dev/null || :
 child=
 # The input guard's classifier (InputGuard.swift), on constructed events that are never posted.
 "$bin" __guard-selftest | jq -e '.ok == true and .cases >= 12' >/dev/null
+
+# Inaudible launches (Inaudible.swift): what launch would do about a target's sound, without
+# launching anything. Dev builds are inaudible; hardened, SIP-protected and script targets muted.
+printf 'int main(void) { return 0; }\n' > "$work/hello.c"
+xcrun clang -o "$work/adhoc" "$work/hello.c"
+cp "$work/adhoc" "$work/hardened"
+codesign -f -s - --options runtime "$work/hardened" 2>/dev/null
+printf '#!/bin/sh\nexit 0\n' > "$work/script.sh"
+chmod +x "$work/script.sh"
+"$bin" __inaudible-check "$work/adhoc" | jq -e '.eligible and .audio == "inaudible" and (.library | test("libbackstage-inaudible.dylib$"))' >/dev/null
+"$bin" __inaudible-check --audio "$work/adhoc" | jq -e '.audio == "metered"' >/dev/null
+"$bin" __inaudible-check "$work/hardened" | jq -e '(.eligible | not) and .audio == "muted" and (.detail | test("hardened runtime"))' >/dev/null
+"$bin" __inaudible-check --inaudible "$work/hardened" | jq -e '.audio == null' >/dev/null
+"$bin" __inaudible-check "$work/script.sh" | jq -e '(.eligible | not) and (.detail | test("script"))' >/dev/null
+"$bin" __inaudible-check /bin/ls | jq -e '(.eligible | not) and (.detail | test("System Integrity Protection"))' >/dev/null
+BACKSTAGE_INAUDIBLE_DYLIB= "$bin" __inaudible-check "$work/adhoc" | jq -e '.library == null and .audio == "muted"' >/dev/null
+if xctest=$(xcrun -f xctest 2>/dev/null); then
+    "$bin" __inaudible-check "$xctest" | jq -e '.eligible and .audio == "inaudible"' >/dev/null
+fi
+reject 'exclude each other' launch "$work/adhoc" --audio --inaudible
+reject "can't launch hardened inaudible: .*hardened runtime" launch "$work/hardened" --inaudible
+BACKSTAGE_INAUDIBLE_DYLIB= reject "can't launch adhoc inaudible: .*wasn't found" launch "$work/adhoc" --inaudible
+reject 'not an option' audio --inaudible
 echo "CLI regression checks passed"

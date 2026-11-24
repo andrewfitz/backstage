@@ -2,7 +2,8 @@
 // usage: zorder <pid> [<pid>…]   prints the PIDs front to back, by the stacking order of their
 //                                frontmost normal window (PIDs with no on-screen window are left out)
 //        zorder --menus <pid>    prints how many on-screen menu windows (popup menu layer) the PID has
-//        zorder --display        lists the normal windows that intersect the agent display
+//        zorder --display <id>   lists the normal windows that intersect agent display <id> (other
+//                                BACKSTAGE_HOMEs' daemons have backstage displays too)
 import CoreGraphics
 import Foundation
 
@@ -11,7 +12,8 @@ if args.first == "--display" {
     var count: UInt32 = 0
     var ids = [CGDirectDisplayID](repeating: 0, count: 32)
     CGGetActiveDisplayList(32, &ids, &count)
-    guard let agent = ids.prefix(Int(count)).first(where: { CGDisplayVendorNumber($0) == 0xB57A }) else { print("no agent display"); exit(1) }
+    guard args.count > 1, let agent = CGDirectDisplayID(args[1]), ids.prefix(Int(count)).contains(agent),
+          CGDisplayVendorNumber(agent) == 0xB57A else { print("no agent display \(args.dropFirst().first ?? "(no id given)")"); exit(1) }
     let bounds = CGDisplayBounds(agent)
     for w in CGWindowListCopyWindowInfo([.optionOnScreenOnly, .excludeDesktopElements], kCGNullWindowID) as? [[String: Any]] ?? [] {
         guard (w[kCGWindowLayer as String] as? Int) == 0, let d = w[kCGWindowBounds as String] as? NSDictionary,

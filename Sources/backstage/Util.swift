@@ -64,9 +64,10 @@ struct Args {
     var passthrough: [String] = []
 
     init(_ raw: [String], command: String) throws {
-        let flags: Set<String> = ["help", "json", "force", "double", "right", "raw", "gone", "full", "claude", "codex", "grok", "hooks", "all"]
+        let flags: Set<String> = ["help", "json", "force", "double", "right", "raw", "gone", "full", "claude", "codex", "grok", "hooks", "all", "sound", "dock",
+                                "audio", "inaudible"]
         let values: Set<String> = ["pid", "app", "env", "timeout", "lines", "scale", "o", "out",
-                                   "window", "depth", "role", "text", "ref", "steps", "dx", "dy"]
+                                   "window", "depth", "role", "text", "ref", "steps", "dx", "dy", "since", "min-db", "seconds"]
         var i = 0
         while i < raw.count {
             let token = raw[i]
@@ -107,7 +108,7 @@ struct Args {
         let arity: ClosedRange<Int>
         switch command {
         case "launch", "open":
-            allowed = ["env", "timeout"]; arity = 1...1
+            allowed = ["env", "timeout", "dock", "audio", "inaudible"]; arity = 1...1
             for entry in multi("env") {
                 guard let equals = entry.firstIndex(of: "="), equals != entry.startIndex else {
                     throw CLIError("--env needs NAME=value")
@@ -135,9 +136,23 @@ struct Args {
                 }
             default: throw CLIError("usage: backstage window fill [--window W]  |  backstage window size <w> <h> [--window W]")
             }
+        case "wait" where has("sound"):
+            allowed = target + ["sound", "gone", "since", "min-db", "timeout"]; arity = 0...0
+            if opt("text") != nil || opt("role") != nil { throw CLIError("--text/--role and --sound can't be combined") }
         case "wait", "find":
             allowed = target + ["window", "role", "text"] + (command == "wait" ? ["timeout", "gone"] : [])
             arity = 0...(opt("text") == nil ? 1 : 0)
+        case "audio" where positional.first == "record":
+            allowed = target + ["o", "out", "seconds"]; arity = 1...1
+            if opt("o") != nil && opt("out") != nil { throw CLIError("supply one output path") }
+            if opt("seconds") != nil {
+                guard let n = double("seconds"), n.isFinite, n > 0, n <= audioRingSeconds else {
+                    throw CLIError("invalid --seconds: give 0 < N <= \(Int(audioRingSeconds)) (the daemon keeps the last \(Int(audioRingSeconds)) s)")
+                }
+            }
+        case "audio":
+            allowed = target; arity = 0...0
+            if !positional.isEmpty { throw CLIError("wrong number of arguments for audio. Usage: backstage audio | backstage audio record [-o out.wav] [--seconds N]") }
         case "press", "focus", "menu": allowed = target; arity = 1...1
         case "set", "action": allowed = target; arity = 2...2
         case "type": allowed = target + ["ref"]; arity = 1...1
@@ -151,6 +166,8 @@ struct Args {
         case "uninstall": allowed = ["claude", "codex", "grok"]; arity = 0...0
         case "hook": allowed = []; arity = 1...1
         case "skill": allowed = []; arity = 0...0
+        case "__dock-restore": allowed = target; arity = 0...0
+        case "__inaudible-check": allowed = ["audio", "inaudible"]; arity = 1...1
         case "scroll": allowed = target + ["scale", "dx", "dy"]; arity = 2...2
         case "drag": allowed = target + ["scale", "steps"]; arity = 4...4
         default: allowed = []; arity = 0...0
@@ -167,6 +184,9 @@ struct Args {
         }
         for name in ["dx", "dy"] where opt(name) != nil && Int32(opt(name)!) == nil {
             throw CLIError("--\(name) must fit in a signed 32-bit integer")
+        }
+        for name in ["since", "min-db"] where opt(name) != nil {
+            guard let n = double(name), n.isFinite else { throw CLIError("invalid --\(name)") }
         }
         for name in ["timeout", "scale"] where opt(name) != nil {
             guard let n = double(name), n.isFinite, n >= 0, name != "scale" || n > 0 else {

@@ -86,12 +86,24 @@ func screenIntrusion(_ command: String, depth: Int = 0) -> String? {
     return nil
 }
 
-func hookDenyMessage(_ why: String, _ command: String) -> String {
-    """
-    backstage: blocked, because \(why). Command: \(command.count > 160 ? String(command.prefix(160)) + "…" : command)
-    • Checking your own work (build/test/verify/debug/screenshot/explore)? Run it hidden: `backstage launch <app|bundle-id|path>`, then screenshot/tree/click (see the backstage skill or `backstage help`).
-    • Did the user explicitly ask to see it on their screen? Use `backstage show <app|file|url>`, or `backstage show --pid P` to hand over an app you launched hidden.
-    """
+/// The agent runs inside a desktop app that offers computer-use tools: the Claude desktop app
+/// (its Code and local agent sessions set CLAUDE_CODE_ENTRYPOINT) or the Codex desktop app (sets
+/// CODEX_INTERNAL_ORIGINATOR_OVERRIDE for its codex processes). Only reorders the deny message's
+/// advice: terminal Codex sessions can have computer use too, so this is no reason to allow anything.
+func desktopComputerUseHost(_ env: [String: String] = ProcessInfo.processInfo.environment) -> Bool {
+    if let e = env["CLAUDE_CODE_ENTRYPOINT"], ["claude-desktop", "claude-desktop-3p", "local-agent", "local_agent"].contains(e) { return true }
+    return !(env["CODEX_INTERNAL_ORIGINATOR_OVERRIDE"] ?? "").isEmpty
+}
+
+func hookDenyMessage(_ why: String, _ command: String, env: [String: String] = ProcessInfo.processInfo.environment) -> String {
+    let own = "• Checking your own work (build/test/verify/debug/screenshot/explore)? Run it hidden: `backstage launch <app|bundle-id|path>`, then screenshot/tree/click (see the backstage skill or `backstage help`)."
+    let user = "• Did the user explicitly ask to see it on their screen? Use `backstage show <app|file|url>`, or `backstage show --pid P` to hand over an app you launched hidden."
+    let computerUse = "• Going to drive it with computer-use tools that work on the user's screen (screenshots of their display, the real mouse and keyboard)? "
+        + "They can't see backstage's hidden display: put the app on the user's screen with `backstage show <app>` (`backstage show --pid P` if you launched it hidden), "
+        + "or use your computer-use tool's own open-application action."
+    let advice = desktopComputerUseHost(env) ? [computerUse, own, user] : [own, user, computerUse]
+    return "backstage: blocked, because \(why). Command: \(command.count > 160 ? String(command.prefix(160)) + "…" : command)\n"
+        + advice.joined(separator: "\n")
 }
 
 /// `backstage hook pre-tool-use`: read the agent's hook payload on stdin, and exit 2 with a
@@ -155,8 +167,16 @@ func cmdShow(_ args: Args) throws -> [String: Any] {
 
     // Hand a managed (hidden) app over to the user: stop managing it, move it, bring it forward.
     let app = try managedApp(args)
-    try handOver(app)
-    return ["ok": true, "pid": app.pid, "note": "app is now on the user's screen and no longer managed by backstage"]
+    let (unmuted, dock) = try handOver(app)
+    if app.audioMode == .inaudible {
+        // The app silenced itself from inside at launch; removing the tap can't undo that.
+        return ["ok": true, "pid": app.pid, "audio": "inaudible", "dock": dock,
+                "note": "app is now on the user's screen and no longer managed by backstage; it was launched inaudible, so the user "
+                    + "still can't hear it (relaunch it with `show <app>`, or `launch --audio` then `show --pid`, for sound)"]
+    }
+    return ["ok": true, "pid": app.pid, "audio": unmuted ? "unmuted" : "unknown", "dock": dock,
+            "note": "app is now on the user's screen and no longer managed by backstage; "
+                + (unmuted ? "its audio is no longer muted, so the user hears it" : "backstage couldn't confirm its audio tap was removed")]
 }
 
 /// A live managed (hidden) instance of this app exists, in any session.
@@ -174,7 +194,11 @@ private func managedInstanceRunning(of app: URL) -> Bool {
 /// Callers check ownership (the CLI goes through `managedApp`) and pass the record they checked;
 /// this locks its owning session and hands over only that same process (PID, start time, owner),
 /// so a reused PID can't hand over another session's app.
-func handOver(_ record: ManagedApp, wait: Bool = true) throws {
+/// Returns `unmuted` true once the daemon has removed the app's audio tap (it's audible again);
+/// `wait: false` doesn't wait for that. `dock` says whether the app got back the Dock tile and
+/// ⌘-Tab entry `launch` hid (see `restoreDock`).
+@discardableResult
+func handOver(_ record: ManagedApp, wait: Bool = true) throws -> (unmuted: Bool, dock: String) {
     let pid = record.pid
     let lifecycle = try StateLock("lifecycle.lock", nonblocking: !wait, shared: true)
     defer { lifecycle.release() }
@@ -186,16 +210,23 @@ func handOver(_ record: ManagedApp, wait: Bool = true) throws {
     guard let app = NSRunningApplication(processIdentifier: pid), record.matchesProcess else { throw CLIError("app \(pid) is gone") }
     try AppStore.update { $0.removeAll(where: same) }
     pump(0.2) // the daemon re-reads the app list on change; give it a beat so it stops pulling windows back
+    // The daemon sees the handover and destroys the app's tap: from then on the user hears it.
+    let status = record.processStart.map { AudioFiles.status(pid, $0) }
+    let unmuted = !wait || status == nil
+        || waitFor(timeout: 2, { FileManager.default.fileExists(atPath: status!.path) ? nil : true }) != nil
     for (i, w) in axApp(pid).windows.enumerated() {
         let size = w.size ?? CGSize(width: 600, height: 400)
         let x = target.midX - size.width / 2 + CGFloat(i * 30), y = max(target.minY + 60, target.midY - size.height / 2 + CGFloat(i * 30))
         w.setPosition(CGPoint(x: x, y: y))
     }
+    // A regular app again (Dock tile, ⌘-Tab) before it's activated for the user.
+    let dock = restoreDock(pid)
     // Activation: AX first (works regardless of cooperative-activation rules), then AppKit.
     AXUIElementSetAttributeValue(axApp(pid), kAXFrontmostAttribute as CFString, kCFBooleanTrue)
     if !app.isActive { app.activate() }
     pump(0.3)
-    logShown("handed over pid \(pid) (\(app.localizedName ?? "?"))")
+    logShown("handed over pid \(pid) (\(app.localizedName ?? "?")), dock: \(dock)")
+    return (unmuted, dock)
 }
 
 private func logShown(_ s: String) {
@@ -353,6 +384,13 @@ func selectedAgents(_ args: Args) -> [Agent] {
     return Agent.allCases.filter { FileManager.default.fileExists(atPath: $0.root.path) }
 }
 
+/// Any version of backstage's own skill (its frontmatter names it), as opposed to a user's
+/// unrelated skill that happens to live in the same folder.
+func isBackstageSkill(_ text: String) -> Bool {
+    let lines = text.split(separator: "\n", maxSplits: 3, omittingEmptySubsequences: false)
+    return lines.count > 1 && lines[0] == "---" && lines[1].trimmingCharacters(in: .whitespaces) == "name: backstage"
+}
+
 func cmdInstall(_ args: Args) throws -> [String: Any] {
     let agents = selectedAgents(args)
     guard !agents.isEmpty else { throw CLIError("no agent config dirs found (~/.claude, ~/.codex, ~/.grok); pass --claude/--codex/--grok") }
@@ -362,9 +400,18 @@ func cmdInstall(_ args: Args) throws -> [String: Any] {
     for a in agents {
         var r: [String: Any] = [:]
         let skill = a.skillDir.appendingPathComponent("SKILL.md")
-        if FileManager.default.fileExists(atPath: skill.path),
-           try String(contentsOf: skill, encoding: .utf8) != skillMarkdown {
-            throw CLIError("found a different skill at \(skill.path); move it before installing")
+        if FileManager.default.fileExists(atPath: skill.path) {
+            let existing = try String(contentsOf: skill, encoding: .utf8)
+            guard isBackstageSkill(existing) else {
+                throw CLIError("found a different skill at \(skill.path); move it before installing")
+            }
+            // An older (or locally edited) backstage skill: upgrade it, keeping a copy if it differs.
+            if existing != skillMarkdown {
+                let bak = skill.appendingPathExtension("backstage-bak")
+                try? FileManager.default.removeItem(at: bak)
+                try FileManager.default.copyItem(at: skill, to: bak)
+                r["previousSkill"] = bak.path
+            }
         }
         if args.has("hooks") {
             r["hook"] = a == .grok ? try editTOMLHooks(a.hookFile, matcher: a.hookMatcher, command: command)
@@ -396,7 +443,7 @@ func cmdUninstall(_ args: Args) throws -> [String: Any] {
                                    : try editJSONHooks(a.hookFile, matcher: a.hookMatcher, command: nil)
         }
         if FileManager.default.fileExists(atPath: skill.path) {
-            if try String(contentsOf: skill, encoding: .utf8) == skillMarkdown {
+            if isBackstageSkill(try String(contentsOf: skill, encoding: .utf8)) {
                 try FileManager.default.removeItem(at: skill)
                 // rmdir removes only an empty directory, even if another writer adds a file.
                 _ = rmdir(a.skillDir.path)

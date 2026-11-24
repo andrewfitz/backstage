@@ -205,8 +205,14 @@ else grep -q "another backstage session" "$WORK/wforeign.json" && pass "window f
 echo "== logs"
 "$BS" logs $A | grep -q "fixture stdout hello" && pass "logs captured app stdout" || fail "logs"
 
+# backstage's one "you're active" event, plus the fixture's own activate(): macOS refuses that for
+# a regular background app, but this one starts as a UIElement (no Dock tile), which may activate
+# itself. Then the daemon must have handed focus straight back (the watchdog checks the rest).
 N=$(grep -c "became active" "$LOG" || true)
-[ "$N" = 1 ] && pass "app saw exactly one activation" || fail "app saw $N activations (expected 1)"
+if [ "$N" = 1 ]; then pass "app saw one activation"
+elif [ "$N" = 2 ] && grep -q "managed app $PID took focus; handing focus back" "$BACKSTAGE_HOME/daemon.log"; then
+    pass "app saw two activations: its own activate(), which the daemon handed back, and backstage's"
+else fail "app saw $N activations (expected 1, or 2 with a focus hand-back)"; fi
 
 echo "== quit"
 [[ $("$BS" quit $A | jget "['ok']") == True ]]
@@ -221,10 +227,12 @@ echo "$BARE_OUT"
 BARE_PID=$(echo "$BARE_OUT" | jget "['pid']")
 grep -Fx "pid=$BARE_PID" "$WORK/bare.log"
 grep -Fx "argument=argument with a 'quote'" "$WORK/bare.log"
+# LaunchServices runs it directly (no exec'ing shim, which would give it a Dock tile), so it starts in /.
 BARE_CWD=$(sed -n 's/^cwd=//p' "$WORK/bare.log")
-[[ "$BARE_CWD" -ef "$BARE_DIR" ]]
+[[ "$BARE_CWD" == / ]]
+[[ $(echo "$BARE_OUT" | jget "['dock']") == hidden ]]
 [[ $("$BS" quit --pid "$BARE_PID" | jget "['ok']") == True ]]
-pass "bare executable ran from its directory with its exact argument"
+pass "bare executable ran in / with its exact argument, hidden from the Dock"
 
 echo "== second instance: popup uses center() instead of fixed coordinates"
 OUT2=$("$BS" launch "$WORK/BackstageTestApp.app" --env TESTAPP_POPUP=1 --env "TESTAPP_LOG=$LOG" --env TESTAPP_POPUP_CENTER=1)

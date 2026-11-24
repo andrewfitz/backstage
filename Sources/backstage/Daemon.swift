@@ -1,6 +1,7 @@
 import Foundation
 import AppKit
 import ApplicationServices
+import CBackstageAudio
 
 /// Place a window inside the agent display, cascading by `slot`, shrinking it if it doesn't fit.
 func placeOnAgentDisplay(_ w: AXUIElement, display b: CGRect, slot: Int) {
@@ -83,6 +84,10 @@ final class Daemon {
     var statusMenu: StatusMenu?
     /// Per-app audio levels for the menu bar meter (set by the tap manager; read by StatusMenu).
     var audioLevels: AudioLevelSource?
+    /// The audio tap manager (AudioTaps.swift; macOS 14.2+), and why muting is unavailable if it isn't.
+    var audioTaps: AudioTapControl?
+    var audioUnavailable: String? = "audio muting needs macOS 14.2 or later"
+    var audioRegistry: [AudioRegistryEntry] = []
     var nextMenuUpdate = 0.0
     let sizeSource: String
     let inputGuard = InputGuard()
@@ -121,16 +126,18 @@ final class Daemon {
     }
 
     func run() throws -> Never {
-        // Wait for the display to come online, give it its mode (Retina or 1x), then park it.
+        // Wait for the display to come online, park it at once (macOS first puts a new display
+        // edge to edge with the user's), give it its mode (Retina or 1x), and check it's parked.
         guard waitFor(timeout: 5, { activeDisplays().contains(display.id) ? true : nil }) != nil else {
             throw CLIError("could not bring the agent display online")
         }
+        guard display.park(force: true) else { throw CLIError("could not park the agent display") }
         guard display.selectMode() else {
             throw CLIError("could not set the agent display to \(display.size.width)x\(display.size.height) points at \(display.size.scale)x")
         }
         guard display.park() else { throw CLIError("could not park the agent display") }
         pump(0.5)
-        screens = userDisplayBounds()
+        refreshScreens()
 
         lastUserApp = NSWorkspace.shared.frontmostApplication
         NSWorkspace.shared.notificationCenter.addObserver(forName: NSWorkspace.didActivateApplicationNotification, object: nil, queue: .main) { [weak self] n in
@@ -146,11 +153,17 @@ final class Daemon {
         // Keep the user's input out of managed apps (an open menu takes the keyboard focus).
         inputGuard.update(managed: managed, userPid: lastUserApp?.processIdentifier ?? 0)
         inputGuardUp = inputGuard.start()
-        // Monitor arrangement changes (user plugs in a screen): re-park.
+        // Monitor arrangement changes (user plugs in a screen, another home's daemon adds its
+        // display): guard the new layout at once, re-park if needed.
         CGDisplayRegisterReconfigurationCallback({ _, flags, _ in
             if flags.contains(.beginConfigurationFlag) { return }
-            DispatchQueue.main.async { Daemon.shared?.scheduleRepark() }
+            DispatchQueue.main.async { Daemon.shared?.refreshScreens(); Daemon.shared?.scheduleRepark() }
         }, nil)
+
+        // A crash kills the managed apps first (C handler, fixed PID table): otherwise their
+        // windows land on the user's screen and their audio comes out unmuted.
+        bs_crash_install()
+        startAudio()
 
         for sig in [SIGTERM, SIGINT, SIGHUP] {
             signal(sig, SIG_IGN)
@@ -161,7 +174,7 @@ final class Daemon {
         }
 
         try writeInfo()
-        log("daemon up pid=\(getpid()) display=\(display.id) bounds=\(display.bounds)")
+        log("daemon up pid=\(getpid()) display=\(display.id) serial=\(display.serial) bounds=\(display.bounds)")
         log(inputGuardUp ? "input guard up" : "input guard unavailable (event tap refused; Accessibility not granted?): input commands will refuse to run")
         // Menu bar indicator: the daemon runs as an accessory app (no Dock icon, never activates).
         if ProcessInfo.processInfo.environment["BACKSTAGE_MENUBAR"] != "off" {
@@ -184,11 +197,21 @@ final class Daemon {
 
     static var shared: Daemon?
 
+    /// The user's displays, and every backstage display but ours (other homes' daemons).
+    var otherAgentScreens: [CGRect] = []
+    func refreshScreens() {
+        screens = userDisplayBounds()
+        otherAgentScreens = otherAgentDisplayBounds(excluding: display.id)
+    }
+
     var reparkPending = false
+    var reparkFailures = 0
     func scheduleRepark() {
         guard !reparkPending else { return }
         reparkPending = true
-        DispatchQueue.main.asyncAfter(deadline: .now() + 0.5) {
+        // Staggered by serial, so daemons reacting to the same change don't all move at once
+        // (park() also serializes them, and a parked display never moves).
+        DispatchQueue.main.asyncAfter(deadline: .now() + 0.25 + Double(display.serial % 8) * 0.05) {
             self.reparkPending = false
             self.repark()
         }
@@ -197,13 +220,24 @@ final class Daemon {
         guard !stopping else { return }
         // Monitor unplugged / turned off: the agent display would become the user's only screen
         // and their windows would migrate onto it. Bail out so it disappears.
-        screens = userDisplayBounds()
+        refreshScreens()
         if screens.isEmpty { shutdown(reason: "no user display left"); return }
-        let u = screens.reduce(CGRect.null) { $0.union($1) }
-        let b = display.bounds
-        if b.minX != u.maxX || b.minY != u.maxY {
-            guard display.park() else { shutdown(reason: "failed to re-park display"); return }
-            log("re-parked display at \(display.bounds)")
+        if display.isParked {
+            reparkFailures = 0
+        } else {
+            let was = display.bounds
+            if display.park() {
+                reparkFailures = 0
+                if display.bounds != was { log("re-parked display from \(was) to \(display.bounds)") }
+            } else {
+                // Another (older) daemon may be moving its display right now: try again shortly,
+                // but don't stay touching the user's desktop along an edge.
+                reparkFailures += 1
+                guard reparkFailures < 4 else { shutdown(reason: "failed to re-park display"); return }
+                log("could not re-park display (at \(display.bounds)); retrying")
+                scheduleRepark()
+            }
+            refreshScreens()
         }
         do { try writeInfo() } catch { log("cannot update display state: \(error)") }
     }
@@ -217,7 +251,8 @@ final class Daemon {
         try writeJSON(Paths.daemon, DaemonInfo(pid: getpid(), displayID: display.id, x: b.minX, y: b.minY, width: b.width, height: b.height,
                                                startedAt: startedAt, processStart: processBirth(getpid()),
                                                protocol: DaemonInfo.currentProtocol, stopping: shutdownRequested ? true : nil,
-                                               sizeSource: sizeSource, inputGuard: inputGuardUp))
+                                               sizeSource: sizeSource, inputGuard: inputGuardUp,
+                                               audio: audioUnavailable == nil, audioReason: audioUnavailable, audioModes: true))
     }
 
     func markShutdown(_ requested: Bool) {
@@ -258,6 +293,7 @@ final class Daemon {
         nextReload = now + 0.25
         registry.removeAll { !$0.matchesProcess }
         managed = Set(registry.map { $0.pid })
+        if !registryUnreadable { pushAudioRegistry() }
         inputGuard.update(managed: managed, userPid: lastUserApp?.processIdentifier ?? 0)
         for pid in managed where observers[pid] == nil && now >= observeAfter[pid, default: 0] { observe(pid, now: now) }
         observeAfter = observeAfter.filter { managed.contains($0.key) }
@@ -339,15 +375,21 @@ final class Daemon {
             m.update(apps: managed.count)
         }
         let b = display.bounds
+        if now >= nextArrangementCheck { nextArrangementCheck = now + 0.25; checkArrangement() }
+        if now >= nextDockCheck { nextDockCheck = now + 1; guardDock() }
 
-        // 1. Keep managed windows off the user's screens.
+        // 1. Keep managed windows off the user's screens, and off other homes' backstage
+        //    displays (an app restoring a window to where it last was can land there).
         if !managed.isEmpty {
             idleSince = ProcessInfo.processInfo.systemUptime
             var offenders: Set<pid_t> = []
             for w in onscreenWindows() {
                 guard let pid = w[kCGWindowOwnerPID as String] as? pid_t, managed.contains(pid),
                       let layer = w[kCGWindowLayer as String] as? Int, layer < 1000 else { continue }
-                if screens.contains(where: { $0.intersects(cgBounds(w)) }) { offenders.insert(pid) }
+                let f = cgBounds(w)
+                if screens.contains(where: { $0.intersects(f) }) || otherAgentScreens.contains(where: { $0.intersects(f) }) {
+                    offenders.insert(pid)
+                }
             }
             for pid in offenders where registry.contains(where: { $0.pid == pid && $0.matchesProcess }) {
                 let n = adoptWindows(pid: pid, display: b, slotBase: Int(pid % 5))
@@ -359,8 +401,9 @@ final class Daemon {
             shutdown(reason: "idle for \(Int(idleTimeout))s with no managed apps")
         }
 
-        // 2. Keep the user's cursor off the agent display.
-        if let loc = CGEvent(source: nil)?.location, b.contains(loc) {
+        // 2. Keep the user's cursor off every backstage display: ours and other homes'.
+        //    Points on a user display's bottom or right edge (the Dock) are never on one.
+        if let loc = CGEvent(source: nil)?.location, b.contains(loc) || otherAgentScreens.contains(where: { $0.contains(loc) }) {
             let points = screens.map { u in
                 CGPoint(x: min(max(loc.x, u.minX), u.maxX - 1), y: min(max(loc.y, u.minY), u.maxY - 1))
             }
@@ -368,6 +411,80 @@ final class Daemon {
             CGWarpMouseCursorPosition(p)
             CGAssociateMouseAndMouseCursorPosition(1)
         }
+    }
+
+    /// The reconfiguration callback isn't delivered without an NSApplication (BACKSTAGE_MENUBAR=off),
+    /// so watch the arrangement here too.
+    var nextArrangementCheck = 0.0
+    var arrangement: [CGRect] = []
+    func checkArrangement() {
+        let now = activeDisplays().map { CGDisplayBounds($0) }
+        guard now != arrangement else { return }
+        arrangement = now
+        refreshScreens()
+        scheduleRepark()
+    }
+
+    var nextDockCheck = 0.0
+    var dockAway: CGRect?
+    /// The Dock must stay on the user's screens. Parking (corner contact only) keeps macOS from
+    /// moving it to a backstage display; this catches it if that ever happens anyway.
+    func guardDock() {
+        guard let dock = dockWindowBounds() else { return }
+        let ours = contact(dock, display.bounds) == .overlap
+        let theirs = otherAgentScreens.contains { contact(dock, $0) == .overlap }
+        guard ours || theirs else {
+            if let away = dockAway { log("the Dock is back on the user's screen (was at \(away))"); dockAway = nil }
+            return
+        }
+        if dockAway == nil {
+            // macOS moves the Dock to a display arranged right below its own. Re-parking (which
+            // runs on any arrangement change) brings it back by itself ~0.1 s after the move.
+            log("the Dock moved onto \(ours ? "this daemon's" : "another backstage") display at \(dock); this display at \(display.bounds)"
+                + (ours && display.isParked ? " though parked: not moving it (no undisruptive way known)" : ""))
+        }
+        if ours, !display.isParked { scheduleRepark() }
+        dockAway = dock
+    }
+
+    /// Start the tap manager before daemon.json exists, so no launch can see a daemon whose
+    /// muting isn't up yet. A failed mute self-test leaves `audio: false`: `launch` refuses.
+    func startAudio() {
+        guard #available(macOS 14.2, *) else { log("audio: macOS 14.2 or later is needed for muting; launch will refuse"); return }
+        let taps = AudioTapManager(log: { [weak self] in self?.log($0) }, quit: { pid, birth, registered in
+            DispatchQueue.main.async { Daemon.shared?.quitOverAudio(pid: pid, birth: birth, registered: registered) }
+        })
+        if let failure = taps.start() {
+            audioUnavailable = failure
+            log("audio: muting unavailable: \(failure); launch will refuse")
+            return
+        }
+        audioUnavailable = nil
+        audioTaps = taps
+        audioLevels = taps
+        log("audio: tap manager up")
+    }
+
+    /// Hand the registry to the tap manager when it changes (only after a good read), and keep
+    /// the crash handler's PID table current.
+    func pushAudioRegistry() {
+        let entries = registry.map(AudioRegistryEntry.init)
+        guard entries != audioRegistry else { return }
+        audioRegistry = entries
+        bs_crash_set(0, entries.map { Int32($0.pid) }, entries.map { $0.birth }, Int32(entries.count))
+        audioTaps?.updateRegistry(entries)
+    }
+
+    /// The tap manager couldn't mute an app: quit it at once, like `stop` (gracefully, then forcefully).
+    func quitOverAudio(pid: pid_t, birth: UInt64, registered: Bool) {
+        if registered, let record = registry.first(where: { $0.pid == pid && $0.processStart == birth }) {
+            try? record.requestTermination(force: false)
+            DispatchQueue.main.asyncAfter(deadline: .now() + 1) { if record.matchesProcess { try? record.requestTermination(force: true) } }
+            return
+        }
+        guard processBirth(pid) == birth else { return }
+        kill(pid, SIGTERM)
+        DispatchQueue.main.asyncAfter(deadline: .now() + 1) { if processBirth(pid) == birth { kill(pid, SIGKILL) } }
     }
 
     func shutdown(reason: String) {
@@ -422,6 +539,8 @@ final class Daemon {
             markShutdown(false)
             return
         }
+        // The apps are gone: now their taps can go.
+        audioTaps?.shutdown()
         try? FileManager.default.removeItem(at: Paths.daemon)
         inputGuard.logActivity(log, force: true)
         log("bye")

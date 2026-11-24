@@ -14,6 +14,8 @@ enum CaptureTarget {
 /// and `captureImage` never return, in every process involved, until those processes exit. So:
 /// - captures take `capture.lock` and keep it until the process exits (`captureLock`), since a
 ///   client that has finished its calls but is still running can still collide with the next one;
+///   then the same lock shared by every BACKSTAGE_HOME (`userCaptureLock`): the hang doesn't care
+///   which daemon a process belongs to;
 /// - an attempt that doesn't answer within `captureAttemptTimeout` gives up the lock and runs the
 ///   command again once in a fresh process image (`retryCaptureInFreshProcess`), which ends the
 ///   stuck call;
@@ -21,6 +23,7 @@ enum CaptureTarget {
 ///   other sessions capture; that is retried once.
 let captureAttemptTimeout = 4.0
 private var captureLock: StateLock?
+private var userCaptureLock: UserLock?
 private struct CaptureTimedOut: Error {}
 
 /// Capture with ScreenCaptureKit. Works for windows on the (invisible) agent display.
@@ -30,9 +33,11 @@ func capture(_ target: CaptureTarget, to url: URL, scale: Double) throws -> CGSi
     var image: CGImage?
     while image == nil {
         if captureLock == nil { captureLock = try StateLock("capture.lock") }
+        if userCaptureLock == nil { userCaptureLock = UserLock("capture.lock") }
         do {
             image = try runAsync(timeout: captureAttemptTimeout, onTimeout: CaptureTimedOut()) { try await grab(target, scale: scale) }
         } catch is CaptureTimedOut {
+            userCaptureLock?.release(); userCaptureLock = nil
             captureLock?.release(); captureLock = nil
             try retryCaptureInFreshProcess()
         } catch let error as NSError where error.domain == SCStreamErrorDomain

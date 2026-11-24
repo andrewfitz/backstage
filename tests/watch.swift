@@ -3,6 +3,8 @@
 //  - a window owned by a process with the given bundle ID is on-screen on a user display, or
 //  - that process is frontmost, or
 //  - the cursor is on a non-user (virtual) display, or
+//  - the Dock is not on a user display (macOS moves it to a display arranged below its own, or
+//    to one whose bottom edge the cursor lingers at), or
 //  - input that backstage didn't send (the user's typing, clicks, scrolls) reached that process,
 //    or input backstage sent reached the user's frontmost app. A listen-only event tap sees every
 //    key, click and scroll after the WindowServer has picked its target process; backstage tags
@@ -16,10 +18,16 @@ import os
 
 let bundleID = CommandLine.arguments[1]
 let secs = Double(CommandLine.arguments[2])!
-func userDisplays() -> [CGRect] {
+func displays() -> [CGDirectDisplayID] {
     var n: UInt32 = 0; var ids = [CGDirectDisplayID](repeating: 0, count: 32); CGGetActiveDisplayList(32, &ids, &n)
-    return ids[0..<Int(n)].filter { CGDisplayVendorNumber($0) != 0xB57A }.map { CGDisplayBounds($0) }
+    return Array(ids[0..<Int(n)])
 }
+func userDisplays() -> [CGRect] { displays().filter { CGDisplayVendorNumber($0) != 0xB57A }.map { CGDisplayBounds($0) } }
+func agentDisplays() -> [(CGDirectDisplayID, CGRect)] { displays().filter { CGDisplayVendorNumber($0) == 0xB57A }.map { ($0, CGDisplayBounds($0)) } }
+// The Dock's window is as large as the display the Dock is on.
+let dockPid = NSRunningApplication.runningApplications(withBundleIdentifier: "com.apple.dock").first?.processIdentifier
+let dockLevel = Int(CGWindowLevelForKey(.dockWindow))
+func overlaps(_ a: CGRect, _ b: CGRect) -> Bool { let i = a.intersection(b); return !i.isNull && i.width > 0 && i.height > 0 }
 var violations: [String: Int] = [:]
 
 // Tags backstage puts in kCGEventSourceUserData (Sources/backstage/InputGuard.swift).
@@ -138,8 +146,21 @@ while Date() < end && !(stopFile.map { FileManager.default.fileExists(atPath: $0
        NSRunningApplication(processIdentifier: pid)?.bundleIdentifier == bundleID {
         violations["test app became frontmost", default: 0] += 1
     }
+    // CGRect.contains leaves out maxX/maxY, as the cursor does: on a 1080-point-high display it
+    // goes down to y 1079.x, so y == 1080 is the next display down (an agent display parked
+    // along the user's bottom edge instead of at the corner).
     if let loc = CGEvent(source: nil)?.location, !screens.contains(where: { $0.contains(loc) }) {
-        violations["cursor off user displays at \(loc)", default: 0] += 1
+        let on = agentDisplays().first { $0.1.contains(loc) }.map { "on backstage display \($0.0) \($0.1)" } ?? "off every display"
+        violations["cursor off user displays at \(loc), \(on)", default: 0] += 1
+    }
+    if samples % 10 == 0, let dockPid,
+       let dock = wins.first(where: { ($0[kCGWindowOwnerPID as String] as? pid_t) == dockPid && ($0[kCGWindowLayer as String] as? Int) == dockLevel }),
+       let bd = dock[kCGWindowBounds as String] as? NSDictionary, let b = CGRect(dictionaryRepresentation: bd) {
+        if let agent = agentDisplays().first(where: { overlaps($0.1, b) }) {
+            violations["the Dock is on backstage display \(agent.0) \(agent.1)", default: 0] += 1
+        } else if !screens.contains(where: { overlaps($0, b) }) {
+            violations["the Dock is off the user's displays at \(b)", default: 0] += 1
+        }
     }
     if let pid = keyFocusPid(), withTapLock({ testPids.contains(pid) }) {
         if focusSince == nil { focusSince = now }
