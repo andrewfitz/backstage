@@ -3,3 +3,4 @@
 *.backstage-bak
 .DS_Store
 load-results/
+*.orig
