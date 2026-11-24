@@ -8,12 +8,13 @@ set -euo pipefail
 cd "$(dirname "$0")"
 ROOT="$(cd .. && pwd)"
 if [[ -z ${BACKSTAGE_BIN:-} ]]; then
-    (cd "$ROOT" && swift build -c release)
+    (cd "$ROOT" && make build)
     BACKSTAGE_BIN="$(cd "$ROOT" && swift build -c release --show-bin-path)/backstage"
 fi
 BS="$BACKSTAGE_BIN"
 WORK="$(mktemp -d /tmp/backstage-dock.XXXX)"
 export BACKSTAGE_HOME="$WORK/state"
+unset BACKSTAGE_SESSION
 TAG="${WORK##*.}"
 NAME="BackstageDock$TAG"
 BARE_NAME="BackstageDockBare$TAG"
@@ -22,7 +23,7 @@ cleanup() {
     local result=$?
     trap - EXIT
     if [[ -n "$WATCH" ]]; then touch "$WORK/watch.stop"; wait "$WATCH" || true; fi
-    if [[ -f "$BACKSTAGE_HOME/daemon.json" ]]; then "$BS" stop > /dev/null || result=1; fi
+    if [[ -f "$BACKSTAGE_HOME/daemon.json" || -f "$BACKSTAGE_HOME/apps.json" ]]; then "$BS" stop --all > /dev/null || result=1; fi
     # LaunchServices registered the fixture and the bare executable's wrapper: forget them.
     local lsregister=/System/Library/Frameworks/CoreServices.framework/Frameworks/LaunchServices.framework/Support/lsregister
     for bundle in "$WORK/$NAME.app" "$BACKSTAGE_HOME"/wrappers/*.app; do
@@ -52,7 +53,12 @@ APP="$WORK/$NAME.app"
 
 "$WORK/dockwatch" watch "$NAME" "$BARE_NAME" --stop "$WORK/watch.stop" --max 300 > "$WORK/watch.out" 2>&1 &
 WATCH=$!
-for _ in $(seq 1 50); do grep -q watching "$WORK/watch.out" 2>/dev/null && break; sleep 0.1; done
+for _ in $(seq 1 50); do
+    grep -qx watching "$WORK/watch.out" && break
+    kill -0 "$WATCH" 2>/dev/null || break
+    sleep 0.1
+done
+grep -qx watching "$WORK/watch.out" || { cat "$WORK/watch.out"; fail "Dock watcher did not start"; exit 1; }
 
 echo "== launch: no Dock tile, ever"
 OUT=$("$BS" launch "$APP" --env TESTAPP_POLICY=none --env "TESTAPP_LOG=$WORK/app.log")
@@ -79,9 +85,11 @@ BPID=$(echo "$OUT" | jget "['pid']")
     && pass "bare executable's window placed" || fail "bare executable has no window"
 "$BS" quit --pid "$BPID" > /dev/null
 
-touch "$WORK/watch.stop"; wait "$WATCH"; WATCH=
+touch "$WORK/watch.stop"
+wait "$WATCH" || fail "Dock watcher did not cover the run"
+WATCH=
 cat "$WORK/watch.out"
-grep -q "^shows=0 " "$WORK/watch.out" && pass "no Dock tile appeared while the apps ran" || fail "a Dock tile appeared"
+grep -qE '^shows=0 samples=[1-9][0-9]* ' "$WORK/watch.out" && pass "no Dock tile appeared while the apps ran" || fail "Dock watcher did not confirm zero appearances"
 
 echo "== restore (what show does before activating)"
 OUT=$("$BS" launch "$APP" --env TESTAPP_POLICY=none --env "TESTAPP_LOG=$WORK/app.log")

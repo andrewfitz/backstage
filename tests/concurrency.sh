@@ -12,11 +12,12 @@ set -uo pipefail
 cd "$(dirname "$0")"
 ROOT="$(cd .. && pwd)"
 if [[ -z ${BACKSTAGE_BIN:-} ]]; then
-    (cd "$ROOT" && swift build -c release)
-    BACKSTAGE_BIN="$(cd "$ROOT" && swift build -c release --show-bin-path)/backstage"
+    (cd "$ROOT" && make build) || exit 1
+    BIN_DIR="$(cd "$ROOT" && swift build -c release --show-bin-path)" || exit 1
+    BACKSTAGE_BIN="$BIN_DIR/backstage"
 fi
 BS="$BACKSTAGE_BIN"
-WORK="$(mktemp -d /tmp/backstage-concurrency.XXXX)"
+WORK="$(mktemp -d /tmp/backstage-concurrency.XXXX)" || exit 1
 export BACKSTAGE_HOME="$WORK/state"
 # A small display, so the third window has to wrap to a second row.
 export BACKSTAGE_WIDTH=1000 BACKSTAGE_HEIGHT=900
@@ -44,7 +45,7 @@ trap 'exit 130' INT
 trap 'exit 143' TERM
 
 "$BS" status > "$WORK/status.json"
-python3 - "$WORK/status.json" <<'PYTHON'
+python3 - "$WORK/status.json" <<'PYTHON' || exit 1
 import json, sys
 status = json.load(open(sys.argv[1]))
 if not status["ok"]:
@@ -101,22 +102,29 @@ shot() {
 # check <label> <session> <pid> <baseline own> [<minimum own>]: the screenshot has all of the
 # app's own pad pixels (within 2% of the baseline, or at least <minimum own> when a pad-colored
 # menu, sheet or popover is open) and essentially none of the other app's. A pad is ~49k pixels
-# and the swatches 12-30k; the few hundred allowed are title bar buttons.
+# and the swatches 12-30k; the few hundred allowed are title bar buttons. With a menu log
+# and PID, return 2 if that menu closes before the capture can be checked.
 check() {
-    local label=$1 s=$2 pid=$3 base=$4 least=${5:-0} own foreign ok tries=1
+    local label=$1 s=$2 pid=$3 base=$4 least=${5:-0} menu_log=${6:-} menu_pid=${7:-} own foreign ok=0 i tries=1
     # A menu, sheet or popover fades in after its window appears, so a capture taken right
     # away can miss part of it: give those up to ~1.5 s to finish drawing.
     (( least > 0 )) && tries=6
     for (( i = 0; i < tries; i++ )); do
         (( i > 0 )) && sleep 0.25
+        if [[ -n "$menu_log" ]] && menuclosed "$menu_log" "$menu_pid"; then return 2; fi
         read -r own foreign <<< "$(shot "$s" "$pid")"
+        if (( own < 0 || foreign < 0 || foreign >= 1000 )); then break; fi
+        if [[ -n "$menu_log" ]] && menuclosed "$menu_log" "$menu_pid"; then return 2; fi
         if (( least == 0 )); then ok=$(( own * 100 >= base * 98 && own * 100 <= base * 102 ))
         else ok=$(( own >= least )); fi
         (( ok )) && break
     done
-    (( ok && foreign >= 0 && foreign < 1000 )) \
-        && pass "$label: $s's screenshot has its own pixels ($own, baseline $base) and no foreign ones ($foreign)" \
-        || fail "$label: $s's screenshot has $own own pixels (baseline $base, minimum $least) and $foreign foreign"
+    if (( ok && foreign >= 0 && foreign < 1000 )); then
+        pass "$label: $s's screenshot has its own pixels ($own, baseline $base) and no foreign ones ($foreign)"
+    else
+        fail "$label: $s's screenshot has $own own pixels (baseline $base, minimum $least) and $foreign foreign"
+        return 1
+    fi
 }
 # Which of two PIDs has the front window: prints the front PID.
 front() { "$WORK/zorder" "$1" "$2" | awk '{ print $1 }'; }
@@ -126,8 +134,9 @@ waitmenu() { for _ in $(seq 1 30); do (( $("$WORK/zorder" --menus "$1") > 0 )) &
 # context menu sometimes runs its tracking loop without ever showing a window (also with one app
 # and no overlap; see docs/MULTI_AGENT_PLAN.md), so close it and try once more.
 openmenu() {
-    local s=$1 pid=$2 log="$WORK/$1.log" n
+    local s=$1 pid=$2 log="$WORK/$1.log" n attempt
     for attempt in 1 2; do
+        MENU_CLOSED_BEFORE=$(grep -c "context menu closed" "$log")
         n=$(grep -c "pad right click" "$log")
         "$s" click "$3" "$4" --right --pid "$pid" >/dev/null
         for _ in $(seq 1 40); do (( $(grep -c "pad right click" "$log") > n )) && break; sleep 0.1; done
@@ -136,6 +145,48 @@ openmenu() {
         echo "  note: $s's context menu didn't appear (attempt $attempt)"
         "$s" key esc --pid "$pid" >/dev/null; sleep 0.3
     done
+    return 1
+}
+
+# A click elsewhere can dismiss AppKit's tracking menu during capture. Retry only when
+# this opening has a new close event and its menu window is gone.
+menuclosed() {
+    local closed menus
+    closed=$(grep -c "context menu closed" "$1")
+    (( closed > MENU_CLOSED_BEFORE )) || return 1
+    menus=$("$WORK/zorder" --menus "$2") || return 1
+    [[ $menus == 0 ]]
+}
+
+checkmenu() {
+    local owner=$1 pid=$2 base=$3 other=$4 other_pid=$5 other_base=$6
+    local label=A log="$WORK/$owner.log" attempt result MENU_CLOSED_BEFORE
+    [[ $owner == b ]] && label=B
+    for attempt in 1 2; do
+        if ! openmenu "$owner" "$pid" "$MX" "$MY"; then
+            fail "$label's context menu didn't open"
+            return 1
+        fi
+        sleep 0.2
+        check "$label's context menu" "$label" "$pid" "$base" $((base + 5000)) "$log" "$pid"
+        result=$?
+        if [[ $result == 0 ]]; then
+            check "${other} beside $label's menu" "$other" "$other_pid" "$other_base" 0 "$log" "$pid"
+            result=$?
+        fi
+        if [[ $result == 2 ]]; then
+            echo "  note: $label's context menu closed during capture (attempt $attempt)"
+            continue
+        fi
+        if ! menuclosed "$log" "$pid"; then
+            if "$owner" key esc --pid "$pid" >/dev/null; then
+                for _ in $(seq 1 40); do menuclosed "$log" "$pid" && break; sleep 0.1; done
+            fi
+            menuclosed "$log" "$pid" && pass "esc closed $label's menu" || fail "$label's menu stayed open"
+        fi
+        return "$result"
+    done
+    fail "$label's context menu closed during both capture attempts"
     return 1
 }
 
@@ -213,12 +264,8 @@ b menu "Actions > Move To Spot 2" --pid "$PB" >/dev/null; sleep 0.2
 FB=$(frame B --pid "$PB")
 inside "$MX" "$MY" "$FB" && inside $((MX + 200)) $((MY + 90)) "$FB" && [[ $(front "$PA" "$PB") == "$PB" ]] \
     && pass "B [$FB] covers A's menu point and the menu's area" || fail "B [$FB] doesn't cover A's menu area"
-openmenu a "$PA" "$MX" "$MY" && pass "right click opened A's context menu" || fail "A's context menu"
+checkmenu a "$PA" "$BASE_A" B "$PB" "$BASE_B"
 ! grep -q "right click" "$WORK/b.log" && pass "B got no right click" || fail "B received the right click"
-sleep 0.2
-check "A's context menu" A "$PA" "$BASE_A" $((BASE_A + 5000)); check "B beside A's menu" B "$PB" "$BASE_B"
-a key esc --pid "$PA" >/dev/null
-waitlog "$WORK/a.log" "context menu closed" && pass "esc closed A's menu" || fail "A's menu stayed open"
 sleep 0.3
 # While A's context menu is open, A holds the keyboard focus; the daemon's input guard keeps the
 # user's typing out of it (tests/focus.sh), so A's text can't change.
@@ -258,11 +305,7 @@ a menu "Actions > Move To Spot 2" --pid "$PA" >/dev/null; sleep 0.2
 FA2=$(frame A --pid "$PA")
 inside "$MX" "$MY" "$FA2" && inside $((MX + 200)) $((MY + 90)) "$FA2" && [[ $(front "$PA" "$PB") == "$PA" ]] \
     && pass "A [$FA2] covers B's menu point and the menu's area" || fail "A [$FA2] doesn't cover B's menu area"
-openmenu b "$PB" "$MX" "$MY" && pass "right click opened B's context menu" || fail "B's context menu"
-sleep 0.2
-check "B's context menu" B "$PB" "$BASE_B" $((BASE_B + 5000)); check "A beside B's menu" A "$PA" "$BASE_A"
-b key esc --pid "$PB" >/dev/null
-waitlog "$WORK/b.log" "context menu closed" && pass "esc closed B's menu" || fail "B's menu stayed open"
+checkmenu b "$PB" "$BASE_B" A "$PA" "$BASE_A"
 
 echo "== partial overlap: B moves down and right, over part of A's pad"
 a menu "Actions > Move To Spot 1" --pid "$PA" >/dev/null

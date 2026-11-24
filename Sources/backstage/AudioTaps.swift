@@ -17,6 +17,11 @@ struct AudioRegistryEntry: Equatable {
         pid = app.pid; birth = app.processStart ?? 0; name = app.name; session = app.session
         metered = app.audioMode.metered
     }
+
+    static func == (lhs: AudioRegistryEntry, rhs: AudioRegistryEntry) -> Bool {
+        lhs.pid == rhs.pid && lhs.birth == rhs.birth && lhs.name == rhs.name
+            && Session.sameID(lhs.session, rhs.session) && lhs.metered == rhs.metered
+    }
 }
 
 /// What the daemon needs from the tap manager (which exists only on macOS 14.2+).
@@ -47,11 +52,17 @@ private final class RingBox {
     var data: UnsafeMutablePointer<Float> { (base + 64).assumingMemoryBound(to: Float.self) }
 
     init?(url: URL, sampleRate: Double, channels: Int, gain: Double) {
+        guard sampleRate.isFinite, sampleRate >= 1, sampleRate <= 768_000,
+              channels > 0, channels <= 32 else { return nil }
         let capacity = Int(audioRingSeconds * sampleRate)
         size = 64 + capacity * channels * MemoryLayout<Float>.size
-        let fd = open(url.path, O_CREAT | O_RDWR | O_TRUNC | O_CLOEXEC, 0o600)
+        let temporary = url.appendingPathExtension(UUID().uuidString)
+        let fd = open(temporary.path, O_CREAT | O_RDWR | O_EXCL | O_CLOEXEC, 0o600)
         guard fd >= 0 else { return nil }
-        defer { close(fd) }
+        defer {
+            close(fd)
+            unlink(temporary.path)
+        }
         guard ftruncate(fd, off_t(size)) == 0,
               let p = mmap(nil, size, PROT_READ | PROT_WRITE, MAP_SHARED, fd, 0), p != MAP_FAILED else { return nil }
         base = p
@@ -64,6 +75,10 @@ private final class RingBox {
         h.pointee.channels = UInt32(channels)
         h.pointee.capacityFrames = UInt32(capacity)
         h.pointee.levelGain = gain
+        guard rename(temporary.path, url.path) == 0 else {
+            munmap(base, size)
+            return nil
+        }
     }
     deinit { munmap(base, size) }
 }
@@ -130,7 +145,7 @@ private struct TapSnapshot {
 
 /// The worker's running analysis of one app.
 private final class Analysis {
-    var meter: ObjectIdentifier?
+    weak var meter: MeterBox?
     var blocksRead: UInt64 = 0
     var history: [(start: Double, end: Double, peak: Double, sumSquares: Double, frames: Int)] = []
     var sounds: [AudioSound] = []
@@ -295,7 +310,7 @@ final class AudioTapManager: AudioTapControl, AudioLevelSource {
                 apps[key] = a
                 return a
             }()
-            if !app.everRegistered || app.name != e.name || app.session != e.session || app.metered != e.metered { app.version += 1 }
+            if !app.everRegistered || app.name != e.name || !Session.sameID(app.session, e.session) || app.metered != e.metered { app.version += 1 }
             app.everRegistered = true; app.name = e.name; app.session = e.session
             if app.metered != e.metered {
                 app.metered = e.metered
@@ -321,30 +336,59 @@ final class AudioTapManager: AudioTapControl, AudioLevelSource {
 
     // MARK: matching (tapQueue)
 
-    private func processListChanged() {
+    private func processListChanged(reconsiderUnmatched: Bool = false) {
         guard !stopped else { return }
         let now = audioClock()
         let list = HAL.processObjects()
         let present = Set(list)
-        for (object, _) in objectOwner where !present.contains(object) { objectOwner[object] = nil }
+        let departed = objectOwner.filter { !present.contains($0.key) }
+        for object in departed.keys { objectOwner[object] = nil }
         seen.formIntersection(present)
-        for object in list where objectOwner[object] == nil && !seen.contains(object) {
+        for object in list where objectOwner[object] == nil && (reconsiderUnmatched || !seen.contains(object)) {
             seen.insert(object)
             consider(object, sight: now)
         }
+        // Detach departed listeners after examining new clients. Listener removal and
+        // helper liveness checks can block while Core Audio is starting another process.
+        var changed: Set<AppKey> = []
+        for (object, key) in departed {
+            guard let app = apps[key] else { continue }
+            app.objects.removeAll { $0 == object }
+            changed.insert(key)
+            app.listeners.removeAll { id, address, block in
+                guard id == object else { return false }
+                var address = address
+                AudioObjectRemovePropertyListenerBlock(id, &address, tapQueue, block)
+                return true
+            }
+        }
+        for key in changed {
+            guard let app = apps[key] else { continue }
+            app.members.removeAll { $0 != key && processBirth($0.pid) != $0.birth }
+            app.version += 1
+        }
+        if !changed.isEmpty { publishCrashTable() }
     }
 
     /// Every half second: look again at audio clients that matched nothing (an app registered
     /// later, a helper whose parent became managed).
     private func rescan() {
-        let now = audioClock()
-        for object in HAL.processObjects() where objectOwner[object] == nil { consider(object, sight: now) }
+        processListChanged(reconsiderUnmatched: true)
     }
 
     private func consider(_ object: AudioObjectID, sight: Double) {
-        guard let pid = HAL.pid(of: object), pid != ownPid, let birth = processBirth(pid) else { return }
-        guard let app = match(pid) else { return }
-        add(object, pid: pid, birth: birth, to: app, sight: sight, matched: audioClock())
+        let lookupStarted = audioClock()
+        guard let pid = HAL.pid(of: object), pid != ownPid, let identity = processIdentity(pid) else { return }
+        guard let app = match(pid, identity: identity) else { return }
+        add(object, pid: pid, birth: identity.birth, to: app, sight: sight, lookupStarted: lookupStarted, matched: audioClock())
+    }
+
+    private func processIdentity(_ pid: pid_t) -> (birth: UInt64, parent: pid_t)? {
+        guard pid > 0 else { return nil }
+        var info = proc_bsdinfo()
+        let size = Int32(MemoryLayout.size(ofValue: info))
+        guard proc_pidinfo(pid, PROC_PIDTBSDINFO, 0, &info, size) == size, info.pbi_status != SZOMB else { return nil }
+        return (info.pbi_start_tvsec * 1_000_000 + info.pbi_start_tvusec, pid_t(info.pbi_ppid))
     }
 
     private func root(_ pid: pid_t) -> AppTap? {
@@ -355,12 +399,19 @@ final class AudioTapManager: AudioTapControl, AudioLevelSource {
     /// Which managed app an audio client belongs to: the app itself, a descendant, a process
     /// macOS holds the app responsible for (XPC services), or a process carrying a pending
     /// launch's BACKSTAGE_LAUNCH_ID (tap on sight, before the launch registers the app).
-    private func match(_ pid: pid_t) -> AppTap? {
-        if let a = root(pid) { return a }
-        var ancestor = parentPid(pid), depth = 0
-        while let p = ancestor, p > 1, depth < 32 {
-            if let a = root(p) { return a }
-            ancestor = parentPid(p); depth += 1
+    private func match(_ pid: pid_t, identity: (birth: UInt64, parent: pid_t)) -> AppTap? {
+        if let a = apps[AppKey(pid: pid, birth: identity.birth)] { return a }
+        var ancestor = identity.parent
+        for _ in 0..<32 {
+            guard ancestor > 1 else { break }
+            guard let found = processIdentity(ancestor) else {
+                // A zombie parent cannot own a tap but can still lead to a live ancestor.
+                guard let parent = parentPid(ancestor), parent != ancestor else { break }
+                ancestor = parent
+                continue
+            }
+            if let a = apps[AppKey(pid: ancestor, birth: found.birth)] { return a }
+            ancestor = found.parent
         }
         let responsible = responsiblePid(pid)
         if let r = responsible, r != pid, let a = root(r) { return a }
@@ -368,15 +419,16 @@ final class AudioTapManager: AudioTapControl, AudioLevelSource {
         // process macOS holds responsible for it (an XPC helper of an app that hasn't used
         // Core Audio itself yet).
         var carrier = pid
-        var token = processArguments(pid)?.env["BACKSTAGE_LAUNCH_ID"]
-        if token == nil, let r = responsible, r != pid, let t = processArguments(r)?.env["BACKSTAGE_LAUNCH_ID"] { carrier = r; token = t }
+        let launchKey = "BACKSTAGE_LAUNCH_ID"
+        var token = processEnvironmentValue(pid, key: launchKey)
+        if token == nil, let r = responsible, r != pid, let t = processEnvironmentValue(r, key: launchKey) { carrier = r; token = t }
         guard let token else { return nil }
         let record = Launching.file(token)
         if FileManager.default.fileExists(atPath: record.path) {
             // The topmost process carrying this launch's token is the app.
             var top = carrier
-            var p = parentPid(carrier)
-            while let q = p, q > 1, processArguments(q)?.env["BACKSTAGE_LAUNCH_ID"] == token { top = q; p = parentPid(q) }
+            var p = carrier == pid ? identity.parent : parentPid(carrier)
+            while let q = p, q > 1, processEnvironmentValue(q, key: launchKey) == token { top = q; p = parentPid(q) }
             guard let birth = processBirth(top) else { return nil }
             let key = AppKey(pid: top, birth: birth)
             if let a = apps[key] { return a }
@@ -430,10 +482,10 @@ final class AudioTapManager: AudioTapControl, AudioLevelSource {
         return .success(Made(tap: tap, aggregate: aggregate, desc: desc))
     }
 
-    private func add(_ object: AudioObjectID, pid: pid_t, birth: UInt64, to app: AppTap, sight: Double, matched: Double) {
+    private func add(_ object: AudioObjectID, pid: pid_t, birth: UInt64, to app: AppTap, sight: Double, lookupStarted: Double, matched: Double) {
         guard app.state != "failed" || app.tapID != 0 else { return }
         let wasPlaying = HAL.isRunningOutput(object)
-        var objects = app.objects.filter { objectOwner[$0] != nil || $0 == object }
+        var objects = app.objects.filter { objectOwner[$0] == app.key && $0 != object }
         objects.append(object)
         if app.tapID == 0 {
             if testMode == "tap-fail" {
@@ -485,8 +537,8 @@ final class AudioTapManager: AudioTapControl, AudioLevelSource {
         if app.sightToMuteMs.count > 16 { app.sightToMuteMs.removeFirst() }
         if app.state == "armed" { app.state = "muted" }
         app.version += 1
-        log(String(format: "audio: muted pid %d (%@, audio object %u) %.1f ms after sight (matching %.1f ms) at %.4f%@", pid, app.name, object, ms,
-                   (matched - sight) * 1000, audioClock(),
+        log(String(format: "audio: muted pid %d (%@, audio object %u) %.1f ms after sight (before lookup %.1f ms, matching %.1f ms) at %.4f%@", pid, app.name, object, ms,
+                   (lookupStarted - sight) * 1000, (matched - lookupStarted) * 1000, audioClock(),
                    pid == app.key.pid ? "" : " as a helper of pid \(app.key.pid)"))
         addRunningListener(app, object)
         publishCrashTable()
@@ -528,13 +580,12 @@ final class AudioTapManager: AudioTapControl, AudioLevelSource {
     private func formatChanged(_ app: AppTap) {
         guard let f = HAL.tapFormat(app.tapID), f.mSampleRate != app.sampleRate || Int(f.mChannelsPerFrame) != app.channels else { return }
         log("audio: tap format of pid \(app.key.pid) changed to \(f.mSampleRate) Hz, \(f.mChannelsPerFrame) ch; restarting IO")
-        let wasRunning = app.ioRunning
         stopIO(app)
-        app.sampleRate = f.mSampleRate; app.channels = Int(f.mChannelsPerFrame)
-        if let meter = app.meter { meter.pointer.pointee.ring = nil; meter.pointer.pointee.ringData = nil; meter.pointer.pointee.channels = UInt32(app.channels) }
-        app.ring = nil
+        dismantleIO(app)
+        app.sampleRate = f.mSampleRate
+        app.channels = Int(f.mChannelsPerFrame)
         app.version += 1
-        if wasRunning { evaluateIO(app) }
+        prepareIO(app)
     }
 
     /// Create the IOProc (no IO yet) when measuring is permitted. The first IOProc on a tap
@@ -544,22 +595,25 @@ final class AudioTapManager: AudioTapControl, AudioLevelSource {
         guard app.metered, capturePermitted, app.tapID != 0, app.ioProc == nil, !app.ioProcRequested else { return }
         guard let meter = app.meter ?? MeterBox(channels: UInt32(max(app.channels, 1))) else { return }
         app.meter = meter
-        meter.pointer.pointee.loudThreshold = Float(pow(10, audioFloorDb / 20) / app.gain)
+        bs_meter_set_loud_threshold(meter.pointer, Float(pow(10, audioFloorDb / 20) / app.gain))
         app.ioProcRequested = true
         let aggregate = app.aggID, key = app.key
-        ioSetupQueue.async { [weak self] in
+        ioSetupQueue.async { [self] in
+            guard tapQueue.sync(execute: { apps[key]?.meter === meter && apps[key]?.aggID == aggregate }) else { return }
             var proc: AudioDeviceIOProcID?
             let ioproc: AudioDeviceIOProc = { device, now, input, inputTime, output, outputTime, client in
                 bs_meter_ioproc(device, now, input, inputTime, output, outputTime, client)
             }
             let err = AudioDeviceCreateIOProcID(aggregate, ioproc, UnsafeMutableRawPointer(meter.pointer), &proc)
-            self?.tapQueue.async {
-                guard let self else { return }
-                guard let app = self.apps[key], app.aggID == aggregate else {
-                    if let proc, err == noErr { AudioDeviceDestroyIOProcID(aggregate, proc) }
+            let createdProc = proc
+            tapQueue.async { [self, proc = createdProc] in
+                guard let app = apps[key], app.aggID == aggregate, app.meter === meter else {
+                    if let proc { AudioDeviceDestroyIOProcID(aggregate, proc) }
                     return
                 }
+                app.ioProcRequested = false
                 guard err == noErr, let proc else {
+                    if let proc { AudioDeviceDestroyIOProcID(aggregate, proc) }
                     self.log("audio: couldn't create the IOProc for pid \(key.pid): \(fourCC(err)) (muted, but not measured)")
                     return
                 }
@@ -574,7 +628,7 @@ final class AudioTapManager: AudioTapControl, AudioLevelSource {
     /// the first buffer), with the 50 ms timer as a backup; stopped 1 s after output stops.
     private func evaluateIO(_ app: AppTap) {
         guard app.tapID != 0 else { return }
-        guard app.metered else { if app.ioRunning { stopIO(app) }; return }
+        guard app.metered, capturePermitted else { if app.ioRunning { stopIO(app) }; return }
         let running = app.objects.contains { objectOwner[$0] != nil && HAL.isRunningOutput($0) }
         if running {
             app.ioStopAt = nil
@@ -622,6 +676,15 @@ final class AudioTapManager: AudioTapControl, AudioLevelSource {
         log("audio: IO off for pid \(app.key.pid)")
     }
 
+    private func dismantleIO(_ app: AppTap) {
+        if let proc = app.ioProc { AudioDeviceDestroyIOProcID(app.aggID, proc) }
+        app.ioProc = nil
+        app.ioProcRequested = false
+        app.meter = nil
+        if let ring = app.ring { try? FileManager.default.removeItem(at: ring.url) }
+        app.ring = nil
+    }
+
     /// Levels are compensated for the output device: a stereo mixdown tap averages a device's
     /// odd and even channels, so a stereo sound on 2 of N channels reads 20·log10(2/N) low
     /// (measured: -14.0 dB on 10 channels). Gain N/2 restores it for stereo content (the usual
@@ -633,7 +696,9 @@ final class AudioTapManager: AudioTapControl, AudioLevelSource {
         let n = max(widest, 2)
         guard n != app.outputChannels else { return }
         app.outputChannels = n
-        app.meter?.pointer.pointee.loudThreshold = Float(pow(10, audioFloorDb / 20) / app.gain)
+        if let meter = app.meter {
+            bs_meter_set_loud_threshold(meter.pointer, Float(pow(10, audioFloorDb / 20) / app.gain))
+        }
         app.ring?.header.pointee.levelGain = app.gain
         app.version += 1
     }
@@ -665,13 +730,11 @@ final class AudioTapManager: AudioTapControl, AudioLevelSource {
             AudioObjectRemovePropertyListenerBlock(object, &a, tapQueue, block)
         }
         app.listeners = []
-        if let proc = app.ioProc { AudioDeviceDestroyIOProcID(app.aggID, proc); app.ioProc = nil }
+        dismantleIO(app)
         if app.aggID != 0 { AudioHardwareDestroyAggregateDevice(app.aggID); app.aggID = 0 }
         if app.tapID != 0 { AudioHardwareDestroyProcessTap(app.tapID); app.tapID = 0 }
-        for o in app.objects { objectOwner[o] = nil }
+        for o in app.objects where objectOwner[o] == app.key { objectOwner[o] = nil }
         apps[app.key] = nil
-        if let ring = app.ring { try? FileManager.default.removeItem(at: ring.url) }
-        app.ring = nil
         let status = AudioFiles.status(app.key.pid, app.key.birth)
         if keepFile { failedFiles.append((status, audioClock() + 600)) } else { try? FileManager.default.removeItem(at: status) }
         if !app.objects.isEmpty { log("audio: removed the tap of pid \(app.key.pid) (\(why))") }
@@ -719,8 +782,9 @@ final class AudioTapManager: AudioTapControl, AudioLevelSource {
             app.ioProc = nil; app.ioProcRequested = false; app.ioRunning = false; app.ioStopAt = nil
             app.tapID = 0; app.aggID = 0; app.desc = nil
             app.objects = []
-            if let meter = app.meter { meter.pointer.pointee.ring = nil; meter.pointer.pointee.ringData = nil }
-            app.ring = nil
+            dismantleIO(app)
+            app.sampleRate = 0
+            app.channels = 0
             if app.state == "muted" { app.state = "armed" }
             app.version += 1
         }
@@ -740,6 +804,7 @@ final class AudioTapManager: AudioTapControl, AudioLevelSource {
     private func refreshCapture(initial: Bool = false) {
         let preflight = tccPreflight("kTCCServiceAudioCapture")
         workerQueue.async { [self] in
+            guard tapQueue.sync(execute: { !stopped }) else { return }
             health.preflight = preflight
             var permitted: Bool
             if testMode == "no-capture" {
@@ -759,7 +824,9 @@ final class AudioTapManager: AudioTapControl, AudioLevelSource {
                 if changed || initial {
                     log("audio: measuring \(permitted ? "enabled" : "disabled") (System Audio Recording \(permitted ? "granted" : "not granted") to \(hostName))")
                 }
+                guard !stopped else { return }
                 if permitted { for app in apps.values { prepareIO(app) } }
+                else if changed { for app in apps.values { stopIO(app) } }
             }
         }
     }
@@ -771,9 +838,17 @@ final class AudioTapManager: AudioTapControl, AudioLevelSource {
 
     // MARK: self-test (ioSetupQueue)
 
+    private func publishSelfTest(_ result: AudioSelfTestResult) {
+        tapQueue.sync {
+            guard !stopped else { return }
+            try? writePrivateJSON(AudioFiles.selfTestResult(result.id), result)
+        }
+    }
+
     private func runSelfTest(_ id: String) {
+        guard tapQueue.sync(execute: { !stopped }) else { return }
         var result = AudioSelfTestResult(id: id, state: "running")
-        func write() { try? writePrivateJSON(AudioFiles.selfTestResult(id), result) }
+        func write() { publishSelfTest(result) }
         func finish(_ captured: Bool, _ error: String?) {
             result.state = "done"; result.captured = captured; result.error = error
             result.permission = captured ? "granted" : "not granted"
@@ -798,17 +873,24 @@ final class AudioTapManager: AudioTapControl, AudioLevelSource {
         let me = HAL.processObject(for: ownPid)
         guard case .success(let made) = makeTap(objects: [me], name: "backstage-selftest") else { finish(false, "couldn't create the self-test tap"); return }
         defer { AudioHardwareDestroyAggregateDevice(made.aggregate); AudioHardwareDestroyProcessTap(made.tap) }
-        let tapRate = HAL.tapFormat(made.tap)?.mSampleRate ?? 48000
+        let tapRate = HAL.tapFormat(made.tap)?.mSampleRate ?? 0
+        let rate = HAL.nominalRate(device)
+        guard tapRate.isFinite, tapRate > 37_000, rate.isFinite, rate > 37_000 else {
+            finish(false, "the current sample rates cannot represent the 18.5 kHz probe")
+            return
+        }
         let lock = NSLock()
         var detector = Goertzel(hz: 18500, rate: tapRate)
         var tapProc: AudioDeviceIOProcID?
-        var created = false
+        let promptQueue = DispatchQueue(label: "backstage.audio.prompt-watch")
+        var prompting = result
+        prompting.state = "prompting"
+        let promptStatus = prompting
         let promptWatch = DispatchWorkItem { [weak self] in
-            guard !created else { return }
-            result.state = "prompting"; write()
+            self?.publishSelfTest(promptStatus)
             self?.log("audio: self-test is waiting on a System Audio Recording prompt")
         }
-        DispatchQueue.global().asyncAfter(deadline: .now() + 1, execute: promptWatch)
+        promptQueue.asyncAfter(deadline: .now() + 1, execute: promptWatch)
         let setupStart = audioClock()
         let err = AudioDeviceCreateIOProcIDWithBlock(&tapProc, made.aggregate, nil) { _, input, _, _, _ in
             let abl = UnsafeMutableAudioBufferListPointer(UnsafeMutablePointer(mutating: input))
@@ -818,12 +900,10 @@ final class AudioTapManager: AudioTapControl, AudioLevelSource {
             for i in 0..<frames { detector.feed(d[i * ch]) }
             lock.unlock()
         }
-        created = true
-        promptWatch.cancel()
+        promptQueue.sync { promptWatch.cancel() }
         result.ioSetupMs = (audioClock() - setupStart) * 1000
         guard err == noErr, let tapProc else { finish(false, "IOProc on the tap failed: \(fourCC(err))"); return }
         defer { AudioDeviceDestroyIOProcID(made.aggregate, tapProc) }
-        let rate = HAL.nominalRate(device) > 0 ? HAL.nominalRate(device) : 48000
         let tone = ProbeTone(hz: 18500, dbfs: -60, seconds: 0.5, rate: rate)
         var rendered = 0
         var outProc: AudioDeviceIOProcID?
@@ -842,13 +922,15 @@ final class AudioTapManager: AudioTapControl, AudioLevelSource {
             rendered += frames
         }
         guard outErr == noErr, let outProc else { finish(false, "couldn't play the probe on \(HAL.name(device)): \(fourCC(outErr))"); return }
-        AudioDeviceStart(made.aggregate, tapProc)
-        AudioDeviceStart(device, outProc)
+        defer { AudioDeviceDestroyIOProcID(device, outProc) }
+        let tapStart = AudioDeviceStart(made.aggregate, tapProc)
+        guard tapStart == noErr else { finish(false, "couldn't start the self-test tap: \(fourCC(tapStart))"); return }
+        defer { AudioDeviceStop(made.aggregate, tapProc) }
+        let outStart = AudioDeviceStart(device, outProc)
+        guard outStart == noErr else { finish(false, "couldn't start the probe on \(HAL.name(device)): \(fourCC(outStart))"); return }
         usleep(700_000)
         AudioDeviceStop(device, outProc)
-        AudioDeviceDestroyIOProcID(device, outProc)
         usleep(50_000)
-        AudioDeviceStop(made.aggregate, tapProc)
         lock.lock()
         let measured = detector.best
         lock.unlock()
@@ -879,17 +961,25 @@ final class AudioTapManager: AudioTapControl, AudioLevelSource {
             drain(snap, an)
             if let c = an.current, now - c.end >= audioSoundGap { close(an) }
             let playing = an.current != nil
-            let recent = an.history.filter { $0.end >= now - 1 }
-            let peak = recent.map { $0.peak }.max()
-            let frames = recent.reduce(0) { $0 + $1.frames }
-            let rms = frames > 0 ? (recent.reduce(0) { $0 + $1.sumSquares } / Double(frames)).squareRoot() : nil
+            var recentPeak = 0.0, recentSquares = 0.0, recentFrames = 0
+            var livePeak = 0.0, liveSquares = 0.0, liveFrames = 0
+            for block in an.history where block.end >= now - 1 {
+                recentPeak = max(recentPeak, block.peak)
+                recentSquares += block.sumSquares
+                recentFrames += block.frames
+                if block.end >= now - 0.1 {
+                    livePeak = max(livePeak, block.peak)
+                    liveSquares += block.sumSquares
+                    liveFrames += block.frames
+                }
+            }
+            let peak = recentFrames > 0 ? recentPeak : nil
+            let rms = recentFrames > 0 ? (recentSquares / Double(recentFrames)).squareRoot() : nil
             // Only measured apps drive the menu bar meter.
             if snap.state != "failed" && snap.metered {
-                let live = an.history.filter { $0.end >= now - 0.1 }
-                let lp = live.map { $0.peak }.max() ?? 0
-                let lf = live.reduce(0) { $0 + $1.frames }
-                let lr = lf > 0 ? (live.reduce(0) { $0 + $1.sumSquares } / Double(lf)).squareRoot() : 0
-                levels.append(AudioLevelSample(pid: snap.key.pid, name: snap.name, playing: playing, peakDb: Float(dB(lp)), rmsDb: Float(dB(lr))))
+                let liveRMS = liveFrames > 0 ? (liveSquares / Double(liveFrames)).squareRoot() : 0
+                levels.append(AudioLevelSample(pid: snap.key.pid, name: snap.name, playing: playing,
+                                               peakDb: Float(dB(livePeak)), rmsDb: Float(dB(liveRMS))))
             }
             let active = snap.ioRunning || playing
             let changed = snap.version != an.lastVersion || playing != an.lastPlaying || snap.ioRunning != an.lastIO
@@ -910,7 +1000,11 @@ final class AudioTapManager: AudioTapControl, AudioLevelSource {
                                             launch: snap.launch, metered: snap.metered)
                 // A destroyed tap's file must not come back: write on the tap queue, only for apps
                 // still there.
-                tapQueue.sync { if apps[snap.key] != nil { try? writePrivateJSON(AudioFiles.status(snap.key.pid, snap.key.birth), status) } }
+                guard tapQueue.sync(execute: {
+                    guard apps[snap.key]?.version == snap.version else { return false }
+                    try? writePrivateJSON(AudioFiles.status(snap.key.pid, snap.key.birth), status)
+                    return true
+                }) else { continue }
                 an.lastPublished = now; an.lastVersion = snap.version; an.lastPlaying = playing; an.lastIO = snap.ioRunning; an.lastPeak = peak
             }
         }
@@ -923,14 +1017,14 @@ final class AudioTapManager: AudioTapControl, AudioLevelSource {
 
     private func drain(_ snap: TapSnapshot, _ an: Analysis) {
         guard let meter = snap.meter, snap.sampleRate > 0 else { return }
-        let id = ObjectIdentifier(meter)
-        if an.meter != id { an.meter = id; an.blocksRead = 0 }
+        if an.meter !== meter { an.meter = meter; an.blocksRead = 0 }
         let written = bs_meter_blocks_written(meter.pointer)
         if written - an.blocksRead > UInt64(BS_METER_BLOCKS) { an.blocksRead = written - UInt64(BS_METER_BLOCKS) }
         let floor = pow(10, audioFloorDb / 20)
         while an.blocksRead < written {
             let b = bs_meter_block(meter.pointer, an.blocksRead)
             an.blocksRead += 1
+            guard b.frames > 0 else { continue }
             let start = hostTicksToSeconds(b.hostTime), end = start + Double(b.frames) / snap.sampleRate
             let peak = Double(b.peak) * snap.gain
             let sumSquares = b.sumSquares * snap.gain * snap.gain

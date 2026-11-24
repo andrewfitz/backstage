@@ -51,9 +51,10 @@ Arguments: `<sessions> [workloads]`, where workloads is a comma list or `all`. O
 | `--duration S` | 30 | seconds for each steady workload (idle, input, capture, mixed) |
 | `--rounds R` | 3 | cold-launch burst rounds |
 | `--cycles C` | 10 | launch/stop cycles for the leak check |
-| `--capture-sessions K` | sessions/4, at least 1 | sessions that capture in the mixed run; the rest type |
+| `--capture-sessions K` | sessions/4, at least 1 | sessions that capture in the mixed run, from 0 to the session count. The rest type. |
 | `--scale S`, `--format png\|jpg` | 1, png | screenshot settings |
 | `--op-timeout S` | 60 | a screenshot with no reply after this long counts as **hung**, and its client is killed. It's set above backstage's own 20 s capture timeout, so queued captures behind a stuck one aren't miscounted. |
+| `--shareable-interval-ms M` | 250 | target interval between external ScreenCaptureKit probe attempts |
 | `--accessory` | off | fixtures run with `TESTAPP_ACCESSORY=1` (`.accessory` policy, no Dock icon). Recorded in the results. Only with `idle,input,launch,cycles`: in the smoke run, every `screenshot` of an `.accessory` fixture failed with "no visible windows on the agent display" (cause not investigated). |
 | `--dedicated` | off | confirms a separate account or Mac; required above 4 sessions, and drops the smoke label from the summary |
 | `--results DIR` | `load-results/` (gitignored) | where the timestamped results folder goes |
@@ -79,8 +80,9 @@ fixture instance with its own marker text and pad colour (red for even sessions,
 2. Take a 3-second baseline: the daemon and the anchor only.
 3. Run each workload. Steady workloads launch every session's app at once and wait for all of
    them. They then run for `--duration` with every session active, and that window is what's
-   measured. Then the even sessions `stop` while the odd ones keep working for a short tail.
-   The odd sessions then check their apps are the same processes before stopping.
+   measured. After the ownership probes finish, the even sessions `stop` while the odd ones
+   keep working during the scheduled tail. The odd sessions wait for the even sessions'
+   stop checks before verifying their own apps are the same processes and stopping.
 
 | Workload | Each session does |
 |---|---|
@@ -91,8 +93,10 @@ fixture instance with its own marker text and pad colour (red for even sessions,
 | `launch` | cold-launch burst: all N `launch` at once, type a marker and verify it, then all `stop` at once; `--rounds` times |
 | `cycles` | leak check: all N launch, then all stop, `--cycles` times, with a snapshot after each |
 
-Once a steady run is halfway through, every session also tries to `type`, `screenshot` and
-`quit` its neighbour's app by `--pid`, and each must be rejected.
+Starting halfway through a steady run, every session tries to `type`, `screenshot` and `quit`
+its neighbour's app by `--pid` when at least two sessions are available. Each command must
+report that the PID belongs to another session. Workers finish these checks before any
+session starts teardown.
 
 ## What it records
 
@@ -105,23 +109,29 @@ keeps worker logs, fixture logs and any failing screenshots.
   the fixture source, its activation policy, and the configuration and environment.
 - **Latency, as p50/p95/max/mean with n.** Each CLI command (`launch`, `set`, `type`, `read`,
   `press`, `click`, `screenshot`, `stop`) is timed as client wall-clock, process start
-  included, which is what an agent experiences. Only commands inside the measured window
-  count.
+  included, which is what an agent experiences. Steady latency and throughput use successful
+  workload commands that start within the measured window. A command can finish later.
+  Setup, ownership probes and teardown are reported separately from the steady operation
+  rates. Worker correctness checks also cover the tail.
 - **`SCShareableContent`:** `tests/probe.swift` makes the same call backstage makes before every
   app screenshot (`excludingDesktopWindows(true, onScreenWindowsOnly: true)`) every 250 ms,
   from outside backstage. It runs only with Screen Recording already granted, so it can't
-  trigger a permission prompt. Each call holds `BACKSTAGE_HOME/capture.lock`, the lock
-  backstage's own captures take (see the finding below), so the probe can't collide with them.
-  A call that gets no reply in 20 s is reported, and the probe exits.
+  trigger a permission prompt. Each call takes `BACKSTAGE_HOME/capture.lock` first, then
+  `/tmp/backstage-<uid>-capture.lock`. Backstage uses the same order, so the probe
+  serializes with captures from this home and other homes under the same macOS account.
+  A call that gets no reply in 20 s is reported, and the probe exits. The latency window
+  uses the time the ScreenCaptureKit call starts after acquiring the lock.
 - **Lock wait:** a probe `flock`s three locks every 100 ms and times how long it waited: the app
   registry lock (`lock`, exclusive), `lifecycle.lock` (shared, as launches take it) and
   `capture.lock` (exclusive, as screenshots take it). Each session drives
   its own app, so per-app input locks don't contend across sessions. `tests/multi.sh` covers
   two clients on one app.
-- **Throughput:** operations per second, total and per command, plus launches per second for
-  the bursts.
+- **Throughput:** operations per second, total and per command. Launches per second for the
+  round-based workloads includes the full round time, including setup, stops and snapshots.
 - **Resources, sampled every second:** CPU % (from deltas in cumulative CPU time) and RSS for
-  the daemon, WindowServer, the Dock and the fixtures. Also memory pressure
+  the daemon, WindowServer, the Dock and the fixtures. CPU uses sample pairs that both fall
+  inside the measurement window. RSS per fixture is the peak of the per-sample averages.
+  Also memory pressure
   (`kern.memorystatus_vm_pressure_level`: 1 normal, 2 warn, 4 critical), free memory
   percentage (`memory_pressure -Q`), and swap used at the start and end of each workload.
 - **Leaks:** after each launch round and leak cycle, live fixture processes, registered apps,
@@ -145,9 +155,11 @@ The release-gate items (zero observed failures at every supported level):
 - **Cross-session termination.** `quit --pid` on another session's app must be rejected. Odd
   sessions' apps must survive the even sessions' `stop`s, and the anchor app must survive
   every workload.
-- **Non-interference.** `tests/watch.swift` runs throughout. Any fixture window on a user
-  screen, a fixture becoming frontmost, or the cursor leaving the user's displays fails the
-  run.
+- **Non-interference.** `tests/watch.swift` takes its first sample before the run starts and
+  watches through teardown. The run fails if a fixture window is observed on a user display
+  for more than 16 ms, a fixture becomes frontmost, the cursor or Dock leaves the user
+  displays, or the input tap sees input sent to the wrong app. Losing event-tap coverage
+  also fails the run.
 
 Also failures: command errors and hung commands (counted per command as `hung:<op>`), apps
 left running or registered after a workload, and daemon file descriptors growing by one or
@@ -197,7 +209,9 @@ needed.
 
 ## Caveats
 
-- The watchdog samples in a tight loop and keeps one core busy. The probes add one
+- The watchdog samples in a tight loop and keeps one core busy. Brief events can fall
+  between samples. The two-colour pixel check may miss a foreign pad if it completely
+  replaces the expected pad and both sessions use the same colour. The probes add one
   `SCShareableContent` call every 250 ms and a few `flock`s every 100 ms.
 - CPU of the short-lived CLI client processes isn't captured. Only their count is.
 - Lock waits are measured from outside, not per command. Splitting a command's latency into

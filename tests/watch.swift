@@ -12,12 +12,16 @@
 //    untagged event a test posts to the test app, or any key the user types while a test app holds
 //    the keyboard focus, shows up. It also polls which process holds the keyboard focus (an open
 //    menu takes it, even in a background app) and reports how long the test app held it.
-// usage: watch <bundle-id> <seconds> [stop-file]
+// usage: watch <bundle-id> <seconds> [stop-file [ready-file]]
 import Cocoa
 import os
 
-let bundleID = CommandLine.arguments[1]
-let secs = Double(CommandLine.arguments[2])!
+let args = CommandLine.arguments
+guard (3...5).contains(args.count), let secs = Double(args[2]), secs.isFinite, secs > 0 else {
+    print("usage: watch <bundle-id> <seconds> [stop-file [ready-file]]")
+    exit(2)
+}
+let bundleID = args[1]
 func displays() -> [CGDirectDisplayID] {
     var n: UInt32 = 0; var ids = [CGDirectDisplayID](repeating: 0, count: 32); CGGetActiveDisplayList(32, &ids, &n)
     return Array(ids[0..<Int(n)])
@@ -37,33 +41,36 @@ var testPids: Set<pid_t> = []
 var userFront: pid_t = 0
 var tapViolations: [String: Int] = [:]
 var tapNotes: [String: Int] = [:]
-func withTapLock<T>(_ body: () -> T) -> T { os_unfair_lock_lock(&tapLock); defer { os_unfair_lock_unlock(&tapLock) }; return body() }
+@Sendable func withTapLock<T>(_ body: () -> T) -> T { os_unfair_lock_lock(&tapLock); defer { os_unfair_lock_unlock(&tapLock) }; return body() }
 func refreshPids() {
     let pids = Set(NSRunningApplication.runningApplications(withBundleIdentifier: bundleID).map(\.processIdentifier))
     let front = NSWorkspace.shared.runningApplications.first(where: { $0.isActive })?.processIdentifier ?? 0
     withTapLock { testPids = pids; if !pids.contains(front) { userFront = front } }
 }
 refreshPids()
-let tapCallback: CGEventTapCallBack = { _, type, e, _ in
-    if type == .tapDisabledByTimeout || type == .tapDisabledByUserInput {
-        withTapLock { tapNotes["watch's event tap was disabled by macOS (\(type.rawValue)) and re-enabled", default: 0] += 1 }
-        if let tap = watchTap { CGEvent.tapEnable(tap: tap, enable: true) }
+var watchTap: CFMachPort?
+
+enum WatchCallbacks {
+    static func observeTapEvent(_ type: CGEventType, _ e: CGEvent) -> Unmanaged<CGEvent> {
+        if type == .tapDisabledByTimeout || type == .tapDisabledByUserInput {
+            withTapLock { tapViolations["watch's event tap was disabled by macOS (\(type.rawValue)); input observations were interrupted", default: 0] += 1 }
+            if let tap = watchTap { CGEvent.tapEnable(tap: tap, enable: true) }
+            return Unmanaged.passUnretained(e)
+        }
+        let target = pid_t(truncatingIfNeeded: e.getIntegerValueField(.eventTargetUnixProcessID))
+        let source = e.getIntegerValueField(.eventSourceUnixProcessID), tag = e.getIntegerValueField(.eventSourceUserData)
+        withTapLock {
+            if testPids.contains(target) && tag != agentTag {
+                tapViolations["input backstage didn't send (event type \(type.rawValue) from pid \(source)) reached the test app", default: 0] += 1
+            } else if tag == agentTag && target == userFront && target != 0 {
+                tapViolations["backstage input (event type \(type.rawValue)) reached the user's frontmost app (pid \(target))", default: 0] += 1
+            } else if tag == redirectedTag {
+                tapNotes["user input the daemon's input guard handed back to the user's app", default: 0] += 1
+            }
+        }
         return Unmanaged.passUnretained(e)
     }
-    let target = pid_t(truncatingIfNeeded: e.getIntegerValueField(.eventTargetUnixProcessID))
-    let source = e.getIntegerValueField(.eventSourceUnixProcessID), tag = e.getIntegerValueField(.eventSourceUserData)
-    withTapLock {
-        if testPids.contains(target) && tag != agentTag {
-            tapViolations["input backstage didn't send (event type \(type.rawValue) from pid \(source)) reached the test app", default: 0] += 1
-        } else if tag == agentTag && target == userFront && target != 0 {
-            tapViolations["backstage input (event type \(type.rawValue)) reached the user's frontmost app (pid \(target))", default: 0] += 1
-        } else if tag == redirectedTag {
-            tapNotes["user input the daemon's input guard handed back to the user's app", default: 0] += 1
-        }
-    }
-    return Unmanaged.passUnretained(e)
 }
-var watchTap: CFMachPort?
 let tapTypes: [CGEventType] = [.keyDown, .keyUp, .flagsChanged, .leftMouseDown, .leftMouseUp, .leftMouseDragged, .rightMouseDown, .rightMouseUp,
                                .rightMouseDragged, .otherMouseDown, .otherMouseUp, .otherMouseDragged, .scrollWheel]
 do {
@@ -72,7 +79,8 @@ do {
         // Listen-only, appended last: it sees what is left after the daemon's input guard.
         watchTap = CGEvent.tapCreate(tap: .cgAnnotatedSessionEventTap, place: .tailAppendEventTap, options: .listenOnly,
                                      eventsOfInterest: tapTypes.reduce(CGEventMask(0)) { $0 | (CGEventMask(1) << $1.rawValue) },
-                                     callback: tapCallback, userInfo: nil)
+                                     callback: { _, type, event, _ in WatchCallbacks.observeTapEvent(type, event) },
+                                     userInfo: nil)
         if let tap = watchTap { CFRunLoopAddSource(CFRunLoopGetCurrent(), CFMachPortCreateRunLoopSource(nil, tap, 0), .commonModes) }
         ready.signal()
         if watchTap != nil { CFRunLoopRun() }
@@ -109,12 +117,13 @@ struct Exposure {
 }
 var active: [CGWindowID: Exposure] = [:]
 var completed: [Exposure] = []
-let t0 = Date()
+let t0 = ProcessInfo.processInfo.systemUptime
 var samples = 0
-let end = Date().addingTimeInterval(secs)
+let end = t0 + secs
 let frontAtStart = NSWorkspace.shared.frontmostApplication?.bundleIdentifier ?? "?"
-let stopFile = CommandLine.arguments.count > 3 ? CommandLine.arguments[3] : nil
-while Date() < end && !(stopFile.map { FileManager.default.fileExists(atPath: $0) } ?? false) {
+let stopFile = args.count > 3 ? args[3] : nil
+let readyFile = args.count > 4 ? args[4] : nil
+while ProcessInfo.processInfo.systemUptime < end && !(stopFile.map { FileManager.default.fileExists(atPath: $0) } ?? false) {
     samples += 1
     let screens = userDisplays()
     guard !screens.isEmpty,
@@ -168,9 +177,14 @@ while Date() < end && !(stopFile.map { FileManager.default.fileExists(atPath: $0
         focusEpisodes.append(now - since); focusSince = nil
     }
     if samples % 20 == 0 { refreshPids(); RunLoop.current.run(until: Date().addingTimeInterval(0.001)) }
+    if samples == 1, let readyFile,
+       !FileManager.default.createFile(atPath: readyFile, contents: nil) {
+        print("watch: could not create ready file")
+        exit(1)
+    }
 }
 let frontAtEnd = NSWorkspace.shared.frontmostApplication?.bundleIdentifier ?? "?"
-print("watch: \(samples) samples (\(String(format: "%.1f", Date().timeIntervalSince(t0) * 1000 / Double(samples)))ms each), front start=\(frontAtStart) end=\(frontAtEnd)")
+print("watch: \(samples) samples (\(String(format: "%.1f", (ProcessInfo.processInfo.systemUptime - t0) * 1000 / Double(max(1, samples))))ms each), front start=\(frontAtStart) end=\(frontAtEnd)")
 // A window an app opens *later* can be on screen for a moment before the AX observer moves it.
 // Tolerate under one 60Hz frame (16ms) per window; anything longer is a failure.
 if let since = focusSince { focusEpisodes.append(ProcessInfo.processInfo.systemUptime - since) }

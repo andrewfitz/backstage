@@ -99,9 +99,11 @@ func inaudibleEligibility(_ executable: URL, library: URL) -> InaudibleEligibili
     func no(_ why: String) -> InaudibleEligibility { InaudibleEligibility(executable: exe, eligible: false, detail: why) }
     let path = exe.path
     guard let macho = MachOSummary(exe) else {
-        if let head = try? FileHandle(forReadingFrom: exe), let bytes = try? head.read(upToCount: 2), bytes == Data("#!".utf8) {
-            try? head.close()
-            return no("\(exe.lastPathComponent) is a script: its interpreter starts from a system binary, which drops DYLD_INSERT_LIBRARIES")
+        if let head = try? FileHandle(forReadingFrom: exe) {
+            defer { try? head.close() }
+            if let bytes = try? head.read(upToCount: 2), bytes == Data("#!".utf8) {
+                return no("\(exe.lastPathComponent) is a script: backstage cannot verify that its interpreter accepts DYLD_INSERT_LIBRARIES")
+            }
         }
         return no("\(exe.lastPathComponent) isn't a Mach-O executable backstage can inspect")
     }
@@ -181,8 +183,21 @@ struct MachOSummary {
             default: architectures.append("cpu \(cpu)")
             }
             let size = Int(u32(header, 20, big: false))
-            if size > 0, size < 4 << 20, let commands = read(offset + 32, size),
-               commands.range(of: Data("__RESTRICT\0".utf8)) != nil { restrictSegment = true }
+            guard size > 0, size < 4 << 20, offset <= UInt64.max - 32,
+                  let commands = read(offset + 32, size) else { continue }
+            var cursor = 0
+            for _ in 0..<u32(header, 16, big: false) {
+                guard cursor <= size - 8 else { break }
+                let command = u32(commands, cursor, big: false)
+                let length = Int(u32(commands, cursor + 4, big: false))
+                guard length >= 8, length <= size - cursor else { break }
+                if command == 0x19, length >= 72,
+                   commands[(cursor + 8)..<(cursor + 19)] == Data("__RESTRICT\0".utf8) {
+                    restrictSegment = true
+                    break
+                }
+                cursor += length
+            }
         }
         if architectures.isEmpty { return nil }
     }
@@ -269,8 +284,8 @@ func processMaps(_ pid: pid_t, _ file: URL) -> Bool {
         guard proc_pidinfo(pid, PROC_PIDREGIONPATHINFO, address, &info, size) == size else { return false }
         if info.prp_vip.vip_vi.vi_stat.vst_ino == expected.st_ino,
            info.prp_vip.vip_vi.vi_stat.vst_dev == UInt32(bitPattern: expected.st_dev) { return true }
-        let next = info.prp_prinfo.pri_address + info.prp_prinfo.pri_size
-        guard next > address else { return false }
+        let (next, overflow) = info.prp_prinfo.pri_address.addingReportingOverflow(info.prp_prinfo.pri_size)
+        guard !overflow, next > address else { return false }
         address = next
     }
     return false

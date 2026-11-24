@@ -1,18 +1,24 @@
 import Foundation
 import AppKit
 import ScreenCaptureKit
+import ImageIO
+import UniformTypeIdentifiers
 
-/// Menu bar indicator owned by the daemon. Visible only while agents have apps running;
-/// the menu shows a live thumbnail of this daemon's agent display and basic stats.
+/// Menu bar indicator owned by the daemon. Visible only while agents have apps running.
+///
+/// The menu answers, in this order: what is going on back there (a sentence and a live picture
+/// of this daemon's agent display), who is doing it (apps grouped by agent session), and what
+/// can I do about it (bring an app to my screen, quit it, quit everything). Process IDs and
+/// bundle IDs stay in each app's submenu.
 final class StatusMenu: NSObject, NSMenuDelegate {
     private let item: NSStatusItem
     private let menu = NSMenu()
     private weak var daemon: Daemon?
-    private var thumbViews: [CGDirectDisplayID: NSImageView] = [:]
     private var refreshTimer: Timer?
     private var capturing = false
-    private var thumbLock: StateLock?
-    private var thumbUserLock: UserLock?
+    private var thumbnailGeneration = 0
+    /// The picture's width in points. A capture is never wider than twice this in pixels
+    /// (`runMenuThumbnail` refuses more).
     static let thumbWidth: CGFloat = 320
     /// The agent display has its own copy of the menu bar; leave it out of the thumbnail.
     static func menuBarHeight(_ id: CGDirectDisplayID) -> CGFloat {
@@ -20,11 +26,21 @@ final class StatusMenu: NSObject, NSMenuDelegate {
         return max(0, screen.frame.maxY - screen.visibleFrame.maxY)
     }
 
-    static let defaultToolTip = "Backstage: agents are using apps on a hidden display"
     private var meter: AudioMeter?
     /// TEST ONLY (BACKSTAGE_FAKE_AUDIO): a synthetic level source that wins over the real one.
     private var fakeAudio: AudioLevelSource?
-    private var appCount = 0
+
+    /// The sentence and the picture at the top. Kept between openings, so a reopened menu has
+    /// the last picture (faded) at once instead of a placeholder.
+    private var hero: MenuHeroView?
+    private var heroItem: NSMenuItem?
+    private var heroShape = ""
+    /// Each app's row, and what the rows were built from (to notice apps coming and going).
+    private var rows: [pid_t: NSMenuItem] = [:]
+    private var rowsKey: [String] = []
+    private var openedAt = 0.0
+    private var lastFrame = 0.0
+    private var captureFailureLogged = false
 
     init(daemon: Daemon) {
         self.daemon = daemon
@@ -34,11 +50,13 @@ final class StatusMenu: NSObject, NSMenuDelegate {
         fakeAudio = FakeAudioSource(daemon: daemon, spec: ProcessInfo.processInfo.environment["BACKSTAGE_FAKE_AUDIO"])
         if fakeAudio != nil { daemon.log("audio meter: using the test-only fake audio source (BACKSTAGE_FAKE_AUDIO)") }
         if let button = item.button {
-            // Drawn into a plain image, like every meter frame, so the item's width never changes.
-            let img = AudioMeter.symbolImage("rectangle.on.rectangle", description: "Backstage")
+            // A display behind a display, the one behind dashed: the hidden one. Drawn into a
+            // plain image, like every meter frame, so the icon's box never changes; the number of
+            // running apps sits beside it (the width changes only when the count gains a digit).
+            let img = AudioMeter.symbolImage("rectangle.on.rectangle.dashed", description: "Backstage")
+                ?? AudioMeter.symbolImage("rectangle.on.rectangle", description: "Backstage")
             button.image = img
             button.imagePosition = .imageLeading
-            button.toolTip = Self.defaultToolTip
             if let img {
                 // Read the source on every poll: the tap manager may set it after we're created.
                 meter = AudioMeter(button: button, icon: img, source: { [weak self] in self?.fakeAudio ?? self?.daemon?.audioLevels },
@@ -46,34 +64,162 @@ final class StatusMenu: NSObject, NSMenuDelegate {
                 meter?.onChange = { [weak self] in self?.updateLabel() }
             }
         }
+        updateLabel()
         menu.delegate = self
         menu.autoenablesItems = false
+        menu.minimumWidth = MenuHeroView.width(previewWidth: Self.thumbWidth)
         item.menu = menu
     }
 
-    /// Called from the daemon tick (cheap): show/hide and update the count in the menu bar.
+    /// Called from the daemon tick (cheap): show/hide the item and keep its tooltip current.
     func update(apps: Int) {
         let visible = apps > 0
-        if item.isVisible != visible { item.isVisible = visible }
-        // Only on change: setting the title redraws the item and its copy on every other
-        // display's menu bar, about 1% CPU at this rate even when the text is the same.
-        let title = " \(apps)"
-        if visible, item.button?.title != title { item.button?.title = title }
-        meter?.setActive(visible)
-        if apps != appCount { appCount = apps; updateLabel() }
+        if item.isVisible != visible {
+            item.isVisible = visible
+            meter?.layoutChanged()
+        }
+        meter?.setActive(visible && (fakeAudio != nil || daemon?.registry.contains { $0.audioMode.metered } == true))
+        if visible {
+            // Set only on change: touching the button redraws every copy of the item.
+            let title = " \(apps)"
+            if let button = item.button, button.title != title { button.title = title; meter?.layoutChanged() }
+            updateLabel()
+        }
     }
 
-    /// VoiceOver label and tooltip; changed only when the app count or audio state changes.
+    /// VoiceOver label and tooltip. Set only when they change: touching the button redraws the
+    /// item and its copy on every other display's menu bar.
     private func updateLabel() {
         guard let button = item.button else { return }
-        var label = "Backstage, \(appCount) app\(appCount == 1 ? "" : "s")"
-        var tip = Self.defaultToolTip
+        let summary = Self.summary(daemon?.registry ?? [])
+        var label = "Backstage, " + summary
+        var tip = "Backstage: " + summary
         if let name = meter?.playingApp {
-            label += ", playing audio, muted"
-            tip = "Backstage: \(name) is playing audio (muted, you can't hear it)"
+            label += ". \(name) is playing sound, muted"
+            tip += "\n\(name) is playing sound (muted, you can't hear it)"
         }
         if button.accessibilityLabel() != label { button.setAccessibilityLabel(label) }
         if button.toolTip != tip { button.toolTip = tip }
+    }
+
+    // MARK: wording
+
+    /// How agents are named to people. An app's `agent` is the launching process's name: one of
+    /// these for a known agent, anything else (Terminal, python3…) otherwise.
+    static let agentNames = ["claude": "Claude", "codex": "Codex", "grok": "Grok", "cursor-agent": "Cursor", "gemini": "Gemini",
+                             "opencode": "OpenCode", "aider": "Aider", "amp": "Amp", "goose": "Goose"]
+
+    /// One sentence for the top of the menu and the tooltip: who is using how many apps.
+    static func summary(_ apps: [ManagedApp]) -> String {
+        guard !apps.isEmpty else { return "No apps running" }
+        let what = apps.count == 1 ? "1 app" : "\(apps.count) apps"
+        var agents: [String] = []
+        for app in apps.sorted(by: { $0.launchedAt < $1.launchedAt }) {
+            // Something other than a known agent launched one: don't credit the agents with all of them.
+            guard let name = app.agent.flatMap({ agentNames[$0] }) else {
+                return "\(what) \(apps.count == 1 ? "is" : "are") running on a hidden display"
+            }
+            if !agents.contains(name) { agents.append(name) }
+        }
+        switch agents.count {
+        case 1: return "\(agents[0]) is using \(what) on a hidden display"
+        case 2: return "\(agents[0]) and \(agents[1]) are using \(what) on a hidden display"
+        default: return "\(agents.count) agents are using \(what) on a hidden display"
+        }
+    }
+
+    /// The name a person gave a session with BACKSTAGE_SESSION; nil for the IDs backstage derives
+    /// itself (`claude:<uuid>`, `tty:<sid>-<start>`, `<process>:<pid>-<start>`), which mean
+    /// nothing to anyone.
+    static func givenSessionName(_ owner: String) -> String? {
+        if owner == Session.legacy { return nil }
+        guard let colon = owner.firstIndex(of: ":") else { return owner }
+        let kind = String(owner[..<colon])
+        if Session.knownAgents.contains(kind) || kind == "tty" || kind == "process" { return nil }
+        let parts = owner[owner.index(after: colon)...].split(separator: "-", omittingEmptySubsequences: false)
+        if parts.count == 2, parts.allSatisfy({ !$0.isEmpty && $0.allSatisfy { $0.isASCII && $0.isNumber } }) { return nil }
+        return owner
+    }
+
+    /// The folder the launching agent works in: how people tell their agent sessions apart.
+    static func workingFolder(of app: ManagedApp) -> String? {
+        // The agent's PID may have been reused since: it must be older than the app it launched.
+        guard let pid = app.agentPID, let birth = processBirth(pid), Double(birth) / 1e6 <= app.launchedAt else { return nil }
+        var info = proc_vnodepathinfo()
+        let size = Int32(MemoryLayout<proc_vnodepathinfo>.size)
+        guard proc_pidinfo(pid, PROC_PIDVNODEPATHINFO, 0, &info, size) == size else { return nil }
+        let path = withUnsafeBytes(of: &info.pvi_cdir.vip_path) { String(decoding: $0.prefix { $0 != 0 }, as: UTF8.self) }
+        guard !path.isEmpty, path != "/", path != NSHomeDirectory() else { return nil }
+        return URL(fileURLWithPath: path).lastPathComponent
+    }
+
+    /// Apps grouped by the session that launched them, oldest first, each under a heading such as
+    /// "Claude — myproject": the agent, then the session's given name or the agent's folder.
+    static func groups(_ apps: [ManagedApp], folder: (ManagedApp) -> String? = workingFolder) -> [(label: String, apps: [ManagedApp])] {
+        // Owners are compared as bytes: two session names that only normalize alike are two sessions.
+        var order: [Data] = []
+        var members: [Data: [ManagedApp]] = [:]
+        for app in apps.sorted(by: { ($0.launchedAt, $0.pid) < ($1.launchedAt, $1.pid) }) {
+            let owner = Data(app.owner.utf8)
+            if members[owner] == nil { order.append(owner) }
+            members[owner, default: []].append(app)
+        }
+        var used: [String: Int] = [:]
+        return order.map { key in
+            let apps = members[key] ?? []
+            let owner = apps.first?.owner ?? ""
+            let agent = apps.lazy.compactMap { $0.agent }.first
+            let who = agent.map { agentNames[$0] ?? $0 } ?? (owner.hasPrefix("tty:") ? "Terminal" : "Other")
+            let detail = givenSessionName(owner) ?? apps.lazy.compactMap(folder).first
+            var label = clipped(detail.map { "\(who) — \($0)" } ?? who, to: 40)
+            used[label, default: 0] += 1
+            if let n = used[label], n > 1 { label += " (\(n))" }
+            return (label, apps)
+        }
+    }
+
+    /// "Running for 12 min", plus only what's worth a second look: no windows, or sound. If
+    /// that's too long for the menu's width, how long it has run is the part that goes.
+    static func detail(launchedAt: Double, now: Double, windows: Int, playing: Bool) -> String {
+        let minutes = max(0, Int(now - launchedAt)) / 60, hours = minutes / 60
+        let age: String
+        switch minutes {
+        case ..<1: age = "Just launched"
+        case ..<60: age = "Running for \(minutes) min"
+        case ..<600: age = "Running for \(hours) hr" + (minutes % 60 == 0 ? "" : " \(minutes % 60) min")
+        case ..<2880: age = "Running for \(hours) hr"
+        default: age = "Running for \(hours / 24) days"
+        }
+        var parts = [age]
+        if windows == 0 { parts.append("No windows") }
+        if playing { parts.append("Playing sound (muted)") }
+        let font = NSFont.menuFont(ofSize: NSFont.smallSystemFontSize)
+        func fits(_ text: String) -> Bool { (text as NSString).size(withAttributes: [.font: font]).width <= detailWidth }
+        if parts.count > 1, !fits(parts.joined(separator: " · ")) { parts.removeFirst() }
+        return parts.joined(separator: " · ")
+    }
+
+    /// Room for a row's second line: the menu's width less the icon column and the submenu arrow.
+    static let detailWidth = MenuHeroView.width(previewWidth: thumbWidth) - 48 - 40
+
+    /// Cut in the middle until it fits `width` points in `font`, so no row widens the menu.
+    static func fitted(_ text: String, font: NSFont, width: CGFloat) -> String {
+        func w(_ t: String) -> CGFloat { (t as NSString).size(withAttributes: [.font: font]).width }
+        guard w(text) > width else { return text }
+        var limit = text.count
+        while limit > 4 {
+            limit -= 1
+            let t = clipped(text, to: limit)
+            if w(t) <= width { return t }
+        }
+        return clipped(text, to: 4)
+    }
+
+    /// Long names are cut in the middle, so the menu keeps its width and the picture its place.
+    static func clipped(_ text: String, to limit: Int) -> String {
+        guard text.count > limit else { return text }
+        let head = (limit - 1) / 2, tail = limit - 1 - head
+        return String(text.prefix(head)) + "…" + String(text.suffix(tail))
     }
 
     // MARK: menu
@@ -81,199 +227,289 @@ final class StatusMenu: NSObject, NSMenuDelegate {
     func menuNeedsUpdate(_ menu: NSMenu) { rebuild() }
 
     func menuWillOpen(_ menu: NSMenu) {
-        refreshThumbnails()
+        guard refreshTimer == nil else { return }
+        openedAt = ProcessInfo.processInfo.systemUptime
+        captureFailureLogged = false
+        hero?.preview?.reduceMotion = meter?.reduceMotion ?? NSWorkspace.shared.accessibilityDisplayShouldReduceMotion
         let t = Timer(timeInterval: 1.0, repeats: true) { [weak self] _ in
             self?.refreshThumbnails()
-            self?.refreshStatsLine()
-            self?.refreshAudioLines()
+            self?.refreshText()
         }
+        t.tolerance = 0.1
         RunLoop.main.add(t, forMode: .common)   // keeps firing while the menu is tracking
         refreshTimer = t
+        refreshThumbnails()
     }
 
     func menuDidClose(_ menu: NSMenu) {
         refreshTimer?.invalidate()
         refreshTimer = nil
+        thumbnailGeneration += 1
+        if let preview = hero?.preview {
+            preview.highlighted = []
+            preview.resetPointer()
+            preview.message = nil
+            preview.isStale = preview.hasImage
+        }
     }
 
-    private var statsItem: NSMenuItem?
+    deinit { refreshTimer?.invalidate() }
 
-    /// Each app's menu line and its text without the audio part, for the 1 s refresh.
-    private var appLines: [pid_t: (item: NSMenuItem, text: String)] = [:]
+    /// Pointing at an app's row picks its windows out in the picture.
+    func menu(_ menu: NSMenu, willHighlight item: NSMenuItem?) {
+        let pid = item.flatMap { item in rows.first { $0.value === item }?.key }
+        hero?.preview?.highlighted = pid.map { [$0] } ?? []
+    }
 
     private func rebuild() {
+        thumbnailGeneration += 1
         menu.removeAllItems()
-        thumbViews.removeAll()
-        appLines.removeAll()
         guard let d = daemon else { return }
-        let apps = d.registry.filter { $0.matchesProcess }
-
-        let title = NSMenuItem(title: "Backstage: agents working off-screen", action: nil, keyEquivalent: "")
-        title.isEnabled = false
-        menu.addItem(title)
-        let stats = NSMenuItem(title: statsText(), action: nil, keyEquivalent: "")
-        stats.isEnabled = false
-        menu.addItem(stats)
-        statsItem = stats
-        menu.addItem(.separator())
-
         // This daemon's display only: other homes' daemons show theirs in their own menus.
-        for id in [d.display.id] where CGDisplayIsActive(id) != 0 {
-            let b = CGDisplayBounds(id)
-            let h = (Self.thumbWidth * (b.height - Self.menuBarHeight(id)) / max(b.width, 1)).rounded()
-            let container = NSView(frame: NSRect(x: 0, y: 0, width: Self.thumbWidth + 28, height: h + 12))
-            let iv = NSImageView(frame: NSRect(x: 14, y: 6, width: Self.thumbWidth, height: h))
-            iv.imageScaling = .scaleProportionallyUpOrDown
-            iv.wantsLayer = true
-            iv.layer?.cornerRadius = 6
-            iv.layer?.masksToBounds = true
-            iv.layer?.backgroundColor = NSColor.black.withAlphaComponent(0.25).cgColor
-            container.addSubview(iv)
-            let mi = NSMenuItem()
-            mi.view = container
-            menu.addItem(mi)
-            thumbViews[id] = iv
+        let id = d.display.id
+        let b = CGDisplayBounds(id)
+        let area = CGSize(width: b.width, height: b.height - Self.menuBarHeight(id))
+        let shape = CGDisplayIsActive(id) != 0 && area.width > 0 && area.height > 0 ? "\(area.width)x\(area.height)" : "none"
+        if hero == nil || shape != heroShape {
+            let item = NSMenuItem()
+            let view = MenuHeroView(previewWidth: Self.thumbWidth, aspect: shape == "none" ? nil : area.width / area.height)
+            item.view = view
+            hero = view
+            heroItem = item
+            heroShape = shape
         }
-        menu.addItem(.separator())
+        if let heroItem { menu.addItem(heroItem) }
+        rebuildRows()
+    }
 
-        let header = NSMenuItem(title: apps.isEmpty ? "No apps running" : "Apps", action: nil, keyEquivalent: "")
-        header.isEnabled = false
-        menu.addItem(header)
-        for a in apps.sorted(by: { $0.launchedAt < $1.launchedAt }) {
-            let windows = axApp(a.pid).windows.count
-            let who = a.agent ?? "manual"
-            let mi = NSMenuItem(title: "\(a.name) · \(who) · \(windows) window\(windows == 1 ? "" : "s") · \(ago(a.launchedAt))", action: nil, keyEquivalent: "")
-            if let url = NSRunningApplication(processIdentifier: a.pid)?.bundleURL {
-                let icon = NSWorkspace.shared.icon(forFile: url.path)
-                icon.size = NSSize(width: 16, height: 16)
-                mi.image = icon
-            }
-            let sub = NSMenu()
-            let show = NSMenuItem(title: "Show on My Screen", action: #selector(showApp(_:)), keyEquivalent: "")
-            show.target = self; show.tag = Int(a.pid)
-            let quit = NSMenuItem(title: "Quit", action: #selector(quitApp(_:)), keyEquivalent: "")
-            quit.target = self; quit.tag = Int(a.pid)
-            let info = NSMenuItem(title: "pid \(a.pid) · \(a.bundleID ?? a.path)", action: nil, keyEquivalent: "")
-            info.isEnabled = false
-            sub.addItem(show); sub.addItem(quit); sub.addItem(.separator()); sub.addItem(info)
-            mi.submenu = sub
-            menu.addItem(mi)
-            appLines[a.pid] = (mi, mi.title)
+    /// Everything below the picture. Also run while the menu is open, when apps come or go.
+    private func rebuildRows() {
+        while menu.numberOfItems > 1 { menu.removeItem(at: menu.numberOfItems - 1) }
+        rows.removeAll()
+        let apps = daemon?.registry.filter { $0.matchesProcess } ?? []
+        rowsKey = Self.key(apps)
+        if apps.isEmpty {
+            let none = NSMenuItem(title: "No Apps Running", action: nil, keyEquivalent: "")
+            none.isEnabled = false
+            menu.addItem(none)
         }
-        refreshAudioLines()
+        for group in Self.groups(apps) {
+            menu.addItem(.sectionHeader(title: Self.fitted(group.label, font: .systemFont(ofSize: NSFont.smallSystemFontSize, weight: .semibold),
+                                                            width: MenuHeroView.width(previewWidth: Self.thumbWidth) - 32)))
+            for app in group.apps {
+                let row = self.row(for: app)
+                rows[app.pid] = row
+                menu.addItem(row)
+            }
+        }
         menu.addItem(.separator())
         let folder = NSMenuItem(title: "Open Screenshots & Logs Folder", action: #selector(openFolder), keyEquivalent: "")
         folder.target = self
         menu.addItem(folder)
+        // Last and on its own: it ends every agent's work in progress.
+        menu.addItem(.separator())
         let stop = NSMenuItem(title: "Quit All Agent Apps", action: #selector(stopAll), keyEquivalent: "")
         stop.target = self
         stop.isEnabled = !apps.isEmpty
+        stop.toolTip = "Quits every app agents are running here and removes the hidden display. Your own apps aren't touched."
         menu.addItem(stop)
+        menu.addItem(.separator())
+        let footer = NSMenuItem()
+        footer.view = MenuFooterView(width: MenuHeroView.width(previewWidth: Self.thumbWidth)) { [weak self] in
+            self?.menu.cancelTracking()
+            NSWorkspace.shared.open(backstageRepoURL)
+        }
+        menu.addItem(footer)
+        refreshText(apps: apps)
     }
 
-    private func statsText() -> String {
-        guard let d = daemon else { return "" }
-        let apps = d.registry.filter { $0.matchesProcess }
-        let sessions = Set(apps.map { $0.owner }).count
-        let ours = [d.display.bounds]
-        let pids = Set(apps.map { $0.pid })
-        let windows = onscreenWindows().filter {
-            guard let pid = $0[kCGWindowOwnerPID as String] as? pid_t, pids.contains(pid),
-                  ($0[kCGWindowLayer as String] as? Int) == 0 else { return false }
-            let b = cgBounds($0)
-            return ours.contains { $0.intersects(b) }
-        }.count
-        func plural(_ n: Int, _ w: String) -> String { "\(n) \(w)\(n == 1 ? "" : "s")" }
-        return "\(plural(sessions, "session")) · \(plural(apps.count, "app")) · \(plural(windows, "window")) · up \(ago(d.startedAt, suffix: false))"
+    private static func key(_ apps: [ManagedApp]) -> [String] {
+        apps.map { "\($0.pid)/\($0.processStart ?? 0)/\($0.owner)" }.sorted()
     }
 
-    private func refreshStatsLine() { statsItem?.title = statsText() }
+    private func row(for app: ManagedApp) -> NSMenuItem {
+        let name = Self.fitted(app.name, font: .menuFont(ofSize: 0), width: Self.detailWidth)
+        let row = NSMenuItem(title: name, action: nil, keyEquivalent: "")
+        // Two lines (name, then what it's doing) where the system has subtitles, with an icon to match.
+        var iconSize: CGFloat = 16
+        if #available(macOS 14.4, *) { iconSize = 26 }
+        let running = NSRunningApplication(processIdentifier: app.pid)
+        if let icon = (running?.icon ?? running?.bundleURL.map { NSWorkspace.shared.icon(forFile: $0.path) })?.copy() as? NSImage {
+            icon.size = NSSize(width: iconSize, height: iconSize)
+            row.image = icon
+        }
 
-    /// Appends a speaker symbol and "playing" or "silent" to each measured app's line (launched
-    /// with --audio; the others aren't measured, so their lines stay as they are). Without an
-    /// audio source (no taps), every line stays as it is.
-    private func refreshAudioLines() {
-        guard !appLines.isEmpty, let samples = meter?.samples() else { return }
-        let playing = Set(samples.filter { $0.playing }.map { $0.pid })
-        let measured = Set(samples.map { $0.pid })
-        let font = NSFont.menuFont(ofSize: 0)
-        for (pid, line) in appLines {
-            guard measured.contains(pid) else {
-                if line.item.attributedTitle != nil { line.item.attributedTitle = nil; line.item.title = line.text }
-                continue
+        let sub = NSMenu()
+        sub.autoenablesItems = false
+        func action(_ title: String, _ selector: Selector) -> NSMenuItem {
+            let item = NSMenuItem(title: title, action: selector, keyEquivalent: "")
+            item.target = self
+            item.representedObject = app
+            return item
+        }
+        let show = action("Show on My Screen", #selector(showApp(_:)))
+        show.toolTip = "Moves \(name) to your screen and hands it over to you: agents can no longer use it. "
+            + (app.audioMode == .inaudible ? "It stays silent until it's relaunched." : "You'll hear its sound again.")
+        sub.addItem(show)
+        sub.addItem(.separator())
+        sub.addItem(action("Quit \(name)", #selector(quitApp(_:))))
+        // Hold Option, as in the Apple menu.
+        let force = action("Force Quit \(name)", #selector(forceQuitApp(_:)))
+        force.isAlternate = true
+        force.keyEquivalentModifierMask = [.option]
+        sub.addItem(force)
+        sub.addItem(.separator())
+        // For the developer who needs them; nowhere else in the menu.
+        let info = NSMenuItem(title: Self.clipped(app.bundleID ?? URL(fileURLWithPath: app.path).lastPathComponent, to: 44) + " · PID \(app.pid)",
+                              action: nil, keyEquivalent: "")
+        info.isEnabled = false
+        sub.addItem(info)
+        row.submenu = sub
+        return row
+    }
+
+    /// The sentence at the top and each row's second line: at each rebuild, and once a second
+    /// while the menu is open. AppKit is touched only for what changed.
+    private func refreshText(apps current: [ManagedApp]? = nil) {
+        guard let d = daemon else { return }
+        let apps = current ?? d.registry.filter { $0.matchesProcess }
+        guard Self.key(apps) == rowsKey else { rebuildRows(); return }
+        hero?.status = Self.summary(apps)
+
+        var windows: [pid_t: Int] = [:]
+        for window in managedWindows(of: apps) { windows[window.pid, default: 0] += 1 }
+        // Only apps launched with --audio are measured; the others never show as playing.
+        var playing: Set<pid_t> = []
+        for sample in meter?.samples() ?? [] where sample.playing { playing.insert(sample.pid) }
+        let now = Date().timeIntervalSince1970
+        for app in apps {
+            guard let row = rows[app.pid] else { continue }
+            let detail = Self.detail(launchedAt: app.launchedAt, now: now, windows: windows[app.pid] ?? 0, playing: playing.contains(app.pid))
+            if #available(macOS 14.4, *) {
+                if row.subtitle != detail { row.subtitle = detail }
+            } else if row.toolTip != detail {
+                row.toolTip = detail
             }
-            let on = playing.contains(pid)
-            let text = NSMutableAttributedString(string: line.text + " · ", attributes: [.font: font])
-            let symbol = NSImage(systemSymbolName: on ? "speaker.wave.2.fill" : "speaker.fill",
-                                 accessibilityDescription: nil)?
-                .withSymbolConfiguration(NSImage.SymbolConfiguration(pointSize: font.pointSize, weight: .regular))
-            if let symbol {
-                let attachment = NSTextAttachment()
-                attachment.image = symbol
-                // Sit the symbol on the text's baseline like a glyph.
-                attachment.bounds = NSRect(x: 0, y: font.descender / 2, width: symbol.size.width, height: symbol.size.height)
-                text.append(NSAttributedString(attachment: attachment))
+        }
+
+        // A picture that has stopped updating says so, rather than passing for live.
+        if refreshTimer != nil, let preview = hero?.preview {
+            let since = max(lastFrame, openedAt)
+            if ProcessInfo.processInfo.systemUptime - since > 3.5 {
+                preview.isStale = false
+                preview.message = preview.hasImage ? "Preview paused" : "Preview unavailable"
             }
-            text.append(NSAttributedString(string: on ? " playing" : " silent", attributes: [.font: font]))
-            if line.item.attributedTitle != text { line.item.attributedTitle = text }
         }
     }
 
-    private func ago(_ t: Double, suffix: Bool = true) -> String {
-        let s = max(0, Int(Date().timeIntervalSince1970 - t))
-        let text = s < 60 ? "\(s)s" : s < 3600 ? "\(s / 60)m" : "\(s / 3600)h \((s % 3600) / 60)m"
-        return suffix ? text + " ago" : text
+    /// These apps' windows on this daemon's display, front to back, from one pass over the
+    /// window list: no call into the apps, so a hung app can't hold up the menu.
+    private func managedWindows(of apps: [ManagedApp]) -> [(pid: pid_t, bounds: CGRect)] {
+        guard let d = daemon, !apps.isEmpty else { return [] }
+        let display = d.display.bounds
+        let pids = Set(apps.map { $0.pid })
+        return onscreenWindows().compactMap { window in
+            guard let pid = window[kCGWindowOwnerPID as String] as? pid_t, pids.contains(pid),
+                  (window[kCGWindowLayer as String] as? Int) == 0 else { return nil }
+            let bounds = cgBounds(window)
+            guard display.intersects(bounds) else { return nil }
+            return (pid, bounds)
+        }
     }
 
-    /// Small, cheap captures of each agent display while the menu is open.
+    /// Where each managed window is in the picture, front to back.
+    private func regions() -> [DisplayPreviewView.Region] {
+        guard let d = daemon else { return [] }
+        let id = d.display.id
+        let display = CGDisplayBounds(id)
+        let bar = Self.menuBarHeight(id)
+        let area = CGRect(x: display.minX, y: display.minY + bar, width: display.width, height: display.height - bar)
+        guard area.width > 0, area.height > 0 else { return [] }
+        let apps = d.registry.filter { $0.matchesProcess }
+        let names = Dictionary(apps.map { ($0.pid, $0.name) }, uniquingKeysWith: { first, _ in first })
+        return managedWindows(of: apps).compactMap { window in
+            let r = window.bounds.intersection(area)
+            guard !r.isNull, r.width >= 8, r.height >= 8, let name = names[window.pid] else { return nil }
+            return .init(pid: window.pid, name: name,
+                         rect: CGRect(x: (r.minX - area.minX) / area.width, y: (r.minY - area.minY) / area.height,
+                                      width: r.width / area.width, height: r.height / area.height))
+        }
+    }
+
+    /// Capture in a child so a stuck ScreenCaptureKit call dies with its process. The child
+    /// retains both capture locks until exit, and we wait for exit before starting another.
+    /// The picture is captured at its own size in the pixels of the screen the menu is on, so
+    /// it's as sharp as that screen can show it.
     private func refreshThumbnails() {
-        guard !capturing, !thumbViews.isEmpty else { return }
-        // Concurrent ScreenCaptureKit calls hang (see `capture`), so share capture.lock with the
-        // CLI. Never wait for it here: skip this refresh if a capture is running. A thumbnail
-        // capture that doesn't return gives the lock back after 5 s, since the daemon can't exit
-        // to clear it.
-        guard let lock = try? StateLock("capture.lock", nonblocking: true) else { return }
-        guard let userLock = UserLock("capture.lock", nonblocking: true) else { lock.release(); return }
-        thumbLock = lock
-        thumbUserLock = userLock
-        DispatchQueue.main.asyncAfter(deadline: .now() + 5) { lock.release(); userLock.release() }
+        guard !capturing, let d = daemon, let preview = hero?.preview else { return }
+        let id = d.display.id
+        var executable = [CChar](repeating: 0, count: Int(MAXPATHLEN))
+        guard proc_pidpath(getpid(), &executable, UInt32(executable.count)) > 0 else { return }
+        let size = preview.bounds.size
+        let scale = min(2, preview.window?.backingScaleFactor ?? item.button?.window?.backingScaleFactor ?? 2)
+        let generation = thumbnailGeneration
+        let output = Pipe()
+        let process = Process()
+        process.executableURL = URL(fileURLWithPath: String(cString: executable))
+        process.arguments = ["__menu-thumbnail", String(id), String(Double(Self.menuBarHeight(id))),
+                             String(Int(size.width * scale)), String(Int(size.height * scale))]
+        process.standardOutput = output
+        process.standardError = FileHandle.nullDevice
+        do { try process.run() } catch { return }
         capturing = true
-        let targets = thumbViews.map { ($0.key, $0.value.frame.size, Self.menuBarHeight($0.key)) }
-        Task.detached { [weak self] in
-            var images: [CGDirectDisplayID: CGImage] = [:]
-            if let content = try? await SCShareableContent.excludingDesktopWindows(false, onScreenWindowsOnly: true) {
-                for (id, size, menuBar) in targets {
-                    guard let disp = content.displays.first(where: { $0.displayID == id }) else { continue }
-                    let cfg = SCStreamConfiguration()
-                    let db = CGDisplayBounds(id)
-                    cfg.sourceRect = CGRect(x: 0, y: menuBar, width: db.width, height: db.height - menuBar)
-                    cfg.width = Int(size.width * 2); cfg.height = Int(size.height * 2)
-                    cfg.showsCursor = false
-                    if let img = try? await SCScreenshotManager.captureImage(contentFilter: SCContentFilter(display: disp, excludingWindows: []), configuration: cfg) {
-                        images[id] = img
-                    }
-                }
+        DispatchQueue.global(qos: .utility).async { [weak self] in
+            let data = try? output.fileHandleForReading.readToEnd()
+            process.waitUntilExit()
+            let status = process.terminationStatus
+            let image: CGImage? = autoreleasepool {
+                guard status == 0, let data, !data.isEmpty,
+                      let source = CGImageSourceCreateWithData(data as CFData, nil) else { return nil }
+                return CGImageSourceCreateImageAtIndex(source, 0, [kCGImageSourceShouldCacheImmediately: true] as CFDictionary)
             }
-            DispatchQueue.main.async {
+            DispatchQueue.main.async { [weak self] in
                 guard let self else { return }
                 self.capturing = false
-                self.thumbLock?.release(); self.thumbLock = nil
-                self.thumbUserLock?.release(); self.thumbUserLock = nil
-                for (id, img) in images { self.thumbViews[id]?.image = NSImage(cgImage: img, size: .zero) }
+                guard self.refreshTimer != nil, generation == self.thumbnailGeneration else { return }
+                guard let image else {
+                    // Status 0 without a picture: another capture had the lock, so this one was skipped.
+                    if status != 0, !self.captureFailureLogged {
+                        self.captureFailureLogged = true
+                        self.daemon?.log("menu preview: capture failed (status \(status))")
+                    }
+                    return
+                }
+                guard let preview = self.hero?.preview else { return }
+                self.lastFrame = ProcessInfo.processInfo.systemUptime
+                preview.message = nil
+                preview.setImage(image)
+                preview.regions = self.regions()
             }
         }
     }
 
     // MARK: actions (user-initiated)
 
+    private func currentApp(_ sender: NSMenuItem) -> ManagedApp? {
+        guard let selected = sender.representedObject as? ManagedApp,
+              let record = daemon?.registry.first(where: { $0.pid == selected.pid }),
+              record.processStart == selected.processStart, record.launchedAt == selected.launchedAt,
+              record.matchesProcess else { return nil }
+        return record
+    }
+
     @objc private func showApp(_ sender: NSMenuItem) {
-        guard let rec = daemon?.registry.first(where: { $0.pid == pid_t(sender.tag) }) else { NSSound.beep(); return }
+        guard let rec = currentApp(sender) else { NSSound.beep(); return }
         do { try handOver(rec, wait: false) } catch { NSSound.beep(); daemon?.log("menu show failed (busy launch/stop?): \(error)") }
     }
 
     @objc private func quitApp(_ sender: NSMenuItem) {
-        guard let rec = daemon?.registry.first(where: { $0.pid == pid_t(sender.tag) }) else { return }
+        guard let rec = currentApp(sender) else { return }
         do { try rec.requestTermination(force: false) } catch { daemon?.log("menu quit failed: \(error)") }
+    }
+
+    @objc private func forceQuitApp(_ sender: NSMenuItem) {
+        guard let rec = currentApp(sender) else { return }
+        do { try rec.requestTermination(force: true) } catch { daemon?.log("menu force quit failed: \(error)") }
     }
 
     @objc private func openFolder() {
@@ -282,5 +518,45 @@ final class StatusMenu: NSObject, NSMenuDelegate {
 
     @objc private func stopAll() {
         daemon?.shutdown(reason: "stopped from the menu bar")
+    }
+}
+
+/// Internal child entry point. Exit under the locks even if the asynchronous capture times out.
+func runMenuThumbnail(_ args: Args) throws {
+    guard let id = args.pos(0).flatMap(CGDirectDisplayID.init),
+          let menuBar = args.pos(1).flatMap(Double.init), menuBar.isFinite, menuBar >= 0,
+          let width = args.pos(2).flatMap(Int.init), (1...Int(StatusMenu.thumbWidth * 2)).contains(width),
+          let height = args.pos(3).flatMap(Int.init), (1...4096).contains(height) else {
+        throw CLIError("invalid thumbnail dimensions")
+    }
+    guard let daemon = liveDaemon(), daemon.pid == getppid(), daemon.displayID == id, daemon.stopping != true else {
+        throw CLIError("thumbnail capture must target the parent daemon's live backstage display")
+    }
+    guard let lock = try? StateLock("capture.lock", nonblocking: true),
+          let userLock = UserLock("capture.lock", nonblocking: true) else { return }
+    withExtendedLifetime((lock, userLock)) {
+        guard let image = try? runAsync(timeout: captureAttemptTimeout, {
+            let content = try await SCShareableContent.excludingDesktopWindows(false, onScreenWindowsOnly: true)
+            guard let display = content.displays.first(where: { $0.displayID == id }) else {
+                throw CLIError("display unavailable")
+            }
+            let bounds = CGDisplayBounds(id)
+            guard bounds.width > 0, bounds.height > menuBar else { throw CLIError("display unavailable") }
+            let config = SCStreamConfiguration()
+            config.sourceRect = CGRect(x: 0, y: menuBar, width: bounds.width, height: bounds.height - menuBar)
+            config.width = width
+            config.height = height
+            config.showsCursor = false
+            return try await SCScreenshotManager.captureImage(
+                contentFilter: SCContentFilter(display: display, excludingWindows: []), configuration: config
+            )
+        }), let data = CFDataCreateMutable(nil, 0),
+                let destination = CGImageDestinationCreateWithData(data, UTType.png.identifier as CFString, 1, nil)
+        else { exit(1) }
+        CGImageDestinationAddImage(destination, image, nil)
+        guard CGImageDestinationFinalize(destination) else { exit(1) }
+        do { try FileHandle.standardOutput.write(contentsOf: data as Data) }
+        catch { exit(1) }
+        exit(0)
     }
 }

@@ -24,16 +24,16 @@
 //       48     8  levelGain       float64, linear gain the daemon applies to levels for display
 //                                 (multichannel compensation, see docs/AUDIO_PLAN.md); the
 //                                 samples themselves are stored as tapped, without it
-//       56     8  reserved        0
+//       56     8  writeSequence   uint64, odd while an append is in progress and even afterward
 //       64     …  samples         float32, interleaved, capacityFrames × channels
 //
 // The newest frame (framesWritten - 1) ends at endUptime; frame framesWritten - 1 - j started at
 // endUptime - (j + 1) / sampleRate. The timeline is continuous: when IO restarts after a pause
 // (no output running), the daemon first writes the pause as zeros (up to the capacity), so
 // "the last N seconds" is always the N seconds before endUptime. Anything after endUptime is
-// silence: nothing has played since. Readers: read framesWritten, copy the frames, read
-// framesWritten again; if it moved by more than capacityFrames minus the frames you copied,
-// retry. The daemon creates the file at the app's first sound and removes it with the tap.
+// silence: nothing has played since. Readers can use writeSequence to detect incomplete
+// appends and framesWritten to locate samples that have since been overwritten. The daemon
+// creates the file at the app's first sound and removes it with the tap.
 // ---------------------------------------------------------------------------------------------
 typedef struct {
     char magic[4];
@@ -45,7 +45,7 @@ typedef struct {
     uint64_t endHostTime;
     double endUptime;
     double levelGain;
-    uint64_t reserved;
+    uint64_t writeSequence;
 } BSRingHeader;
 
 #define BS_METER_BLOCKS 1024
@@ -61,18 +61,25 @@ typedef struct {
 } BSMeterBlock;
 
 typedef struct {
+    uint64_t sequence;
+    uint64_t words[4];
+} BSMeterSlot;
+
+typedef struct {
     BSRingHeader *ring;    // NULL until the first sound; set only while IO is stopped
     float *ringData;
     uint32_t channels;
     double secondsPerTick; // mach timebase
-    float loudThreshold;   // raw amplitude of the `playing` floor (floor / levelGain)
+    uint32_t loudThresholdBits; // raw amplitude of the `playing` floor (floor / levelGain)
     uint64_t blocksWritten;   // monotonic; release ordering
-    BSMeterBlock blocks[BS_METER_BLOCKS];
+    BSMeterSlot blocks[BS_METER_BLOCKS];
 } BSMeter;
 
 BSMeter *bs_meter_create(uint32_t channels, double secondsPerTick);
 void bs_meter_destroy(BSMeter *meter);
+void bs_meter_set_loud_threshold(BSMeter *meter, float threshold);
 uint64_t bs_meter_blocks_written(const BSMeter *meter);
+/// Returns a zero-frame block if this index has been overwritten or is being overwritten.
 BSMeterBlock bs_meter_block(const BSMeter *meter, uint64_t index);
 
 /// The tap aggregate's IOProc. `client` is a BSMeter*.
@@ -89,7 +96,8 @@ void bs_store_release_u64(uint64_t *p, uint64_t v);
 // ---------------------------------------------------------------------------------------------
 // Crash handler: on a fatal signal, SIGKILL every managed app (checked against its start time)
 // before the daemon dies, so their windows don't land on the user's screen and their audio
-// doesn't come out unmuted. Two independently written segments of a fixed table.
+// doesn't come out unmuted. Two independently written segments of a fixed table, each with
+// one serialized writer.
 // ---------------------------------------------------------------------------------------------
 #define BS_CRASH_SEGMENTS 2
 #define BS_CRASH_MAX 512

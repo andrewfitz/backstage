@@ -6,7 +6,7 @@ import QuartzCore
 /// replaced by five rounded bars in the icon's own box, so the item never changes width. The
 /// bars are the last five peak readings of the loudest playing app, newest on the right, on a
 /// -60...0 dBFS scale. A 12 fps timer runs only while the meter shows; otherwise a 20 Hz poll
-/// (only while the item is visible) watches for sound. 1 s after the sound stops the icon fades
+/// watches for sound while metered apps are running. 1 s after the sound stops the icon fades
 /// back. With Reduce Motion, a static `waveform` symbol shows instead and nothing animates.
 ///
 /// Cost: changing the button's image makes AppKit redraw it and re-snapshot it for the status
@@ -28,6 +28,7 @@ final class AudioMeter {
     private let icon: NSImage
     /// Holds the icon's place in the button (same size, so the same width) while bars show.
     private let blank: NSImage
+    private lazy var waveform = Self.waveformImage(box: icon.size)
     private let source: () -> AudioLevelSource?
     private let log: (String) -> Void
     /// Called when `playingApp` changes (for the accessibility label and tooltip).
@@ -38,7 +39,6 @@ final class AudioMeter {
     private enum Phase { case idle, showing, fading }
     private var phase = Phase.idle
     private var readings = [Float](repeating: -.infinity, count: AudioMeter.barCount)
-    private var lastFractions: [CGFloat]?
     private var silentSince: Double?
     private var fadeToken = 0
     private var nextCopyRefresh = 0.0
@@ -77,7 +77,8 @@ final class AudioMeter {
     }
 
     /// The item is shown (apps are running) or hidden. Hidden: no timers, icon restored.
-    func setActive(_ on: Bool) {
+    func setActive(_ visible: Bool) {
+        let on = visible && source() != nil
         guard on != active else { return }
         active = on
         if on { schedule(Self.pollInterval) } else { hide(); setTimer(nil) }
@@ -104,7 +105,7 @@ final class AudioMeter {
     private func step() {
         guard active else { return }
         let now = ProcessInfo.processInfo.systemUptime
-        let loudest = (samples() ?? []).filter { $0.playing }.max { $0.peakDb < $1.peakDb }
+        let loudest = samples()?.lazy.filter { $0.playing }.max { $0.peakDb < $1.peakDb }
         if let loudest {
             silentSince = nil
             if phase == .idle { log(String(format: "audio meter on: %@ at %.3f", loudest.name, Date().timeIntervalSince1970)) }
@@ -140,8 +141,9 @@ final class AudioMeter {
         phase = .showing
         button.layer?.removeAnimation(forKey: "meterFade")
         if reduceMotion {
+            readings = [Float](repeating: -.infinity, count: Self.barCount)
             removeBars()
-            button.image = Self.waveformImage(box: icon.size)
+            button.image = waveform
             return
         }
         let view = barsView ?? makeBars(in: button)
@@ -152,7 +154,6 @@ final class AudioMeter {
         view.layer?.opacity = 1
         CATransaction.commit()
         if button.image !== blank { button.image = blank }
-        lastFractions = nil
         updateBars()
     }
 
@@ -188,7 +189,6 @@ final class AudioMeter {
         phase = .idle
         silentSince = nil
         readings = [Float](repeating: -.infinity, count: Self.barCount)
-        lastFractions = nil
         removeBars()
         if let button, button.image !== icon { button.image = icon }
         if playingApp != nil { playingApp = nil; onChange?() }
@@ -230,6 +230,11 @@ final class AudioMeter {
         bars = []
     }
 
+    /// Align the overlay when the status item's title changes its layout.
+    func layoutChanged() {
+        if let button, let barsView { barsView.frame = iconRect(in: button) }
+    }
+
     /// Where the button draws its image.
     private func iconRect(in button: NSStatusBarButton) -> NSRect {
         let size = icon.size
@@ -252,9 +257,6 @@ final class AudioMeter {
 
     private func updateBars() {
         guard let view = barsView, bars.count == readings.count else { return }
-        let fractions = readings.map { CGFloat(Self.fraction($0)) }
-        if fractions == lastFractions { return }   // nothing moved (silence): no commit
-        lastFractions = fractions
         let scale = view.window?.backingScaleFactor ?? 2
         func px(_ v: CGFloat) -> CGFloat { (v * scale).rounded() / scale }
         let rect = view.bounds
@@ -264,15 +266,22 @@ final class AudioMeter {
         let total = barW * 5 + gap * 4
         let maxH = rect.height * 0.8
         var x = px(rect.midX - total / 2)
-        CATransaction.begin()
-        CATransaction.setDisableActions(true)
-        for (bar, f) in zip(bars, fractions) {
-            let h = px(barW + f * (maxH - barW))
-            bar.frame = CGRect(x: x, y: px(rect.midY - h / 2), width: barW, height: h)
-            bar.cornerRadius = barW / 2
+        var changed = false
+        for (bar, reading) in zip(bars, readings) {
+            let fraction = CGFloat(Self.fraction(reading))
+            let h = px(barW + fraction * (maxH - barW))
+            let frame = CGRect(x: x, y: px(rect.midY - h / 2), width: barW, height: h)
             x += barW + gap
+            guard frame != bar.frame else { continue }
+            if !changed {
+                CATransaction.begin()
+                CATransaction.setDisableActions(true)
+                changed = true
+            }
+            if frame.width != bar.frame.width { bar.cornerRadius = barW / 2 }
+            bar.frame = frame
         }
-        CATransaction.commit()
+        if changed { CATransaction.commit() }
     }
 
     // MARK: timers
@@ -300,6 +309,10 @@ final class AudioMeter {
         return max(0, min(1, (db - floorDb) / -floorDb))
     }
 
+    /// The size and weight of the system's own menu bar symbols, so the item sits among them
+    /// as one of them (a symbol's default is smaller and lighter).
+    static let symbolConfiguration = NSImage.SymbolConfiguration(pointSize: 15, weight: .medium)
+
     /// The static Reduce Motion symbol, fitted into the icon's box.
     static func waveformImage(box: NSSize) -> NSImage {
         symbolImage("waveform", box: box) ?? NSImage(size: box)
@@ -309,7 +322,8 @@ final class AudioMeter {
     /// status item uses only such images, idle icon included: the button lays out a symbol image
     /// differently from a drawn one (half a point wider), so mixing them would move the item.
     static func symbolImage(_ name: String, box: NSSize? = nil, description: String? = nil) -> NSImage? {
-        guard let symbol = NSImage(systemSymbolName: name, accessibilityDescription: nil) else { return nil }
+        guard let symbol = NSImage(systemSymbolName: name, accessibilityDescription: nil)?
+            .withSymbolConfiguration(symbolConfiguration) else { return nil }
         let box = box ?? symbol.size
         let img = NSImage(size: box, flipped: false) { rect in
             guard symbol.size.width > 0, symbol.size.height > 0 else { return true }

@@ -33,6 +33,7 @@ enum LaunchServices {
     private static let setItem = function("_LSSetApplicationInformationItem", SetItem.self)
     private static let copyInfo = function("_LSCopyApplicationInformation", CopyInfo.self)
     private static let typeKey = key("_kLSApplicationTypeKey")
+    private static let uiElementLaunchKey = key("_kLSOpenOptionUIElementLaunchKey")
 
     /// Values of the application type.
     static let foreground = "Foreground", uiElement = "UIElement"
@@ -44,10 +45,21 @@ enum LaunchServices {
         var log: URL
     }
 
+    /// An open request in flight. LaunchServices answers on its own queue; under heavy load
+    /// (or a WindowServer stall) the answer can come long after the process started, or never.
+    final class OpenRequest: @unchecked Sendable {
+        struct Answer { let ok: Bool; let error: String?; let pid: pid_t? }
+        private let lock = NSLock()
+        private var answered: Answer?
+        /// LaunchServices' answer, once it has given one.
+        var answer: Answer? { lock.lock(); defer { lock.unlock() }; return answered }
+        fileprivate func finish(_ answer: Answer) { lock.lock(); answered = answered ?? answer; lock.unlock() }
+    }
+
     /// The open call and every option `launch` needs exist in this macOS.
     static var canOpen: Bool { open != nil && optionKeys != nil }
     /// The open option that starts an app as a UIElement exists.
-    static var canHideFromDock: Bool { key("_kLSOpenOptionUIElementLaunchKey") != nil }
+    static var canHideFromDock: Bool { uiElementLaunchKey != nil }
 
     private static let optionKeys: [String: String]? = {
         var keys: [String: String] = [:]
@@ -60,9 +72,12 @@ enum LaunchServices {
     }()
 
     /// Launch a new, hidden, inactive instance of the app at `app` (like `open -g -j -n`, not
-    /// added to recents), optionally as a UIElement. Returns the new process's PID when
-    /// LaunchServices reports it (it may not, e.g. for a script executable).
-    static func openApplication(_ app: URL, _ options: OpenOptions, timeout: Double = 30) throws -> pid_t? {
+    /// added to recents), optionally as a UIElement. Returns at once: the request's answer
+    /// carries the new process's PID when LaunchServices reports it (it may not, e.g. for a
+    /// script executable). `launch` doesn't rely on the answer arriving: it also identifies the
+    /// process by its launch token (see LaunchTarget). BACKSTAGE_TEST_LS=no-callback (tests)
+    /// drops the answer, as when LaunchServices never calls back.
+    static func openApplication(_ app: URL, _ options: OpenOptions) throws -> OpenRequest {
         guard let open, let k = optionKeys else { throw CLIError("LaunchServices open call unavailable") }
         var dict: [String: Any] = [
             k["Activate"]!: false,
@@ -75,29 +90,24 @@ enum LaunchServices {
         ]
         if !options.environment.isEmpty { dict[k["EnvironmentVariables"]!] = options.environment }
         if !options.arguments.isEmpty { dict[k["Arguments"]!] = options.arguments }
-        if options.hideFromDock, let ui = key("_kLSOpenOptionUIElementLaunchKey") { dict[ui] = true }
+        if options.hideFromDock, let uiElementLaunchKey { dict[uiElementLaunchKey] = true }
 
-        final class Outcome: @unchecked Sendable {
-            let done = DispatchSemaphore(value: 0)
-            var ok = false, error: String?, pid: pid_t?
-        }
-        let outcome = Outcome()
+        let request = OpenRequest()
+        let dropAnswer = testHooks.contains("no-callback")
         let completion: Completion = { asn, ok, error in
-            outcome.ok = ok
-            outcome.error = error.map { String(describing: $0) }
-            if let asn { outcome.pid = pid(of: asn) }
-            outcome.done.signal()
+            guard !dropAnswer else { return }
+            request.finish(.init(ok: ok, error: error.map { String(describing: $0) }, pid: asn.flatMap { pid(of: $0) }))
         }
         // An empty (not nil) URL list: open the application itself.
         open([] as CFArray, app as CFURL, dict as CFDictionary, completion as AnyObject)
-        let deadline = Date().addingTimeInterval(timeout)
-        while outcome.done.wait(timeout: .now()) != .success {
-            guard Date() < deadline else { throw CLIError("LaunchServices didn't answer within \(Int(timeout))s opening \(app.path)") }
-            RunLoop.current.run(until: Date(timeIntervalSinceNow: 0.005))
-        }
-        guard outcome.ok else { throw CLIError("LaunchServices couldn't open \(app.path): \(outcome.error ?? "unknown error")") }
-        return outcome.pid
+        return request
     }
+
+    /// BACKSTAGE_TEST_LS, comma-separated (tests only): `no-callback` drops LaunchServices'
+    /// answer; `no-find` keeps `launch` from identifying the process, so it gives up and leaves
+    /// the app to the daemon.
+    static let testHooks = Set((ProcessInfo.processInfo.environment["BACKSTAGE_TEST_LS"] ?? "")
+        .split(separator: ",").map { $0.trimmingCharacters(in: .whitespaces) })
 
     private static func pid(of asn: CFTypeRef) -> pid_t? {
         guard let copyInfo, let info = copyInfo(session, asn, nil)?.takeRetainedValue() as? [String: Any],

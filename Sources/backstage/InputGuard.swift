@@ -74,9 +74,11 @@ func isComputerUseInjectorPath(_ path: String) -> Bool {
 /// (Claude keeps app-cu-helper running as a JSON-RPC child; Codex's is a service app).
 func isComputerUseInjector(_ pid: pid_t) -> Bool {
     guard pid > 0 else { return false }
-    var buf = [CChar](repeating: 0, count: 4 * Int(MAXPATHLEN)) // PROC_PIDPATHINFO_MAXSIZE
-    guard proc_pidpath(pid, &buf, UInt32(buf.count)) > 0 else { return false }
-    return isComputerUseInjectorPath(String(cString: buf))
+    // PROC_PIDPATHINFO_MAXSIZE
+    return withUnsafeTemporaryAllocation(of: CChar.self, capacity: 4 * Int(MAXPATHLEN)) { buf in
+        guard let path = buf.baseAddress, proc_pidpath(pid, path, UInt32(buf.count)) > 0 else { return false }
+        return isComputerUseInjectorPath(String(cString: path))
+    }
 }
 
 let guardedEventTypes: [CGEventType] = [
@@ -87,6 +89,19 @@ let guardedEventTypes: [CGEventType] = [
     .scrollWheel,
 ]
 
+private final class InputGuardTap {
+    unowned let guarder: InputGuard
+    let target: pid_t?
+    let birth: UInt64?
+    var port: CFMachPort?
+
+    init(guarder: InputGuard, target: pid_t?, birth: UInt64?) {
+        self.guarder = guarder
+        self.target = target
+        self.birth = birth
+    }
+}
+
 final class InputGuard {
     struct Stats: Equatable {
         var events = 0, redirected = 0, dropped = 0, reenabled = 0, lost = 0, computerUse = 0
@@ -96,38 +111,93 @@ final class InputGuard {
 
     private var lock = os_unfair_lock()
     private var managed: Set<pid_t> = []
+    private var births: [pid_t: UInt64] = [:]
     private var userPid: pid_t = 0
     private var stats = Stats()
-    private var tap: CFMachPort?
+    private var runLoop: CFRunLoop?
+    // Only the tap thread creates, uses, or removes these callback contexts.
+    private var processTaps: [pid_t: InputGuardTap] = [:]
     private var logged = Stats()
 
     /// Install the tap on a dedicated thread. False if macOS refused it (no Accessibility trust).
     func start() -> Bool {
         let ready = DispatchSemaphore(value: 0)
-        var ok = false
         let thread = Thread { [self] in
-            let mask = guardedEventTypes.reduce(CGEventMask(0)) { $0 | (CGEventMask(1) << $1.rawValue) }
-            guard let port = CGEvent.tapCreate(tap: .cgAnnotatedSessionEventTap, place: .headInsertEventTap, options: .defaultTap,
-                                               eventsOfInterest: mask, callback: inputGuardCallback,
-                                               userInfo: Unmanaged.passUnretained(self).toOpaque()) else {
-                ready.signal(); return
+            let loop = CFRunLoopGetCurrent()!
+            guard let sessionTap = installTap(on: loop, target: nil), let port = sessionTap.port else {
+                ready.signal()
+                return
             }
-            tap = port
-            CFRunLoopAddSource(CFRunLoopGetCurrent(), CFMachPortCreateRunLoopSource(nil, port, 0), .commonModes)
-            CGEvent.tapEnable(tap: port, enable: true)
-            ok = true
+            runLoop = loop
             ready.signal()
-            CFRunLoopRun()
+            // Keep callback context alive until the port has been invalidated.
+            withExtendedLifetime(sessionTap) {
+                CFRunLoopRun()
+                CFMachPortInvalidate(port)
+            }
         }
         thread.name = "backstage input guard"
         thread.qualityOfService = .userInteractive
         thread.start()
         ready.wait()
-        return ok
+        return runLoop != nil
     }
 
-    func update(managed m: Set<pid_t>, userPid u: pid_t) {
-        os_unfair_lock_lock(&lock); managed = m; userPid = u; os_unfair_lock_unlock(&lock)
+    private func installTap(on loop: CFRunLoop, target: pid_t?, birth: UInt64? = nil) -> InputGuardTap? {
+        let context = InputGuardTap(guarder: self, target: target, birth: birth)
+        let info = Unmanaged.passUnretained(context).toOpaque()
+        let mask = guardedEventTypes.reduce(CGEventMask(0)) { $0 | (CGEventMask(1) << $1.rawValue) }
+        let port: CFMachPort?
+        if let target {
+            port = CGEvent.tapCreateForPid(pid: target, place: .headInsertEventTap, options: .defaultTap,
+                                           eventsOfInterest: mask, callback: inputGuardCallback, userInfo: info)
+        } else {
+            port = CGEvent.tapCreate(tap: .cgAnnotatedSessionEventTap, place: .headInsertEventTap, options: .defaultTap,
+                                     eventsOfInterest: mask, callback: inputGuardCallback, userInfo: info)
+        }
+        guard let port else { return nil }
+        guard let source = CFMachPortCreateRunLoopSource(nil, port, 0) else {
+            CFMachPortInvalidate(port)
+            return nil
+        }
+        context.port = port
+        CFRunLoopAddSource(loop, source, .commonModes)
+        CGEvent.tapEnable(tap: port, enable: true)
+        return context
+    }
+
+    func updateUser(_ user: pid_t) {
+        os_unfair_lock_lock(&lock)
+        userPid = user
+        os_unfair_lock_unlock(&lock)
+    }
+
+    func update(managed m: Set<pid_t>, births b: [pid_t: UInt64]) {
+        os_unfair_lock_lock(&lock)
+        let changed = births != b
+        managed = m
+        births = b
+        os_unfair_lock_unlock(&lock)
+        guard changed, let runLoop else { return }
+        CFRunLoopPerformBlock(runLoop, CFRunLoopMode.commonModes.rawValue) { [self] in
+            updateProcessTaps(on: runLoop)
+        }
+        CFRunLoopWakeUp(runLoop)
+    }
+
+    private func updateProcessTaps(on loop: CFRunLoop) {
+        os_unfair_lock_lock(&lock)
+        let targets = births
+        os_unfair_lock_unlock(&lock)
+        for (pid, tap) in processTaps where targets[pid] != tap.birth {
+            if let port = tap.port { CFMachPortInvalidate(port) }
+            processTaps.removeValue(forKey: pid)
+        }
+        // Direct posts can reach app-specific taps without appearing at the annotated session
+        // tap. The destination is known here even when the event's target field is missing.
+        for (pid, birth) in targets where processTaps[pid] == nil && processBirth(pid) == birth {
+            processTaps[pid] = installTap(on: loop, target: pid, birth: birth)
+        }
     }
 
     func snapshot() -> Stats {
@@ -141,24 +211,28 @@ final class InputGuard {
         guard force || s.redirected != logged.redirected || s.dropped != logged.dropped || s.reenabled != logged.reenabled || s.lost != logged.lost
                 || s.computerUse != logged.computerUse else { return }
         log(String(format: "input guard: %d redirected to the user's app, %d dropped, %d unredirectable, %d re-enables, %d from computer use let through "
-                   + "(last target pid %d; %d events seen, %.0fµs average, %d over 1ms, slowest %.0fµs)",
+                   + "(last target pid %d; %d tap callbacks, %.0fµs average, %d over 1ms, slowest %.0fµs)",
                    s.redirected, s.dropped, s.lost, s.reenabled, s.computerUse, s.lastTarget, s.events, s.totalMicros / Double(max(1, s.events)), s.over1ms, s.maxMicros))
         logged = s
     }
 
-    fileprivate func handle(_ type: CGEventType, _ event: CGEvent) -> Unmanaged<CGEvent>? {
+    fileprivate func handle(_ type: CGEventType, _ event: CGEvent, from tap: InputGuardTap) -> Unmanaged<CGEvent>? {
         if type == .tapDisabledByTimeout || type == .tapDisabledByUserInput {
-            if let tap { CGEvent.tapEnable(tap: tap, enable: true) }
+            if let port = tap.port { CGEvent.tapEnable(tap: port, enable: true) }
             os_unfair_lock_lock(&lock); stats.reenabled += 1; os_unfair_lock_unlock(&lock)
             return Unmanaged.passUnretained(event)
         }
         let started = clock_gettime_nsec_np(CLOCK_UPTIME_RAW)
-        let target = pid_t(truncatingIfNeeded: event.getIntegerValueField(.eventTargetUnixProcessID))
+        let target = tap.target ?? pid_t(truncatingIfNeeded: event.getIntegerValueField(.eventTargetUnixProcessID))
         let tag = event.getIntegerValueField(.eventSourceUserData)
         let hid = event.getIntegerValueField(.eventSourceStateID) == Int64(CGEventSourceStateID.hidSystemState.rawValue)
         os_unfair_lock_lock(&lock)
-        let managedNow = managed, user = userPid
+        let managedNow = managed, birth = births[target], user = userPid
         os_unfair_lock_unlock(&lock)
+        // A tap queued for removal must not act on events for a handed-off app or reused PID.
+        if let pinned = tap.birth, pinned != birth || processBirth(target) != pinned {
+            return Unmanaged.passUnretained(event)
+        }
         // The poster's executable is looked up only for untagged events headed for a managed app.
         var computerUse = false
         let verdict = classifyInput(type: type, target: target, tag: tag, hidState: hid, managed: managedNow,
@@ -188,8 +262,10 @@ final class InputGuard {
         stats.maxMicros = max(stats.maxMicros, micros)
         stats.totalMicros += micros
         if micros > 1000 { stats.over1ms += 1 }
-        if verdict != .pass || computerUse { stats.lastTarget = target }
-        if computerUse { stats.computerUse += 1 }
+        // A drop or redirect ends delivery; a trusted pass may reach both taps.
+        let countedComputerUse = computerUse && (tap.target != nil || processTaps[target] == nil)
+        if verdict != .pass || countedComputerUse { stats.lastTarget = target }
+        if countedComputerUse { stats.computerUse += 1 }
         if verdict == .redirect { if lost { stats.lost += 1 } else { stats.redirected += 1 } }
         if verdict == .drop { stats.dropped += 1 }
         os_unfair_lock_unlock(&lock)
@@ -199,7 +275,10 @@ final class InputGuard {
 
 private func inputGuardCallback(_ proxy: CGEventTapProxy, _ type: CGEventType, _ event: CGEvent, _ info: UnsafeMutableRawPointer?) -> Unmanaged<CGEvent>? {
     guard let info else { return Unmanaged.passUnretained(event) }
-    return Unmanaged<InputGuard>.fromOpaque(info).takeUnretainedValue().handle(type, event)
+    return autoreleasepool {
+        let tap = Unmanaged<InputGuardTap>.fromOpaque(info).takeUnretainedValue()
+        return tap.guarder.handle(type, event, from: tap)
+    }
 }
 
 /// `backstage __guard-selftest`: run the classifier over constructed events (never posted).

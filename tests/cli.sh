@@ -5,6 +5,8 @@ cd "$(dirname "$0")/.."
 bin=${BACKSTAGE_BIN:-.build/release/backstage}
 work=$(mktemp -d)
 export BACKSTAGE_HOME="$work/state"
+export BACKSTAGE_SESSION=backstage-cli-test
+unset BACKSTAGE_INAUDIBLE_DYLIB
 mkdir "$BACKSTAGE_HOME"
 /bin/sleep 300 &
 child=$!
@@ -30,6 +32,8 @@ reject() {
     fi
 }
 
+reject 'parent daemon' __menu-thumbnail 1 0 640 360
+reject 'thumbnail dimensions' __menu-thumbnail 1 0 641 360
 reject 'pid' quit --pid xyz
 reject 'pid' quit --pid 2147483648
 reject 'pid' quit --pid
@@ -39,6 +43,7 @@ reject 'steps' drag 0 0 10 10 --steps 0
 reject 'dy' scroll 0 0 --dy 2147483648
 reject 'scale' screenshot --scale 0
 reject 'timeout' wait --text ready --timeout inf
+reject 'needs --text and/or --role' wait
 reject 'env' launch fixture --env MISSING_VALUE
 reject 'pid' stop --pid "$child"
 reject 'selector' screenshot --full --pid "$child"
@@ -119,10 +124,66 @@ check_tail 3
 # with a way out, and isn't touched. `windows` only reads state, so a bug here can't start a
 # real daemon.
 jq -n --argjson pid "$child" --argjson birth "$birth" \
-    '{pid:$pid,displayID:1,x:0,y:0,width:1,height:1,startedAt:now,processStart:$birth}' > "$BACKSTAGE_HOME/daemon.json"
+    '{pid:$pid,displayID:1,x:0,y:0,width:1,height:1,startedAt:now,processStart:$birth,inputGuard:true}' > "$BACKSTAGE_HOME/daemon.json"
 reject 'older version.*stop --all' windows
+reject 'older version.*stop --all' press --pid "$child" w0
 kill -0 "$child"
 rm "$BACKSTAGE_HOME/daemon.json"
+
+# An input command must recheck its target after waiting on the app lock. Use the
+# window command so the test can reach the lock without starting an input guard.
+python3 - "$bin" "$BACKSTAGE_HOME" "$child" "$birth" <<'PYTHON'
+import fcntl
+import json
+from pathlib import Path
+import subprocess
+import sys
+import time
+
+binary, home, pid, birth = sys.argv[1:]
+registry = Path(home) / "apps.json"
+lock = Path(home) / "locks" / f"app-{pid}-{birth}"
+lock.parent.mkdir(exist_ok=True)
+with lock.open("w") as handle:
+    fcntl.flock(handle, fcntl.LOCK_EX)
+    proc = subprocess.Popen([binary, "window", "fill", "--pid", pid], stdout=subprocess.PIPE)
+    try:
+        deadline = time.monotonic() + 10
+        while True:
+            opened = subprocess.run(["/usr/sbin/lsof", "-Fn", "-p", str(proc.pid)],
+                                    capture_output=True, text=True)
+            if "n" + str(lock.resolve()) in opened.stdout.splitlines():
+                break
+            if proc.poll() is not None or time.monotonic() >= deadline:
+                raise AssertionError("window command did not wait on the app lock")
+            time.sleep(0.025)
+        saved = registry.with_suffix(".saved.json")
+        replacement = registry.with_suffix(".replacement.json")
+        saved.write_bytes(registry.read_bytes())
+        replacement.write_text("[]")
+        replacement.replace(registry)
+        try:
+            fcntl.flock(handle, fcntl.LOCK_UN)
+            result = json.loads(proc.communicate(timeout=10)[0])
+            assert proc.returncode == 1 and "no longer a live managed app" in result["error"], result
+        finally:
+            saved.replace(registry)
+    finally:
+        if proc.poll() is None:
+            proc.kill()
+        proc.communicate()
+PYTHON
+
+# Session identity must agree with the byte-based keys used for app and session locks.
+# A precomposed and a decomposed spelling must not address each other's apps.
+mv "$BACKSTAGE_HOME/apps.json" "$work/legacy-apps.json"
+owner=$'test-\xc3\xa9'
+other=$'test-e\xcc\x81'
+jq --arg owner "$owner" '.[0].session = $owner' "$work/legacy-apps.json" > "$BACKSTAGE_HOME/apps.json"
+BACKSTAGE_SESSION="$other" reject 'another backstage session' logs --pid "$child"
+BACKSTAGE_SESSION="$other" "$bin" list | jq -e '.apps == []' >/dev/null
+BACKSTAGE_SESSION="$owner" "$bin" logs --pid "$child" --lines 0
+mv "$work/legacy-apps.json" "$BACKSTAGE_HOME/apps.json"
 
 # Session derivation. Results mustn't depend on the agent (if any) running this script, so
 # agent variables are scrubbed, and fake agents are copies of a spawn-and-wait helper.

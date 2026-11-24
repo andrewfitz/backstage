@@ -54,6 +54,12 @@ struct Session {
         return "\(safe)-\(hash)"
     }
 
+    /// Session IDs use their original UTF-8 spelling, as do the existing lock filenames.
+    static func sameID(_ lhs: String?, _ rhs: String?) -> Bool {
+        guard let lhs, let rhs else { return lhs == nil && rhs == nil }
+        return lhs.utf8.elementsEqual(rhs.utf8)
+    }
+
     static func derive(_ env: [String: String]) throws -> Session {
         if let name = env["BACKSTAGE_SESSION"], !name.isEmpty {
             guard name != legacy else { throw CLIError("BACKSTAGE_SESSION=legacy is reserved for apps launched before sessions existed") }
@@ -121,7 +127,7 @@ struct Session {
     /// The agent an interpreter runs: a path component of one of its first arguments
     /// (`node …/bin/gemini`, `node …/@anthropic-ai/claude-code/cli.js`, `python -m aider`).
     static func interpretedAgent(_ pid: pid_t) -> String? {
-        guard let argv = processArguments(pid)?.argv else { return nil }
+        guard let argv = processArguments(pid, includeEnvironment: false)?.argv else { return nil }
         for arg in argv.dropFirst().prefix(4) where !arg.hasPrefix("-") {
             if let agent = arg.split(separator: "/").lazy.compactMap({ agentName(String($0)) }).first { return agent }
         }
@@ -131,7 +137,7 @@ struct Session {
     /// The closest ancestor that is an agent; the scan stops there.
     static func nearestAgent(_ chain: [Ancestor]) -> Ancestor? { chain.first { $0.agent != nil } }
 
-    /// Parent processes from the caller up to (not including) launchd.
+    /// Parent processes from the caller up to the nearest agent or launchd.
     static func ancestors() -> [Ancestor] {
         var chain: [Ancestor] = []
         var pid = getppid()
@@ -148,6 +154,7 @@ struct Session {
                 agent = interpretedAgent(pid)
             }
             chain.append(Ancestor(pid: pid, birth: info.pbi_start_tvsec * 1_000_000 + info.pbi_start_tvusec, name: n, agent: agent))
+            if agent != nil { break }
             pid = pid_t(info.pbi_ppid)
         }
         return chain
@@ -162,7 +169,7 @@ struct Session {
 
 /// A process's arguments and environment, from KERN_PROCARGS2: argc, the executable path,
 /// alignment padding, argv, then the environment. Nil if unreadable (another user's process).
-func processArguments(_ pid: pid_t) -> (argv: [String], env: [String: String])? {
+private func readProcessArguments(_ pid: pid_t, decodeArguments: Bool) -> (argv: [String], environment: ArraySlice<UInt8>)? {
     var mib = [CTL_KERN, KERN_PROCARGS2, pid]
     var size = 0
     guard sysctl(&mib, 3, nil, &size, nil, 0) == 0, size > MemoryLayout<Int32>.size else { return nil }
@@ -176,9 +183,17 @@ func processArguments(_ pid: pid_t) -> (argv: [String], env: [String: String])? 
     var argv: [String] = []
     for _ in 0..<argc {
         guard let end = bytes[index..<size].firstIndex(of: 0) else { return nil }
-        argv.append(String(decoding: bytes[index..<end], as: UTF8.self))
+        if decodeArguments { argv.append(String(decoding: bytes[index..<end], as: UTF8.self)) }
         index = end + 1
     }
+    return (argv, bytes[index..<size])
+}
+
+func processArguments(_ pid: pid_t, includeEnvironment: Bool = true) -> (argv: [String], env: [String: String])? {
+    guard let (argv, bytes) = readProcessArguments(pid, decodeArguments: true) else { return nil }
+    if !includeEnvironment { return (argv, [:]) }
+    var index = bytes.startIndex
+    let size = bytes.endIndex
     var env: [String: String] = [:]
     while index < size && bytes[index] != 0 {
         guard let end = bytes[index..<size].firstIndex(of: 0) else { break }
@@ -189,6 +204,20 @@ func processArguments(_ pid: pid_t) -> (argv: [String], env: [String: String])? 
         index = end + 1
     }
     return (argv, env)
+}
+
+/// Read a single environment value without decoding the process's arguments or other variables.
+func processEnvironmentValue(_ pid: pid_t, key: String) -> String? {
+    guard let bytes = readProcessArguments(pid, decodeArguments: false)?.environment else { return nil }
+    let prefix = (key + "=").utf8
+    var start = bytes.startIndex
+    while start < bytes.endIndex && bytes[start] != 0 {
+        guard let end = bytes[start...].firstIndex(of: 0) else { return nil }
+        let entry = bytes[start..<end]
+        if entry.starts(with: prefix) { return String(decoding: entry.dropFirst(prefix.count), as: UTF8.self) }
+        start = end + 1
+    }
+    return nil
 }
 
 /// Coordination locks in BACKSTAGE_HOME. Acquire in this order, never the reverse:
@@ -205,8 +234,8 @@ enum Locks {
     static func session(_ id: String, nonblocking: Bool = false) throws -> StateLock {
         try StateLock("locks/session-" + Session.fileKey(id), nonblocking: nonblocking)
     }
-    static func app(_ app: ManagedApp) throws -> StateLock {
-        try StateLock("locks/app-\(app.pid)-\(app.processStart ?? 0)")
+    static func app(_ app: ManagedApp, nonblocking: Bool = false) throws -> StateLock {
+        try StateLock("locks/app-\(app.pid)-\(app.processStart ?? 0)", nonblocking: nonblocking)
     }
     /// Remove lock files of apps that are gone. Nobody can hold a dead app's lock usefully.
     /// Records without a start time lock `app-<pid>-0`, which can't be checked: those stay.
@@ -227,15 +256,24 @@ enum Locks {
     /// loses nothing. Each file is unlinked while holding its lock (non-blocking: skip if busy).
     static func pruneSessionLocks() {
         let dir = Paths.dir.appendingPathComponent("locks")
-        guard let names = try? FileManager.default.contentsOfDirectory(atPath: dir.path),
-              let apps = try? AppStore.read() else { return }
-        let live = Set((apps.map { $0.owner } + Launching.records().map { $0.session }).map { "session-" + Session.fileKey($0) })
         let cutoff = Date().addingTimeInterval(-86_400)
-        for name in names where name.hasPrefix("session-") && !live.contains(name) {
+        func isOld(_ url: URL) -> Bool {
+            guard let modified = (try? FileManager.default.attributesOfItem(atPath: url.path))?[.modificationDate] as? Date else {
+                return false
+            }
+            return modified < cutoff
+        }
+        guard let names = try? FileManager.default.contentsOfDirectory(atPath: dir.path) else { return }
+        let candidates = names.filter { $0.hasPrefix("session-") && isOld(dir.appendingPathComponent($0)) }
+        guard !candidates.isEmpty, let apps = try? AppStore.read() else { return }
+        let owners = apps.map { $0.owner } + Launching.records().map { $0.session }
+        let distinctOwners = Set(owners.map { Data($0.utf8) })
+        let live = Set(distinctOwners.map { "session-" + Session.fileKey(String(decoding: $0, as: UTF8.self)) })
+        for name in candidates where !live.contains(name) {
             let url = dir.appendingPathComponent(name)
-            guard let modified = (try? FileManager.default.attributesOfItem(atPath: url.path))?[.modificationDate] as? Date,
-                  modified < cutoff, let lock = try? StateLock("locks/" + name, nonblocking: true) else { continue }
-            try? FileManager.default.removeItem(at: url)
+            guard let lock = try? StateLock("locks/" + name, nonblocking: true) else { continue }
+            // A stop may have written a new stamp after the directory scan.
+            if isOld(url) { try? FileManager.default.removeItem(at: url) }
             lock.release()
         }
     }

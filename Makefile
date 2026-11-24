@@ -1,5 +1,5 @@
 PREFIX ?= /opt/homebrew
-BIN = $(shell swift build -c release --show-bin-path)/backstage
+BIN := $(shell swift build -c release --show-bin-path)/backstage
 # Injected into the dev builds and test runners `launch` starts (Sources/BackstageInaudible).
 # backstage looks for it next to itself, then in ../lib/backstage.
 DYLIB_NAME = libbackstage-inaudible.dylib
@@ -7,12 +7,11 @@ DYLIB = $(dir $(BIN))$(DYLIB_NAME)
 LIBDIR = $(PREFIX)/lib/backstage
 # GUI suites run a fresh copy of the build at a new path each time (see the install rule:
 # ScreenCaptureKit can stop answering one executable path for good).
-TEST_BIN := /tmp/backstage-test-$(shell id -u)-$(shell date +%s)/backstage
 define fresh_bin
-mkdir -p "$(dir $(TEST_BIN))" && cp "$(BIN)" "$(TEST_BIN)" && cp "$(DYLIB)" "$(dir $(TEST_BIN))$(DYLIB_NAME)"
+testdir=$$(mktemp -d /tmp/backstage-test.XXXXXX) && trap 'rm -f "$$testdir/backstage" "$$testdir/$(DYLIB_NAME)"; rmdir "$$testdir"' EXIT && cp "$(BIN)" "$$testdir/backstage" && cp "$(DYLIB)" "$$testdir/$(DYLIB_NAME)"
 endef
 
-.PHONY: build install uninstall dist test test-cli test-agents test-multi test-concurrency test-focus test-computer-use test-audio test-dock load
+.PHONY: build install uninstall dist test test-cli test-agents test-multi test-concurrency test-focus test-computer-use test-audio test-dock test-launch load
 
 build:
 	swift build -c release
@@ -60,31 +59,35 @@ test-agents: build
 	bash tests/agent-config.sh "$(BIN)"
 
 test-multi: build
-	$(fresh_bin) && BACKSTAGE_BIN="$(TEST_BIN)" tests/multi.sh
+	$(fresh_bin) && BACKSTAGE_BIN="$$testdir/backstage" tests/multi.sh
 
 test-concurrency: build
-	$(fresh_bin) && BACKSTAGE_BIN="$(TEST_BIN)" tests/concurrency.sh
+	$(fresh_bin) && BACKSTAGE_BIN="$$testdir/backstage" tests/concurrency.sh
 
 test-focus: build
-	$(fresh_bin) && BACKSTAGE_BIN="$(TEST_BIN)" tests/focus.sh
+	$(fresh_bin) && BACKSTAGE_BIN="$$testdir/backstage" tests/focus.sh
 
 test-computer-use: build
-	$(fresh_bin) && BACKSTAGE_BIN="$(TEST_BIN)" tests/computer-use.sh
+	$(fresh_bin) && BACKSTAGE_BIN="$$testdir/backstage" tests/computer-use.sh
 
 test-audio: build
-	$(fresh_bin) && BACKSTAGE_BIN="$(TEST_BIN)" tests/audio.sh
+	$(fresh_bin) && BACKSTAGE_BIN="$$testdir/backstage" tests/audio.sh
 
 test-dock: build
-	$(fresh_bin) && BACKSTAGE_BIN="$(TEST_BIN)" tests/dock.sh
+	$(fresh_bin) && BACKSTAGE_BIN="$$testdir/backstage" tests/dock.sh
+
+test-launch: build
+	$(fresh_bin) && BACKSTAGE_BIN="$$testdir/backstage" tests/launch.sh
 
 test: test-cli test-agents
-	$(fresh_bin) && BACKSTAGE_BIN="$(TEST_BIN)" tests/e2e.sh
-	$(fresh_bin) && BACKSTAGE_BIN="$(TEST_BIN)" tests/multi.sh
-	$(fresh_bin) && BACKSTAGE_BIN="$(TEST_BIN)" tests/concurrency.sh
-	$(fresh_bin) && BACKSTAGE_BIN="$(TEST_BIN)" tests/focus.sh
-	$(fresh_bin) && BACKSTAGE_BIN="$(TEST_BIN)" tests/computer-use.sh
-	$(fresh_bin) && BACKSTAGE_BIN="$(TEST_BIN)" tests/audio.sh
-	$(fresh_bin) && BACKSTAGE_BIN="$(TEST_BIN)" tests/dock.sh
+	$(fresh_bin) && BACKSTAGE_BIN="$$testdir/backstage" tests/e2e.sh
+	$(fresh_bin) && BACKSTAGE_BIN="$$testdir/backstage" tests/launch.sh
+	$(fresh_bin) && BACKSTAGE_BIN="$$testdir/backstage" tests/multi.sh
+	$(fresh_bin) && BACKSTAGE_BIN="$$testdir/backstage" tests/concurrency.sh
+	$(fresh_bin) && BACKSTAGE_BIN="$$testdir/backstage" tests/focus.sh
+	$(fresh_bin) && BACKSTAGE_BIN="$$testdir/backstage" tests/computer-use.sh
+	$(fresh_bin) && BACKSTAGE_BIN="$$testdir/backstage" tests/audio.sh
+	$(fresh_bin) && BACKSTAGE_BIN="$$testdir/backstage" tests/dock.sh
 
 # Load harness (docs/LOAD_TESTING.md), not part of `make test`. Defaults to a short 2-session
 # smoke run. Full runs (8/16/32 sessions, with --dedicated) belong on a separate macOS user
@@ -93,4 +96,4 @@ LOAD_SESSIONS ?= 2
 LOAD_WORKLOADS ?= all
 LOAD_ARGS ?= --duration 6 --rounds 2 --cycles 3
 load: build
-	$(fresh_bin) && BACKSTAGE_BIN="$(TEST_BIN)" tests/load.sh $(LOAD_SESSIONS) $(LOAD_WORKLOADS) $(LOAD_ARGS)
+	$(fresh_bin) && BACKSTAGE_BIN="$$testdir/backstage" tests/load.sh $(LOAD_SESSIONS) $(LOAD_WORKLOADS) $(LOAD_ARGS)

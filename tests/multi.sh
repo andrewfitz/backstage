@@ -6,21 +6,24 @@ set -uo pipefail
 cd "$(dirname "$0")"
 ROOT="$(cd .. && pwd)"
 if [[ -z ${BACKSTAGE_BIN:-} ]]; then
-    (cd "$ROOT" && swift build -c release)
-    BACKSTAGE_BIN="$(cd "$ROOT" && swift build -c release --show-bin-path)/backstage"
+    (cd "$ROOT" && make build) || exit 1
+    BIN_DIR="$(cd "$ROOT" && swift build -c release --show-bin-path)" || exit 1
+    BACKSTAGE_BIN="$BIN_DIR/backstage"
 fi
 BS="$BACKSTAGE_BIN"
-WORK="$(mktemp -d /tmp/backstage-multi.XXXX)"
+WORK="$(mktemp -d /tmp/backstage-multi.XXXX)" || exit 1
 export BACKSTAGE_HOME="$WORK/state"
 unset BACKSTAGE_SESSION
 # A second BACKSTAGE_HOME, for two daemons side by side.
 HOME2="$WORK/state2"
 WATCH=
 SLEEPER=
+LC=
 cleanup() {
     local result=$?
     trap - EXIT
-    wait 2>/dev/null
+    # The provisional launch CLI may be stopped. Reap it before stopping the daemon.
+    if [[ -n "$LC" ]]; then kill -KILL "$LC" 2>/dev/null; wait "$LC" 2>/dev/null; fi
     if [[ -f "$BACKSTAGE_HOME/daemon.json" || -f "$BACKSTAGE_HOME/apps.json" ]]; then
         "$BS" stop --all >/dev/null 2>&1 || "$BS" stop >/dev/null 2>&1 || result=1
     fi
@@ -41,7 +44,7 @@ trap 'exit 130' INT
 trap 'exit 143' TERM
 
 "$BS" status > "$WORK/status.json"
-python3 - "$WORK/status.json" <<'PYTHON'
+python3 - "$WORK/status.json" <<'PYTHON' || exit 1
 import json, sys
 status = json.load(open(sys.argv[1]))
 if not status["ok"]:
@@ -184,7 +187,7 @@ if [[ -n "$REC" && -f "$REC" ]]; then
     for _ in $(seq 1 150); do grep -q "fixture marker orphan" "$ELOG" 2>/dev/null && break; sleep 0.1; done
     # The app has the log as stdout (so did `open`, briefly): pick the fixture's process.
     PE=$(for p in $(lsof -t "$ELOG" 2>/dev/null); do ps -o comm= -p "$p" | grep -q BackstageTestApp && echo "$p"; done | head -1)
-    kill -KILL "$LC"; wait "$LC" 2>/dev/null
+    kill -KILL "$LC"; wait "$LC" 2>/dev/null; LC=
     [[ -n "$PE" ]] && pass "orphaned launch started pid $PE" || fail "orphaned launch's app never started"
     for _ in $(seq 1 300); do [[ ! -f "$REC" ]] && ! { [[ -n "$PE" ]] && alive "$PE"; } && break; sleep 0.1; done
     [[ -z "$PE" ]] || ! alive "$PE" && pass "the daemon quit the unregistered app" || fail "orphaned app $PE still running"
@@ -192,7 +195,7 @@ if [[ -n "$REC" && -f "$REC" ]]; then
     [[ $(BACKSTAGE_SESSION=C "$BS" list | pids) == "[]" ]] && pass "the orphan is in no session" || fail "C lists $(BACKSTAGE_SESSION=C "$BS" list | pids)"
     alive "$PB" && daemon_up && pass "B's app and the daemon are unaffected" || fail "B's app or the daemon is gone"
 else
-    kill -KILL "$LC" 2>/dev/null; wait "$LC" 2>/dev/null
+    kill -KILL "$LC" 2>/dev/null; wait "$LC" 2>/dev/null; LC=
     fail "no provisional launch record appeared"
 fi
 

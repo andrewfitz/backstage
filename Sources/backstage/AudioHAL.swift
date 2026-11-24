@@ -15,18 +15,31 @@ enum HAL {
                        scope: AudioObjectPropertyScope = kAudioObjectPropertyScopeGlobal) -> T? {
         var a = address(selector, scope)
         var value = initial
-        var size = UInt32(MemoryLayout<T>.size)
-        return AudioObjectGetPropertyData(object, &a, 0, nil, &size, &value) == noErr ? value : nil
+        let expectedSize = UInt32(MemoryLayout<T>.size)
+        var size = expectedSize
+        // These HAL properties use fixed-size C scalar or struct representations.
+        let status = withUnsafeMutablePointer(to: &value) {
+            AudioObjectGetPropertyData(object, &a, 0, nil, &size, $0)
+        }
+        guard status == noErr, size == expectedSize else { return nil }
+        return value
     }
 
     static func ids(_ object: AudioObjectID, _ selector: AudioObjectPropertySelector,
                     scope: AudioObjectPropertyScope = kAudioObjectPropertyScopeGlobal) -> [AudioObjectID] {
         var a = address(selector, scope)
         var size: UInt32 = 0
-        guard AudioObjectGetPropertyDataSize(object, &a, 0, nil, &size) == noErr, size > 0 else { return [] }
-        var ids = [AudioObjectID](repeating: 0, count: Int(size) / MemoryLayout<AudioObjectID>.size)
-        guard AudioObjectGetPropertyData(object, &a, 0, nil, &size, &ids) == noErr else { return [] }
-        return Array(ids.prefix(Int(size) / MemoryLayout<AudioObjectID>.size))
+        let stride = UInt32(MemoryLayout<AudioObjectID>.stride)
+        guard AudioObjectGetPropertyDataSize(object, &a, 0, nil, &size) == noErr,
+              size > 0, size % stride == 0 else { return [] }
+        let capacity = size
+        var ids = [AudioObjectID](repeating: 0, count: Int(capacity / stride))
+        let status = ids.withUnsafeMutableBufferPointer {
+            AudioObjectGetPropertyData(object, &a, 0, nil, &size, $0.baseAddress!)
+        }
+        guard status == noErr, size <= capacity, size % stride == 0 else { return [] }
+        if size < capacity { ids.removeLast(Int((capacity - size) / stride)) }
+        return ids
     }
 
     static func string(_ object: AudioObjectID, _ selector: AudioObjectPropertySelector) -> String? {
@@ -49,7 +62,8 @@ enum HAL {
         var pid = pid
         var object = AudioObjectID(kAudioObjectUnknown)
         var size = UInt32(MemoryLayout<AudioObjectID>.size)
-        _ = AudioObjectGetPropertyData(system, &a, UInt32(MemoryLayout<pid_t>.size), &pid, &size, &object)
+        guard AudioObjectGetPropertyData(system, &a, UInt32(MemoryLayout<pid_t>.size), &pid, &size, &object) == noErr,
+              size == MemoryLayout<AudioObjectID>.size else { return AudioObjectID(kAudioObjectUnknown) }
         return object
     }
 
@@ -62,10 +76,15 @@ enum HAL {
     static func channels(_ device: AudioObjectID, input: Bool) -> Int {
         var a = address(kAudioDevicePropertyStreamConfiguration, input ? kAudioObjectPropertyScopeInput : kAudioObjectPropertyScopeOutput)
         var size: UInt32 = 0
-        guard AudioObjectGetPropertyDataSize(device, &a, 0, nil, &size) == noErr, size > 0 else { return 0 }
-        let raw = UnsafeMutableRawPointer.allocate(byteCount: Int(size), alignment: 16)
+        let buffersOffset = MemoryLayout<AudioBufferList>.offset(of: \.mBuffers)!
+        guard AudioObjectGetPropertyDataSize(device, &a, 0, nil, &size) == noErr, size >= buffersOffset else { return 0 }
+        let capacity = Int(size)
+        let raw = UnsafeMutableRawPointer.allocate(byteCount: capacity, alignment: MemoryLayout<AudioBufferList>.alignment)
         defer { raw.deallocate() }
-        guard AudioObjectGetPropertyData(device, &a, 0, nil, &size, raw) == noErr else { return 0 }
+        guard AudioObjectGetPropertyData(device, &a, 0, nil, &size, raw) == noErr,
+              size >= buffersOffset, size <= capacity else { return 0 }
+        let count = Int(raw.load(as: UInt32.self))
+        guard count > 0, count <= (Int(size) - buffersOffset) / MemoryLayout<AudioBuffer>.stride else { return 0 }
         return UnsafeMutableAudioBufferListPointer(raw.assumingMemoryBound(to: AudioBufferList.self)).reduce(0) { $0 + Int($1.mNumberChannels) }
     }
     static func isBuiltIn(_ device: AudioObjectID) -> Bool {
@@ -76,9 +95,17 @@ enum HAL {
     /// coreaudiod ask TCC for the Microphone on macOS 27 (measured), even for output only.
     /// Prefers the default output, then built-in devices.
     static func outputOnlyDevice() -> AudioObjectID? {
-        let all = devices().filter { channels($0, input: false) > 0 && channels($0, input: true) == 0 }
-        if let d = defaultOutput(), all.contains(d) { return d }
-        return all.first(where: isBuiltIn) ?? all.first
+        func outputOnly(_ device: AudioObjectID) -> Bool {
+            channels(device, input: false) > 0 && channels(device, input: true) == 0
+        }
+        let all = devices()
+        if let device = defaultOutput(), all.contains(device), outputOnly(device) { return device }
+        var firstOutputOnly: AudioObjectID?
+        for device in all where outputOnly(device) {
+            if isBuiltIn(device) { return device }
+            if firstOutputOnly == nil { firstOutputOnly = device }
+        }
+        return firstOutputOnly
     }
 
     static func tapFormat(_ tap: AudioObjectID) -> AudioStreamBasicDescription? {
@@ -146,21 +173,25 @@ func tccPreflight(_ service: String) -> Int32? {
 /// The inaudible probe: a sine of at least 18 kHz, at most -60 dBFS, with 10 ms raised-cosine
 /// ramps, at most 2 s. Used by the daemon's self-test.
 struct ProbeTone {
-    let hz: Double, amplitude: Double, frames: Int, rate: Double, ramp: Int
+    private let samples: [Float]
+
     init(hz: Double, dbfs: Double, seconds: Double, rate: Double) {
         precondition(hz >= 18000 && hz < rate / 2, "probe tones must be at least 18 kHz and below Nyquist")
         precondition(dbfs <= -60, "probe tones must be at most -60 dBFS")
         precondition(seconds <= 2, "probe bursts must be at most 2 s")
-        self.hz = hz; self.amplitude = pow(10, dbfs / 20); self.rate = rate
-        frames = Int(seconds * rate); ramp = max(1, Int(0.010 * rate))
+        let amplitude = pow(10, dbfs / 20)
+        let frames = Int(seconds * rate)
+        let ramp = max(1, Int(0.010 * rate))
+        samples = (0..<frames).map { i in
+            let distance = min(i, frames - 1 - i)
+            let gain = distance < ramp ? 0.5 - 0.5 * cos(Double.pi * Double(distance) / Double(ramp)) : 1
+            return Float(amplitude * gain * sin(2 * Double.pi * hz * Double(i) / rate))
+        }
     }
+
     func sample(_ i: Int) -> Float {
-        guard i >= 0, i < frames else { return 0 }
-        var g = 1.0
-        if i < ramp { g = 0.5 - 0.5 * cos(Double.pi * Double(i) / Double(ramp)) }
-        let fromEnd = frames - 1 - i
-        if fromEnd < ramp { g = min(g, 0.5 - 0.5 * cos(Double.pi * Double(fromEnd) / Double(ramp))) }
-        return Float(amplitude * g * sin(2 * Double.pi * hz * Double(i) / rate))
+        guard i >= 0, i < samples.count else { return 0 }
+        return samples[i]
     }
 }
 

@@ -58,6 +58,8 @@ struct DaemonInfo: Codable {
     /// The tap manager measures only apps launched with --audio (AudioMode). Absent in daemons
     /// that measure every app.
     var audioModes: Bool? = nil
+    /// The daemon can register a launch that appears after its CLI stopped waiting.
+    var delayedLaunchHandoff: Bool? = nil
 
     static let currentProtocol = 2
     var protocolMismatch: Bool { (self.protocol ?? 1) != DaemonInfo.currentProtocol }
@@ -69,7 +71,7 @@ struct DaemonInfo: Codable {
     var bounds: CGRect { CGRect(x: x, y: y, width: width, height: height) }
 }
 
-struct ManagedApp: Codable {
+struct ManagedApp: Codable, Equatable {
     var pid: Int32
     var name: String
     var bundleID: String?
@@ -154,12 +156,24 @@ final class StateLock {
             // Lock files of dead apps and old sessions are pruned (unlinked under the lock). If
             // that happened while this waited, the lock is on an orphaned file: start over.
             var held = stat(), current = stat()
-            if fstat(descriptor, &held) == 0, stat(path, &current) == 0,
-               held.st_dev == current.st_dev, held.st_ino == current.st_ino {
+            guard fstat(descriptor, &held) == 0 else {
+                let error = errno
+                close(descriptor)
+                throw POSIXError(POSIXErrorCode(rawValue: error) ?? .EIO)
+            }
+            if stat(path, &current) == 0 {
+                if held.st_dev != current.st_dev || held.st_ino != current.st_ino {
+                    close(descriptor)
+                    continue
+                }
                 fd = descriptor
                 return
             }
+            let error = errno
             close(descriptor)
+            guard error == ENOENT || error == EINTR else {
+                throw POSIXError(POSIXErrorCode(rawValue: error) ?? .EIO)
+            }
         }
     }
 
@@ -172,18 +186,35 @@ final class StateLock {
         if fd >= 0 { close(fd); fd = -1 }
     }
 
-    /// A timestamp kept in the lock file (a session's last `stop`), read and written under the lock.
-    var stamp: Double? {
-        get {
-            var buffer = [UInt8](repeating: 0, count: 64)
-            let n = pread(fd, &buffer, buffer.count, 0)
-            guard n > 0 else { return nil }
-            return Double(String(decoding: buffer[0..<n], as: UTF8.self).trimmingCharacters(in: .whitespacesAndNewlines))
+    /// A session's last `stop` timestamp, read and written under the lock.
+    func readStamp() throws -> Double? {
+        var buffer = [UInt8](repeating: 0, count: 64)
+        var count: Int
+        repeat { count = pread(fd, &buffer, buffer.count, 0) } while count < 0 && errno == EINTR
+        guard count >= 0 else { throw POSIXError(POSIXErrorCode(rawValue: errno) ?? .EIO) }
+        if count == 0 { return nil }
+        let text = String(decoding: buffer.prefix(count), as: UTF8.self).trimmingCharacters(in: .whitespacesAndNewlines)
+        guard count < buffer.count, let stamp = Double(text), stamp.isFinite else {
+            throw CLIError("invalid session stop timestamp")
         }
-        set {
-            let text = Array((newValue.map { String($0) } ?? "").utf8)
-            _ = ftruncate(fd, 0)
-            _ = text.withUnsafeBytes { pwrite(fd, $0.baseAddress, $0.count, 0) }
+        return stamp
+    }
+
+    func writeStamp(_ value: Double) throws {
+        let text = Array(String(value).utf8)
+        try text.withUnsafeBytes { buffer in
+            var offset = 0
+            while offset < buffer.count {
+                let count = pwrite(fd, buffer.baseAddress?.advanced(by: offset), buffer.count - offset, off_t(offset))
+                if count < 0 && errno == EINTR { continue }
+                guard count > 0 else {
+                    throw POSIXError(count == 0 ? .EIO : POSIXErrorCode(rawValue: errno) ?? .EIO)
+                }
+                offset += count
+            }
+        }
+        while ftruncate(fd, off_t(text.count)) != 0 {
+            if errno != EINTR { throw POSIXError(POSIXErrorCode(rawValue: errno) ?? .EIO) }
         }
     }
 
@@ -203,11 +234,14 @@ func writeJSON<T: Encodable>(_ url: URL, _ value: T) throws {
 func processAlive(_ pid: Int32) -> Bool { processBirth(pid) != nil }
 
 enum AppStore {
-    static func read(allowMissing: Bool = true) throws -> [ManagedApp] {
+    private static func readRecords(allowMissing: Bool) throws -> [ManagedApp]? {
         do {
-            let records = try JSONDecoder().decode([ManagedApp].self, from: Data(contentsOf: Paths.apps))
-            return records.filter { $0.matchesProcess }
-        } catch CocoaError.fileReadNoSuchFile where allowMissing { return [] }
+            return try JSONDecoder().decode([ManagedApp].self, from: Data(contentsOf: Paths.apps))
+        } catch CocoaError.fileReadNoSuchFile where allowMissing { return nil }
+    }
+
+    static func read(allowMissing: Bool = true, matching: (ManagedApp) -> Bool = { _ in true }) throws -> [ManagedApp] {
+        try readRecords(allowMissing: allowMissing)?.filter { matching($0) && $0.matchesProcess } ?? []
     }
 
     static func load() -> [ManagedApp] { (try? read()) ?? [] }
@@ -229,9 +263,13 @@ enum AppStore {
     static func update(_ change: (inout [ManagedApp]) throws -> Void) throws {
         let lock = try StateLock("lock")
         try withExtendedLifetime(lock) {
-            var apps = try read()
+            let records = try readRecords(allowMissing: true)
+            var apps = records?.filter { $0.matchesProcess } ?? []
             try change(&apps)
-            try writeJSON(Paths.apps, apps)
+            let unchanged = records?.elementsEqual(apps) {
+                $0 == $1 && Session.sameID($0.session, $1.session)
+            } ?? false
+            if !unchanged { try writeJSON(Paths.apps, apps) }
         }
     }
 }

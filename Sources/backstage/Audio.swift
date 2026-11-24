@@ -219,6 +219,15 @@ func cmdAudio(_ args: Args) throws -> [String: Any] {
 /// tapped (float32), without the multichannel compensation `audio`'s levels get.
 func cmdAudioRecord(_ args: Args) throws -> [String: Any] {
     let (app, s, _) = try audioTarget(args)
+    let seconds: Double
+    if let value = args.opt("seconds") {
+        guard let duration = Double(value), duration.isFinite, duration > 0 else {
+            throw CLIError("--seconds needs a finite duration greater than zero")
+        }
+        seconds = min(duration, audioRingSeconds)
+    } else {
+        seconds = audioRingSeconds
+    }
     let me = try Session.current().id
     let outPath: String
     if let given = args.opt("o") ?? args.opt("out") {
@@ -235,14 +244,13 @@ func cmdAudioRecord(_ args: Args) throws -> [String: Any] {
         let why = s.tap == "armed" ? "it hasn't used Core Audio yet" : "its audio output hasn't run since launch"
         throw CLIError("nothing to record: pid \(app.pid) hasn't played any sound (\(why)). Make it play first (`backstage wait --sound` tells you when it does)")
     }
-    let seconds = args.double("seconds") ?? audioRingSeconds
     guard let snap = readRing(URL(fileURLWithPath: ring), seconds: seconds) else {
         throw CLIError("couldn't read pid \(app.pid)'s audio ring (\(ring)): it changed while being read or was removed; retry")
     }
     guard snap.frames > 0 else { throw CLIError("nothing to record: pid \(app.pid)'s audio ring is still empty; retry once it plays") }
     let out = URL(fileURLWithPath: outPath)
     do {
-        try wavData(snap.samples, sampleRate: snap.sampleRate, channels: snap.channels).write(to: out, options: .atomic)
+        try writeWAV(snap, to: out)
     } catch {
         throw CLIError("couldn't write \(out.path): \(error.localizedDescription)")
     }
@@ -256,21 +264,54 @@ func cmdAudioRecord(_ args: Args) throws -> [String: Any] {
 }
 
 /// A WAV of 32-bit float samples (WAVE_FORMAT_IEEE_FLOAT, with the `fact` chunk non-PCM formats need).
-func wavData(_ samples: [Float], sampleRate: Double, channels: Int) -> Data {
+private func wavHeader(sampleCount: Int, sampleRate: Double, channels: Int) -> Data {
     var d = Data()
     func tag(_ s: String) { d.append(contentsOf: Array(s.utf8)) }
     func u32(_ v: UInt32) { withUnsafeBytes(of: v.littleEndian) { d.append(contentsOf: $0) } }
     func u16(_ v: UInt16) { withUnsafeBytes(of: v.littleEndian) { d.append(contentsOf: $0) } }
-    let bytes = samples.count * 4
-    d.reserveCapacity(58 + bytes)
+    let bytes = sampleCount * 4
+    d.reserveCapacity(58)
     tag("RIFF"); u32(UInt32(50 + bytes)); tag("WAVE")
     tag("fmt "); u32(18)
     u16(3); u16(UInt16(channels)); u32(UInt32(sampleRate.rounded()))
     u32(UInt32(sampleRate.rounded()) * UInt32(channels) * 4); u16(UInt16(channels * 4)); u16(32); u16(0)
-    tag("fact"); u32(4); u32(UInt32(samples.count / max(channels, 1)))
+    tag("fact"); u32(4); u32(UInt32(sampleCount / channels))
     tag("data"); u32(UInt32(bytes))
-    samples.withUnsafeBufferPointer { d.append($0) }   // Macs are little-endian, like WAV
     return d
+}
+
+/// Publish only after both the header and payload have been written to a sibling file.
+private func writeWAV(_ snap: RingSnapshot, to url: URL) throws {
+    func posixError() -> POSIXError {
+        POSIXError(POSIXErrorCode(rawValue: errno) ?? .EIO)
+    }
+    let temporary = url.deletingLastPathComponent().appendingPathComponent(".backstage-audio-\(UUID())")
+    var existing = stat()
+    let existingFile = lstat(url.path, &existing) == 0 && existing.st_mode & S_IFMT == S_IFREG
+    let fd = open(temporary.path, O_WRONLY | O_CREAT | O_EXCL | O_CLOEXEC, existingFile ? 0o600 : 0o666)
+    guard fd >= 0 else { throw posixError() }
+    defer { unlink(temporary.path) }
+
+    func writeAll(_ bytes: UnsafeRawBufferPointer) throws {
+        guard let base = bytes.baseAddress else { return }
+        var written = 0
+        while written < bytes.count {
+            let count = write(fd, base + written, bytes.count - written)
+            if count < 0 && errno == EINTR { continue }
+            guard count > 0 else { throw count == 0 ? POSIXError(.EIO) : posixError() }
+            written += count
+        }
+    }
+    do {
+        let header = wavHeader(sampleCount: snap.samples.count, sampleRate: snap.sampleRate, channels: snap.channels)
+        try header.withUnsafeBytes(writeAll)
+        try snap.samples.withUnsafeBytes(writeAll) // Float32 on Macs already has WAV byte order.
+        if existingFile, fchmod(fd, existing.st_mode & 0o777) != 0 { throw posixError() }
+    } catch {
+        close(fd)
+        throw error
+    }
+    guard close(fd) == 0, rename(temporary.path, url.path) == 0 else { throw posixError() }
 }
 
 private func failedStatus(_ pid: pid_t) -> AudioAppStatus? {
@@ -278,7 +319,7 @@ private func failedStatus(_ pid: pid_t) -> AudioAppStatus? {
           let me = try? Session.current().id else { return nil }
     return names.filter { $0.hasPrefix("\(pid)-") && $0.hasSuffix(".json") }
         .compactMap { readJSON(AudioFiles.dir.appendingPathComponent($0), AudioAppStatus.self) }
-        .first { $0.tap == "failed" && $0.session == me }
+        .first { $0.tap == "failed" && Session.sameID($0.session, me) }
 }
 
 /// Failed taps of this session whose apps the daemon has quit (kept for 10 minutes), for `list`.
@@ -286,7 +327,7 @@ func recentAudioFailures(session: String, live: Set<Int32>) -> [[String: Any]] {
     guard let names = try? FileManager.default.contentsOfDirectory(atPath: AudioFiles.dir.path) else { return [] }
     return names.filter { $0.hasSuffix(".json") && $0.first?.isNumber == true }
         .compactMap { readJSON(AudioFiles.dir.appendingPathComponent($0), AudioAppStatus.self) }
-        .filter { $0.tap == "failed" && $0.session == session && !live.contains($0.pid) }
+        .filter { $0.tap == "failed" && Session.sameID($0.session, session) && !live.contains($0.pid) }
         .map { ["pid": $0.pid, "name": $0.name, "tap": "failed", "reason": $0.reason ?? "tap failed"] }
 }
 
@@ -434,50 +475,74 @@ struct RingSnapshot {
 /// The last `seconds` of a published ring, cut off at `endingBy` (audio clock): frames after
 /// the newest one are silence and aren't included.
 func readRing(_ url: URL, seconds: Double, endingBy: Double? = nil) -> RingSnapshot? {
-    guard let fh = try? FileHandle(forReadingFrom: url) else { return nil }
+    guard seconds.isFinite, seconds > 0, endingBy?.isFinite != false,
+          let fh = try? FileHandle(forReadingFrom: url) else { return nil }
     defer { try? fh.close() }
-    func header() -> (rate: Double, ch: Int, cap: Int, written: UInt64, end: Double, gain: Double)? {
-        guard (try? fh.seek(toOffset: 0)) != nil, let d = try? fh.read(upToCount: 64), d.count == 64,
-              d.prefix(4) == Data("BSAR".utf8) else { return nil }
-        return d.withUnsafeBytes { raw in
-            (raw.loadUnaligned(fromByteOffset: 8, as: Double.self), Int(raw.loadUnaligned(fromByteOffset: 16, as: UInt32.self)),
-             Int(raw.loadUnaligned(fromByteOffset: 20, as: UInt32.self)), raw.loadUnaligned(fromByteOffset: 24, as: UInt64.self),
-             raw.loadUnaligned(fromByteOffset: 40, as: Double.self), raw.loadUnaligned(fromByteOffset: 48, as: Double.self))
+    var info = stat()
+    guard fstat(fh.fileDescriptor, &info) == 0, info.st_size >= 64 else { return nil }
+
+    func read(_ offset: UInt64, _ count: Int) -> Data? {
+        guard (try? fh.seek(toOffset: offset)) != nil, let data = try? fh.read(upToCount: count),
+              data.count == count else { return nil }
+        return data
+    }
+    func header() -> (rate: Double, ch: Int, cap: Int, written: UInt64, end: Double, gain: Double, sequence: UInt64)? {
+        guard let marker = read(56, 8), let data = read(0, 64), data.prefix(4) == Data("BSAR".utf8) else { return nil }
+        return data.withUnsafeBytes { raw in
+            let sequence = raw.loadUnaligned(fromByteOffset: 56, as: UInt64.self)
+            guard raw.loadUnaligned(fromByteOffset: 4, as: UInt32.self) == 1,
+                  sequence & 1 == 0, marker.withUnsafeBytes({ $0.loadUnaligned(as: UInt64.self) }) == sequence else { return nil }
+            return (raw.loadUnaligned(fromByteOffset: 8, as: Double.self), Int(raw.loadUnaligned(fromByteOffset: 16, as: UInt32.self)),
+                    Int(raw.loadUnaligned(fromByteOffset: 20, as: UInt32.self)), raw.loadUnaligned(fromByteOffset: 24, as: UInt64.self),
+                    raw.loadUnaligned(fromByteOffset: 40, as: Double.self), raw.loadUnaligned(fromByteOffset: 48, as: Double.self), sequence)
         }
     }
-    for _ in 0..<3 {
-        guard let h = header(), h.rate > 0, h.ch > 0, h.cap > 0 else { return nil }
+    for _ in 0..<6 {
+        guard let h = header() else { continue }
+        guard h.rate.isFinite, h.rate >= 1, h.rate <= 768_000, h.ch > 0, h.ch <= 32,
+              h.cap > 0, h.cap <= Int(audioRingSeconds * h.rate), h.end.isFinite, h.end >= 0,
+              Int64(h.cap) <= (info.st_size - 64) / Int64(h.ch * 4) else { return nil }
         let gain = h.gain.isFinite && h.gain > 0 ? h.gain : 1
         let available = Int(min(h.written, UInt64(h.cap)))
-        var want = min(available, Int((seconds * h.rate).rounded()))
-        if let endingBy, endingBy > h.end { want = max(0, want - Int((endingBy - h.end) * h.rate)) }
-        guard want > 0 else { return RingSnapshot(sampleRate: h.rate, channels: h.ch, endUptime: h.end, levelGain: gain, samples: []) }
-        let firstFrame = Int((h.written - UInt64(want)) % UInt64(h.cap))
-        var samples: [Float] = []
-        samples.reserveCapacity(want * h.ch)
-        var remaining = want, pos = firstFrame
-        while remaining > 0 {
-            let n = min(remaining, h.cap - pos)
-            guard (try? fh.seek(toOffset: UInt64(64 + pos * h.ch * 4))) != nil,
-                  let d = try? fh.read(upToCount: n * h.ch * 4), d.count == n * h.ch * 4 else { break }
-            d.withUnsafeBytes { samples.append(contentsOf: $0.bindMemory(to: Float.self)) }
-            remaining -= n; pos = 0
+        let cutoff = endingBy ?? h.end
+        let skipped = Int(min(Double(available), (max(0, h.end - cutoff) * h.rate).rounded(.up)))
+        let length = min(seconds, audioRingSeconds) - max(0, cutoff - h.end)
+        let want = min(available - skipped, Int((max(0, length) * h.rate).rounded()))
+        let end = h.end - Double(skipped) / h.rate
+        guard want > 0 else { return RingSnapshot(sampleRate: h.rate, channels: h.ch, endUptime: end, levelGain: gain, samples: []) }
+        let firstFrame = Int((h.written - UInt64(skipped + want)) % UInt64(h.cap))
+        let firstCount = min(want, h.cap - firstFrame) * h.ch * MemoryLayout<Float>.stride
+        var samples = [Float](unsafeUninitializedCapacity: want * h.ch) { buffer, initializedCount in
+            initializedCount = 0
+            let bytes = UnsafeMutableRawBufferPointer(buffer)
+
+            func readSamples(from offset: Int, into start: Int, count: Int) -> Bool {
+                guard let base = bytes.baseAddress else { return count == 0 }
+                var copied = 0
+                while copied < count {
+                    let n = pread(fh.fileDescriptor, base + start + copied, count - copied, off_t(offset + copied))
+                    if n < 0 && errno == EINTR { continue }
+                    guard n > 0 else { return false }
+                    copied += n
+                }
+                return true
+            }
+            guard readSamples(from: 64 + firstFrame * h.ch * MemoryLayout<Float>.stride, into: 0, count: firstCount),
+                  readSamples(from: 64, into: firstCount, count: bytes.count - firstCount) else { return }
+            initializedCount = buffer.count
         }
-        // The file was recreated (a new tap format) or shrank under us: start over.
-        guard remaining == 0, let after = header(), after.rate == h.rate, after.ch == h.ch, after.cap == h.cap,
+        guard !samples.isEmpty, let after = header(), after.rate == h.rate, after.ch == h.ch, after.cap == h.cap,
               after.written >= h.written, after.written - h.written < UInt64(h.cap) else { continue }
-        // The writer moves forward from framesWritten, overwriting the oldest frames, and copies a
-        // buffer's samples before publishing its count. Frames it may have overwritten while we
-        // copied (what it published, plus one buffer in flight unless it has been idle) are the
-        // oldest ones we have: drop them rather than fail, so a full 15 s read of a playing app works.
         let advanced = Int(after.written - h.written)
-        let idle = advanced == 0 && audioClock() - after.end > 0.25
-        let lapped = advanced + (idle ? 0 : Int(0.1 * h.rate)) - (h.cap - want)
+        // Older writers leave the marker at zero and publish their count only after copying.
+        let legacyInFlight = after.sequence == 0 && (advanced > 0 || audioClock() - after.end <= 0.25)
+            ? Int(0.1 * h.rate) : 0
+        let lapped = advanced + legacyInFlight - (h.cap - skipped - want)
         if lapped > 0 {
             guard lapped < want else { continue }
             samples.removeFirst(lapped * h.ch)
         }
-        return RingSnapshot(sampleRate: h.rate, channels: h.ch, endUptime: h.end, levelGain: gain, samples: samples)
+        return RingSnapshot(sampleRate: h.rate, channels: h.ch, endUptime: end, levelGain: gain, samples: samples)
     }
     return nil
 }
@@ -510,6 +575,7 @@ func dominantFrequency(_ snap: RingSnapshot) -> Double? {
                 mp.baseAddress!.withMemoryRebound(to: DSPComplex.self, capacity: n / 2) { vDSP_ctoz($0, 2, &split, 1, vDSP_Length(n / 2)) }
             }
             vDSP_fft_zrip(setup, &split, 1, log2n, FFTDirection(FFT_FORWARD))
+            split.imagp[0] = 0  // vDSP packs the Nyquist value with the DC bin.
             vDSP_zvmags(&split, 1, &mags, 1, vDSP_Length(n / 2))
         }
     }

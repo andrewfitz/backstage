@@ -14,7 +14,7 @@ set -uo pipefail
 cd "$(dirname "$0")"
 ROOT="$(cd .. && pwd)"
 if [[ -z ${BACKSTAGE_BIN:-} ]]; then
-    (cd "$ROOT" && swift build -c release) || exit 1
+    (cd "$ROOT" && make build) || exit 1
     BACKSTAGE_BIN="$(cd "$ROOT" && swift build -c release --show-bin-path)/backstage"
 fi
 BS="$BACKSTAGE_BIN"
@@ -44,7 +44,7 @@ echo "== build helpers in $BUILD"
 build || exit 1
 for arg in "$@"; do [[ $arg == --build-only ]] && exit 0; done
 
-WORK="$(mktemp -d /tmp/backstage-load.XXXX)"
+WORK="$(mktemp -d /tmp/backstage-load.XXXX)" || exit 1
 export BACKSTAGE_HOME="$WORK/state"
 # The menu bar item isn't under test, and its thumbnails would add captures if someone opened it.
 export BACKSTAGE_MENUBAR="${BACKSTAGE_MENUBAR:-off}"
@@ -84,9 +84,17 @@ if not status["ok"]:
     sys.exit("\n".join(status["problems"]))
 PYTHON
 
-"$BUILD/watch" "$BUNDLE_ID" 86400 "$WORK/watch.stop" > "$WORK/watch.out" 2>&1 &
+"$BUILD/watch" "$BUNDLE_ID" 86400 "$WORK/watch.stop" "$WORK/watch.ready" > "$WORK/watch.out" 2>&1 &
 WATCH=$!
-sleep 0.3
+watch_deadline=$((SECONDS + 10))
+while [[ ! -f "$WORK/watch.ready" ]]; do
+    if (( SECONDS >= watch_deadline )) || ! kill -0 "$WATCH" 2>/dev/null; then
+        echo "watchdog did not become ready" >&2
+        kill "$WATCH" 2>/dev/null
+        exit 1
+    fi
+    sleep 0.05
+done
 python3 load.py run "$@" --bin "$BS" --work "$WORK" --app "$BUILD/BackstageTestApp.app" \
     --pixels "$BUILD/pixels" --probe "$BUILD/probe" --root "$ROOT"
 RUN=$?

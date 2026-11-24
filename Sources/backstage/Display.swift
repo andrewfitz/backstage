@@ -23,8 +23,8 @@ func isOurDisplay(_ id: CGDirectDisplayID) -> Bool {
 }
 
 /// Bounds of the backstage displays other than `own` (other homes' daemons).
-func otherAgentDisplayBounds(excluding own: CGDirectDisplayID) -> [CGRect] {
-    activeDisplays().filter { $0 != own && isOurDisplay($0) }.map { CGDisplayBounds($0) }
+func otherAgentDisplayBounds(excluding own: CGDirectDisplayID, from ids: [CGDirectDisplayID] = activeDisplays()) -> [CGRect] {
+    ids.filter { $0 != own && isOurDisplay($0) }.map { CGDisplayBounds($0) }
 }
 
 /// Serial numbers for this home's display, best first. Each BACKSTAGE_HOME has its own daemon and
@@ -83,7 +83,7 @@ func parkingSpot(size: CGSize, users: [CGRect], others: [CGRect]) -> CGPoint? {
 }
 
 /// An flock shared by every backstage process of this user, whatever its BACKSTAGE_HOME (in /tmp,
-/// not TMPDIR, which a caller may override). Nil if unavailable: callers go on without it.
+/// not TMPDIR, which a caller may override). Nil if unavailable.
 final class UserLock {
     private var fd: Int32 = -1
     init?(_ name: String, nonblocking: Bool = false) {
@@ -100,8 +100,8 @@ final class UserLock {
 }
 
 /// Bounds (global, top-left origin) of every display the user can actually see.
-func userDisplayBounds() -> [CGRect] {
-    activeDisplays()
+func userDisplayBounds(from ids: [CGDirectDisplayID] = activeDisplays()) -> [CGRect] {
+    ids
         .filter { !isOurDisplay($0) && CGDisplayMirrorsDisplay($0) == kCGNullDirectDisplay }
         .map { CGDisplayBounds($0) }
 }
@@ -179,7 +179,8 @@ final class AgentDisplay {
     /// Select the mode explicitly, for this login session only (nothing is saved).
     func selectMode() -> Bool {
         func wanted(_ m: CGDisplayMode) -> Bool {
-            m.width == Int(size.width) && m.height == Int(size.height) && m.pixelWidth == Int(size.width * size.scale)
+            m.width == Int(size.width) && m.height == Int(size.height)
+                && m.pixelWidth == Int(size.width * size.scale) && m.pixelHeight == Int(size.height * size.scale)
         }
         if let current = CGDisplayCopyDisplayMode(id), wanted(current) { return true }
         let options = [kCGDisplayShowDuplicateLowResolutionModes: kCFBooleanTrue] as CFDictionary
@@ -198,7 +199,12 @@ final class AgentDisplay {
     /// other backstage display (see `mayStay`): the cursor essentially can't wander onto it (and
     /// the daemons warp it back if it does), and the Dock, which follows the cursor to a display's
     /// bottom edge and moves to a display arranged below its own, stays on the user's screen.
-    var isParked: Bool { mayStay(bounds, users: userDisplayBounds(), others: otherAgentDisplayBounds(excluding: id)) }
+    var isParked: Bool {
+        let displays = activeDisplays()
+        let here = bounds
+        return displays.contains(id) && !here.isEmpty
+            && mayStay(here, users: userDisplayBounds(from: displays), others: otherAgentDisplayBounds(excluding: id, from: displays))
+    }
 
     /// Park the display diagonally off the bottom-right corner of the user's desktop, or chained
     /// off another backstage display's corner when that spot is taken (see `parkingSpot`). Only
@@ -209,16 +215,19 @@ final class AgentDisplay {
     /// asked onto an occupied spot (an older daemon's) to wherever it fits, often edge to edge.
     @discardableResult
     func park(force: Bool = false) -> Bool {
-        let lock = UserLock("park.lock")
-        defer { lock?.release() }
+        guard let lock = UserLock("park.lock") else { return false }
+        defer { lock.release() }
+        // The size it will have: a display can come up in the mode last used with its identity.
+        let target = CGSize(width: Int(size.width), height: Int(size.height))
         for attempt in 0..<5 {
-            let users = userDisplayBounds(), others = otherAgentDisplayBounds(excluding: id)
+            let displays = activeDisplays()
+            guard displays.contains(id) else { return false }
+            let users = userDisplayBounds(from: displays)
+            let others = otherAgentDisplayBounds(excluding: id, from: displays)
             let here = bounds
-            // The size it will have: a display can come up in the mode last used with its identity.
-            let target = CGSize(width: Int(size.width), height: Int(size.height))
             guard let spot = parkingSpot(size: target, users: users, others: others),
                   let x = Int32(exactly: spot.x), let y = Int32(exactly: spot.y) else { return false }
-            if mayStay(here, users: users, others: others), !force || attempt > 0 || here.origin == spot { return true }
+            if !here.isEmpty, mayStay(here, users: users, others: others), !force || attempt > 0 || here.origin == spot { return true }
             var cfg: CGDisplayConfigRef?
             guard CGBeginDisplayConfiguration(&cfg) == .success, let cfg else { return false }
             guard CGConfigureDisplayOrigin(cfg, id, x, y) == .success else {
@@ -226,7 +235,10 @@ final class AgentDisplay {
                 return false
             }
             guard CGCompleteDisplayConfiguration(cfg, .forSession) == .success else { return false }
-            for _ in 0..<25 where bounds.origin != spot { usleep(20_000) }
+            for _ in 0..<25 {
+                if bounds.origin == spot { break }
+                usleep(20_000)
+            }
         }
         return isParked
     }

@@ -9,7 +9,7 @@
 // the app's stdout or stderr (test runners capture them) unless BACKSTAGE_INAUDIBLE_LOG is set.
 #include <CoreAudio/CoreAudio.h>
 #include <dispatch/dispatch.h>
-#include <fcntl.h>
+#include <errno.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -17,6 +17,8 @@
 
 static char *ack_path;          // the root process's acknowledgement file (see bs_acknowledge)
 static int log_enabled;
+static dispatch_queue_t recovery_queue;
+static int retry_pending;      // accessed only on recovery_queue
 
 static OSStatus bs_set_inaudible(void) {
     AudioObjectPropertyAddress a = { kAudioHardwarePropertyProcessIsAudible, kAudioObjectPropertyScopeGlobal,
@@ -31,23 +33,40 @@ static OSStatus bs_set_inaudible(void) {
 // names, written atomically. Only the launched process does this (the variable is removed from
 // its environment once read, so its children don't); a sandboxed app may not be able to, and
 // launch then falls back to checking that the library is mapped.
-static void bs_acknowledge(OSStatus err) {
+static void bs_acknowledge(OSStatus err, int replace) {
     if (!ack_path) return;
     char tmp[1100], line[64];
-    if (snprintf(tmp, sizeof tmp, "%s.%d.tmp", ack_path, getpid()) >= (int)sizeof tmp) return;
-    int fd = open(tmp, O_CREAT | O_TRUNC | O_WRONLY | O_CLOEXEC, 0600);
+    if (snprintf(tmp, sizeof tmp, "%s.XXXXXX", ack_path) >= (int)sizeof tmp) return;
+    int fd = mkstemp(tmp);
     if (fd < 0) return;
     int n = snprintf(line, sizeof line, "%d %d\n", getpid(), (int)err);
-    ssize_t written = write(fd, line, (size_t)n);
+    size_t used = 0;
+    while (used < (size_t)n) {
+        ssize_t written = write(fd, line + used, (size_t)n - used);
+        if (written < 0 && errno == EINTR) continue;
+        if (written <= 0) break;
+        used += (size_t)written;
+    }
     close(fd);
-    if (written != n || rename(tmp, ack_path) != 0) unlink(tmp);
+    // A retry can update the pending status, but must not recreate a file the launcher removed.
+    if (used == (size_t)n && !replace && rename(tmp, ack_path) == 0) return;
+    if (used == (size_t)n && replace) renamex_np(tmp, ack_path, RENAME_SWAP);
+    unlink(tmp);
 }
 
-// Core Audio wasn't reachable at startup (coreaudiod restarting, say): keep trying for a while.
+static void bs_finish_acknowledgement(OSStatus err, int replace) {
+    bs_acknowledge(err, replace);
+    free(ack_path);
+    ack_path = NULL;
+}
+
+// Core Audio may be unavailable during startup or a server restart. Coalesce retries.
 static void bs_retry(int attempt) {
-    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, 100 * NSEC_PER_MSEC), dispatch_get_global_queue(QOS_CLASS_USER_INTERACTIVE, 0), ^{
+    retry_pending = 1;
+    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, 100 * NSEC_PER_MSEC), recovery_queue, ^{
+        retry_pending = 0;
         OSStatus err = bs_set_inaudible();
-        if (err == noErr || attempt >= 100) bs_acknowledge(err);
+        if (err == noErr || attempt >= 100) bs_finish_acknowledgement(err, 1);
         else bs_retry(attempt + 1);
     });
 }
@@ -57,16 +76,20 @@ __attribute__((constructor)) static void bs_inaudible_init(void) {
     const char *ack = getenv("BACKSTAGE_INAUDIBLE_ACK");
     if (ack && *ack && strlen(ack) < 1024) ack_path = strdup(ack);
     unsetenv("BACKSTAGE_INAUDIBLE_ACK");
+    recovery_queue = dispatch_queue_create("backstage.inaudible.recovery", DISPATCH_QUEUE_SERIAL);
     OSStatus err = bs_set_inaudible();
-    bs_acknowledge(err);
-    if (err != noErr) bs_retry(1);
+    if (err == noErr) bs_finish_acknowledgement(err, 0);
+    else {
+        bs_acknowledge(err, 0);
+        dispatch_async(recovery_queue, ^{ bs_retry(1); });
+    }
     // A coreaudiod restart forgets the setting: set it again on the new server.
     AudioObjectPropertyAddress restarted = { kAudioHardwarePropertyServiceRestarted, kAudioObjectPropertyScopeGlobal,
                                              kAudioObjectPropertyElementMain };
     AudioObjectAddPropertyListenerBlock(kAudioObjectSystemObject, &restarted,
-                                        dispatch_get_global_queue(QOS_CLASS_USER_INTERACTIVE, 0),
+                                        recovery_queue,
                                         ^(UInt32 count, const AudioObjectPropertyAddress *addresses) {
         (void)count; (void)addresses;
-        bs_set_inaudible();
+        if (!retry_pending && bs_set_inaudible() != noErr) bs_retry(1);
     });
 }

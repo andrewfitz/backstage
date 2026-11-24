@@ -32,7 +32,7 @@ FIXTURE_EXE = "BackstageTestApp.app/Contents/MacOS/BackstageTestApp"
 # ---------------------------------------------------------------- shared helpers
 
 def bs(binary, session, args, timeout=120):
-    """Run one backstage command as `session`. Returns (milliseconds, exit code, JSON or None, text)."""
+    """Run one backstage command as `session`. Returns (milliseconds, exit code or None on timeout, JSON or None, text)."""
     env = dict(os.environ)
     env["BACKSTAGE_SESSION"] = session
     started = time.monotonic()
@@ -41,7 +41,7 @@ def bs(binary, session, args, timeout=120):
                               timeout=timeout)
         code, out = proc.returncode, proc.stdout.decode("utf-8", "replace")
     except subprocess.TimeoutExpired:
-        code, out = -1, "timed out after %ss" % timeout
+        code, out = None, "timed out after %ss" % timeout
     ms = (time.monotonic() - started) * 1000
     try:
         data = json.loads(out)
@@ -55,7 +55,8 @@ def ok(code, data):
 
 
 def rejected(code, data):
-    return code == 1 and isinstance(data, dict) and data.get("ok") is False
+    return (code == 1 and isinstance(data, dict) and data.get("ok") is False
+            and "belongs to another backstage session" in str(data.get("error", "")))
 
 
 def ident(pid):
@@ -117,7 +118,7 @@ class Worker:
     def __init__(self, cfg):
         self.cfg = cfg
         self.session = cfg["session"]
-        self.events = []          # [op, seconds since start, ms, ok]
+        self.events = []          # [op, command start relative to window, ms, ok]
         self.errors = []
         self.checks = []          # {"gate", "name", "ok", "detail"}
         self.counts = {}
@@ -126,14 +127,14 @@ class Worker:
         self.pid = None
 
     def run_bs(self, op, args, timeout=120, record=True):
+        t = time.time() - self.start if self.start is not None else -1
         ms, code, data, out = bs(self.cfg["bin"], self.session, args, timeout)
         good = ok(code, data)
         if record:
-            t = time.time() - self.start if self.start else -1
-            self.events.append([op, round(t, 3), round(ms, 2), good])
+            self.events.append([op, t, round(ms, 2), good])
             if not good:
                 self.errors.append({"op": op, "t": round(t, 3), "error": out.strip()[:300]})
-            if code == -1:
+            if code is None:
                 self.count("hung:" + op)  # no reply within the timeout; the client was killed
         return ms, code, data, good
 
@@ -268,6 +269,7 @@ class Worker:
         while time.time() < stop_at:
             if not crossed and time.time() >= cross_at:
                 self.cross_session(go)
+                self.signal("crossed")
                 crossed = True
             iteration += 1
             if role == "idle":
@@ -284,19 +286,37 @@ class Worker:
                 self.capture_once()
         if not crossed:
             self.cross_session(go)
+            self.signal("crossed")
+        # No worker may remove another worker's target before its ownership probes finish.
+        self.wait_for_peers("crossed", go["participants"])
         if late:
-            # Every even session has stopped by now; this app must be the same live process.
-            same = ident(self.pid) == read_json(self.cfg["ready"])["ident"]
+            self.wait_for_peers("stopped", go["early"])
+            original = read_json(self.cfg["ready"])["ident"]
+            same = original is not None and ident(self.pid) == original
             self.check("cross_session_termination", "app survived the other sessions' stops", same,
                        "" if same else "pid %s gone or replaced" % self.pid)
         if role == "input":
             self.verify_input()
         self.stop()
+        if not late:
+            self.signal("stopped")
+
+    def signal(self, phase):
+        with open(os.path.join(self.cfg["dir"], "%s-%s" % (phase, self.session)), "w"):
+            pass
+
+    def wait_for_peers(self, phase, sessions):
+        deadline = time.time() + 240
+        for session in sessions:
+            if not wait_for_file(os.path.join(self.cfg["dir"], "%s-%s" % (phase, session)), deadline):
+                raise RuntimeError("%s never signaled %s" % (session, phase))
 
     def capture_once(self):
         cfg = self.cfg
         shot = os.path.join(cfg["dir"], "shots", "%s.%s" % (self.session, cfg["format"]))
         args = ["screenshot", "-o", shot] + (["--scale", str(cfg["scale"])] if cfg["scale"] != 1 else [])
+        if os.path.exists(shot):
+            os.unlink(shot)
         _, _, data, good = self.run_bs("screenshot", args, cfg["op_timeout"])
         if not good:
             return
@@ -304,11 +324,12 @@ class Worker:
         size = "%sx%s" % (data.get("width"), data.get("height"))
         self.counts.setdefault("resolutions", {})
         self.counts["resolutions"][size] = self.counts["resolutions"].get(size, 0) + 1
-        out = subprocess.run([cfg["pixels"], shot], stdout=subprocess.PIPE).stdout.decode().split()
-        if len(out) != 2:
-            self.check("other", "pixel count", False, "pixels failed on %s" % shot)
+        try:
+            pixels = subprocess.run([cfg["pixels"], shot], stdout=subprocess.PIPE, check=True, timeout=30)
+            red, green = map(int, pixels.stdout.split())
+        except (OSError, ValueError, subprocess.SubprocessError) as e:
+            self.check("other", "pixel count", False, "%s: %s" % (shot, e))
             return
-        red, green = int(out[0]), int(out[1])
         own, foreign = (red, green) if cfg["env"]["TESTAPP_PAD"] == "red" else (green, red)
         # Screenshots are points x scale, so one pad (380x130 pt) is ~49,400 x scale^2 pixels, less
         # its white label; the title bar buttons add a few hundred red/green. More than 1.5 pads of
@@ -421,10 +442,11 @@ def worker_main(path):
 # ---------------------------------------------------------------- orchestrator probes
 
 def parse_cpu(text):
+    days, separator, clock = text.partition("-")
     seconds = 0.0
-    for part in text.replace("-", ":").split(":"):
+    for part in (clock if separator else days).split(":"):
         seconds = seconds * 60 + float(part)
-    return seconds
+    return seconds + (int(days) * 86400 if separator else 0)
 
 
 class Sampler(threading.Thread):
@@ -438,9 +460,10 @@ class Sampler(threading.Thread):
         self.halt = threading.Event()
 
     def run(self):
-        prev, prev_t = {}, None
+        prev, prev_t, prev_wall = {}, None, None
         while not self.halt.is_set():
             t = time.time()
+            tick = time.monotonic()
             rows = self.run_.ps()
             daemon = self.run_.daemon_pid()
             groups = {"daemon": [], "windowserver": [], "dock": [], "fixtures": [], "clients": []}
@@ -455,7 +478,7 @@ class Sampler(threading.Thread):
                     groups["fixtures"].append((pid, cpu, rss))
                 elif comm == self.run_.bin:
                     groups["clients"].append((pid, cpu, rss))
-            sample = {"t": t, "pressure": self.run_.pressure_level(), "freePct": self.run_.free_pct()}
+            sample = {"t": t, "previousT": prev_wall, "pressure": self.run_.pressure_level(), "freePct": self.run_.free_pct()}
             current = {}
             for name, members in groups.items():
                 cpu_delta = 0.0
@@ -465,10 +488,10 @@ class Sampler(threading.Thread):
                         cpu_delta += cpu - prev.get(pid, 0.0) if pid in prev else cpu
                 sample[name] = {"procs": len(members), "rssMB": round(sum(m[2] for m in members) / 1024.0, 1)}
                 if prev_t is not None:
-                    sample[name]["cpuPct"] = round(max(0.0, cpu_delta) / (t - prev_t) * 100, 1)
-            prev, prev_t = current, t
+                    sample[name]["cpuPct"] = round(max(0.0, cpu_delta) / (tick - prev_t) * 100, 1)
+            prev, prev_t, prev_wall = current, tick, t
             self.samples.append(sample)
-            self.halt.wait(max(0.0, 1.0 - (time.time() - t)))
+            self.halt.wait(max(0.0, 1.0 - (time.monotonic() - tick)))
 
 
 class LockProbe(threading.Thread):
@@ -485,6 +508,7 @@ class LockProbe(threading.Thread):
         threading.Thread.__init__(self, daemon=True)   # one thread per lock: a long wait on one doesn't thin out the others
         self.path, self.mode, self.key = os.path.join(home, name), mode, key
         self.waits = []
+        self.error = None
         self.halt = halt
 
     @classmethod
@@ -496,16 +520,16 @@ class LockProbe(threading.Thread):
         while not self.halt.is_set():
             try:
                 fd = os.open(self.path, os.O_CREAT | os.O_RDWR, 0o600)
-            except OSError:
-                self.halt.wait(0.1)
-                continue
-            try:
-                started = time.monotonic()
-                fcntl.flock(fd, self.mode)
-                self.waits.append((time.time(), (time.monotonic() - started) * 1000))
-                fcntl.flock(fd, fcntl.LOCK_UN)
-            finally:
-                os.close(fd)
+                try:
+                    stamp = time.time()
+                    started = time.monotonic()
+                    fcntl.flock(fd, self.mode)
+                    self.waits.append((stamp, (time.monotonic() - started) * 1000))
+                finally:
+                    os.close(fd)
+            except OSError as e:
+                self.error = str(e)
+                break
             self.halt.wait(0.1)
 
 
@@ -594,8 +618,10 @@ class Run:
             elif comm.endswith("/WindowServer"):
                 snap["windowserverRssMB"] = round(rss / 1024.0, 1)
         if daemon:
-            out = subprocess.run(["lsof", "-n", "-P", "-p", str(daemon)], stdout=subprocess.PIPE, stderr=subprocess.DEVNULL).stdout
-            snap["daemonFds"] = max(0, len(out.splitlines()) - 1)
+            fds = subprocess.run(["lsof", "-n", "-P", "-p", str(daemon), "-Ff"],
+                                 stdout=subprocess.PIPE, stderr=subprocess.DEVNULL)
+            if fds.returncode == 0:
+                snap["daemonFds"] = sum(line[1:].isdigit() for line in fds.stdout.splitlines() if line.startswith(b"f"))
             th = subprocess.run(["ps", "-M", "-p", str(daemon)], stdout=subprocess.PIPE, stderr=subprocess.DEVNULL).stdout
             snap["daemonThreads"] = max(0, len(th.splitlines()) - 1)
         return snap
@@ -618,15 +644,22 @@ class Run:
     def stop_probes(self, window):
         with open(self.probe_stop, "w"):
             pass
-        try:
-            self.probe.wait(15)
-        except subprocess.TimeoutExpired:
-            self.probe.kill()
         self.sampler.halt.set()
         self.locks_halt.set()
+        probe_timeout = False
+        try:
+            self.probe.wait(22)
+        except subprocess.TimeoutExpired:
+            probe_timeout = True
+            self.probe.kill()
+            self.probe.wait()
         self.sampler.join(10)
+        if self.sampler.is_alive():
+            self.other_failures.append("resource sampler did not exit after its stop signal")
         for t in self.locks:
             t.join(10)
+            if t.is_alive() or t.error:
+                self.other_failures.append("%s lock probe: %s" % (t.key, t.error or "still waiting for the lock at teardown"))
         lo, hi = window
         shareable, shareable_err, probe_hung = [], None, 0
         for line in open(self.probe_out):
@@ -639,12 +672,22 @@ class Run:
             elif e.get("hung"):
                 probe_hung += 1
                 self.other_failures.append("SCShareableContent probe: no reply in 20 s (it exits; later samples are missing)")
-            elif e.get("ok") and lo <= e["t"] <= hi:
-                shareable.append(e["ms"])
-        samples = [s for s in self.sampler.samples if lo <= s["t"] <= hi]
+            elif lo <= e["t"] < hi:
+                if e.get("ok"):
+                    shareable.append(e["ms"])
+                else:
+                    self.other_failures.append("SCShareableContent probe: " + e["error"])
+        if probe_timeout:
+            shareable_err = "probe did not exit after its stop signal"
+        elif self.probe.returncode != 0 and shareable_err is None and not probe_hung:
+            shareable_err = "probe exited %d" % self.probe.returncode
+        if shareable_err is not None:
+            self.other_failures.append("SCShareableContent probe: " + shareable_err)
+        samples = [s for s in self.sampler.samples if lo <= s["t"] < hi]
+        cpu_samples = [s for s in samples if s["previousT"] is not None and s["previousT"] >= lo]
         resources = {}
         for group in ("daemon", "windowserver", "dock", "fixtures", "clients"):
-            cpu = [s[group]["cpuPct"] for s in samples if "cpuPct" in s[group]]
+            cpu = [s[group]["cpuPct"] for s in cpu_samples]
             rss = [s[group]["rssMB"] for s in samples]
             procs = [s[group]["procs"] for s in samples]
             resources[group] = {"cpuPctMean": round(sum(cpu) / len(cpu), 1) if cpu else None,
@@ -652,18 +695,19 @@ class Run:
                                 "rssMBMean": round(sum(rss) / len(rss), 1) if rss else None,
                                 "rssMBMax": max(rss) if rss else None,
                                 "procsMax": max(procs) if procs else 0}
-        fixtures = max((s["fixtures"]["procs"] for s in samples), default=0)
-        if fixtures and resources["fixtures"]["rssMBMean"] is not None:
-            resources["fixtures"]["rssMBPerApp"] = round(resources["fixtures"]["rssMBMax"] / fixtures, 1)
+        per_app_rss = [s["fixtures"]["rssMB"] / s["fixtures"]["procs"] for s in samples if s["fixtures"]["procs"]]
+        if per_app_rss:
+            resources["fixtures"]["rssMBPerApp"] = round(max(per_app_rss), 1)
         pressure = [s["pressure"] for s in samples if s["pressure"] is not None]
         free = [s["freePct"] for s in samples if s["freePct"] is not None]
         memory = {"pressureLevelMax": max(pressure) if pressure else None,
                   "pressureLevels": "1 normal, 2 warn, 4 critical",
                   "freePctMin": min(free) if free else None,
                   "swapUsedMBStart": self.swap_start, "swapUsedMBEnd": self.swap_used_mb()}
-        locks = dict((t.key, stats([ms for at, ms in t.waits if lo <= at <= hi], 3)) for t in self.locks)
+        locks = dict((t.key, stats([ms for at, ms in t.waits if lo <= at < hi], 3)) for t in self.locks)
         return {"resources": resources, "memory": memory, "resourceSamples": len(samples),
-                "shareableContentMs": stats(shareable) if shareable_err is None else {"n": 0, "error": shareable_err},
+                "cpuResourceSamples": len(cpu_samples),
+                "shareableContentMs": stats(shareable) if shareable_err is None else {**stats(shareable), "error": shareable_err},
                 "shareableContentHung": probe_hung,
                 "lockWaitMs": locks}
 
@@ -687,8 +731,8 @@ class Run:
         for cfg in cfgs:
             path = os.path.join(cfg["dir"], "worker-%s.json" % cfg["session"])
             write_json(path, cfg)
-            log = open(os.path.join(cfg["dir"], "worker-%s.log" % cfg["session"]), "w")
-            p = subprocess.Popen([sys.executable, os.path.abspath(__file__), "worker", path], stdout=log, stderr=subprocess.STDOUT)
+            with open(os.path.join(cfg["dir"], "worker-%s.log" % cfg["session"]), "w") as log:
+                p = subprocess.Popen([sys.executable, os.path.abspath(__file__), "worker", path], stdout=log, stderr=subprocess.STDOUT)
             self.children.append(p)
             procs.append(p)
         return procs
@@ -707,12 +751,14 @@ class Run:
         deadline = time.time() + timeout
         for p in procs:
             try:
-                p.wait(max(1, deadline - time.time()))
+                if p.wait(max(0, deadline - time.time())) != 0:
+                    self.other_failures.append("worker %s exited %d" % (p.args[-1], p.returncode))
             except subprocess.TimeoutExpired:
                 p.kill()
+                p.wait()
                 self.other_failures.append("worker %s timed out" % p.args[-1])
 
-    def collect(self, cfgs, window, steady_end=None):
+    def collect(self, cfgs, steady_end=None):
         """Merge worker results: latency per op inside the measured window, errors and checks."""
         by_op, errors_by_op, checks, counts, tail_ops = {}, {}, [], {}, 0
         resolutions = {}
@@ -722,17 +768,24 @@ class Run:
             except (OSError, ValueError):
                 checks.append({"gate": "other", "name": "worker result", "ok": False, "detail": cfg["session"], "session": cfg["session"]})
                 continue
+            measured_ops = set()
             for op, t, ms, good in r["events"]:
-                if steady_end is not None and t < 0:
-                    continue  # the launch before the window opens; reported as launchMs
-                # By start time: a command started inside the window counts however long it took.
-                if steady_end is not None and t - ms / 1000.0 > steady_end:
-                    tail_ops += 1
-                    continue
+                if steady_end is not None:
+                    if t < 0 or op in ("launch", "stop"):
+                        continue
+                    # Count commands that start in the measured window, even if they finish later.
+                    if t >= steady_end:
+                        tail_ops += 1
+                        continue
                 if good:
                     by_op.setdefault(op, []).append(ms)
+                    measured_ops.add(op)
                 else:
                     errors_by_op[op] = errors_by_op.get(op, 0) + 1
+            primary_op = {"input": "type", "capture": "screenshot"}.get(cfg["role"])
+            if steady_end is not None and primary_op and primary_op not in measured_ops:
+                checks.append({"gate": "other", "name": "no successful measured " + primary_op,
+                               "ok": False, "detail": "", "session": cfg["session"]})
             for c in r["checks"]:
                 c["session"] = cfg["session"]
                 checks.append(c)
@@ -797,13 +850,15 @@ class Run:
         tail = min(5.0, max(2.0, self.a.duration / 4))
         late = {c["session"]: end + tail for c in cfgs if c["index"] % 2 == 1}
         neighbor = {}
-        if self.n > 1:
-            for i, c in enumerate(cfgs):
-                neighbor[c["session"]] = ready[cfgs[(i + 1) % self.n]["session"]]
-        write_json(cfgs[0]["go"], {"start": start, "end": end, "late": late, "neighbor": neighbor})
-        self.wait_exit(procs, self.a.duration + tail + 180)
+        participants = [c["session"] for c in cfgs if c["session"] not in failed]
+        if len(participants) > 1:
+            for i, session in enumerate(participants):
+                neighbor[session] = ready[participants[(i + 1) % len(participants)]]
+        write_json(cfgs[0]["go"], {"start": start, "end": end, "late": late, "neighbor": neighbor,
+                                   "participants": participants, "early": [s for s in participants if s not in late]})
+        self.wait_exit(procs, self.a.duration + tail + 310)
         probes = self.stop_probes((start, end))
-        by_op, errs, checks, counts, resolutions, tail_ops = self.collect(cfgs, (start, end), steady_end=self.a.duration)
+        by_op, errs, checks, counts, resolutions, tail_ops = self.collect(cfgs, steady_end=self.a.duration)
         self.settle(name)
         total = sum(len(v) for v in by_op.values())
         result = {"sessions": self.n, "roles": {r: roles.count(r) for r in set(roles)}, "durationS": self.a.duration,
@@ -840,7 +895,7 @@ class Run:
             with open(cfgs[0]["release"], "w"):
                 pass
             self.wait_exit(procs, 180)
-            by_op, e, checks, _, _, _ = self.collect(cfgs, None)
+            by_op, e, checks, _, _, _ = self.collect(cfgs)
             launch += by_op.get("launch", [])
             stop += by_op.get("stop", [])
             for op, k in e.items():
@@ -912,8 +967,8 @@ class Run:
         meta["daemonStartMs"] = round(ms, 1)
         _, code, status, _ = self.ctl(["status"], 30)
         meta["daemon"] = (status or {}).get("daemon")
-        displays = subprocess.run([a.probe, "displays"], stdout=subprocess.PIPE).stdout.decode()
-        meta["displays"] = json.loads(displays).get("displays") if displays.strip() else None
+        displays = subprocess.run([a.probe, "displays"], stdout=subprocess.PIPE, check=True).stdout
+        meta["displays"] = json.loads(displays)["displays"]
         anchor_env = ["--env", "TESTAPP_LOG=%s" % os.path.join(self.work, "anchor.log"), "--env", "TESTAPP_MARKER=anchor"]
         if a.accessory:
             anchor_env += ["--env", "TESTAPP_ACCESSORY=1"]
@@ -952,6 +1007,8 @@ class Run:
         meta["finalStop"] = {"ms": round(ms, 1), "ok": ok(code, data),
                              "daemonGone": not (self.daemon_pid() and ident(self.daemon_pid())),
                              "fixturesLeft": self.fixtures_alive()}
+        if not meta["finalStop"]["ok"]:
+            self.other_failures.append("final anchor stop failed: " + out.strip()[:300])
         if meta["finalStop"]["fixturesLeft"] or not meta["finalStop"]["daemonGone"]:
             self.other_failures.append("after the last stop: daemon gone=%s, fixtures left %s" % (meta["finalStop"]["daemonGone"], meta["finalStop"]["fixturesLeft"]))
         meta["finishedAt"] = datetime.datetime.now().isoformat(timespec="seconds")
@@ -1061,7 +1118,7 @@ def finalize(out, watch_out, status):
         print("no results at %s" % path)
         return 1
     text = open(watch_out).read() if os.path.exists(watch_out) else ""
-    passed = status == 0 and "PASS" in text
+    passed = status == 0 and "watch: PASS — no interference observed" in text.splitlines()
     r["watchdog"] = {"passed": passed, "exitStatus": status, "output": text.strip().splitlines()[-20:]}
     r["passed"] = r["passed"] and passed
     write_json(path, r)
@@ -1108,6 +1165,17 @@ def main():
     if a.accessory and set(a.workloads) & {"capture", "mixed"}:
         p.error("--accessory can't be used with capture or mixed: screenshots of .accessory fixtures failed with "
                 "'no visible windows on the agent display'. Use idle,input,launch,cycles.")
+    if len(set(a.workloads)) != len(a.workloads):
+        p.error("workloads must not be repeated")
+    for option in ("duration", "scale", "op_timeout"):
+        value = getattr(a, option)
+        if not math.isfinite(value) or value <= 0:
+            p.error("--%s must be finite and positive" % option.replace("_", "-"))
+    for option in ("rounds", "cycles", "shareable_interval_ms"):
+        if getattr(a, option) < 1:
+            p.error("--%s must be positive" % option.replace("_", "-"))
+    if a.capture_sessions is not None and not 0 <= a.capture_sessions <= a.sessions:
+        p.error("--capture-sessions must be between 0 and sessions")
     if a.sessions < 1:
         p.error("sessions must be at least 1")
     if a.sessions > 4 and not a.dedicated:

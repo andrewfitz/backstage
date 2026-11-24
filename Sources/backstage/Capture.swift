@@ -16,9 +16,9 @@ enum CaptureTarget {
 ///   client that has finished its calls but is still running can still collide with the next one;
 ///   then the same lock shared by every BACKSTAGE_HOME (`userCaptureLock`): the hang doesn't care
 ///   which daemon a process belongs to;
-/// - an attempt that doesn't answer within `captureAttemptTimeout` gives up the lock and runs the
-///   command again once in a fresh process image (`retryCaptureInFreshProcess`), which ends the
-///   stuck call;
+/// - an attempt that doesn't answer within `captureAttemptTimeout` runs the command again once
+///   in a fresh process image (`retryCaptureInFreshProcess`), which ends the stuck call and
+///   closes both locks on exec;
 /// - ScreenCaptureKit sometimes fails a capture with a spurious "user declined" (-3801) while
 ///   other sessions capture; that is retried once.
 let captureAttemptTimeout = 4.0
@@ -30,15 +30,17 @@ private struct CaptureTimedOut: Error {}
 func capture(_ target: CaptureTarget, to url: URL, scale: Double) throws -> CGSize {
     guard scale.isFinite, scale > 0 else { throw CLIError("scale must be positive and finite") }
     var declinedRetries = 1
-    var image: CGImage?
-    while image == nil {
+    let img: CGImage
+    while true {
         if captureLock == nil { captureLock = try StateLock("capture.lock") }
-        if userCaptureLock == nil { userCaptureLock = UserLock("capture.lock") }
+        if userCaptureLock == nil {
+            guard let lock = UserLock("capture.lock") else { throw CLIError("cannot lock ScreenCaptureKit for this user") }
+            userCaptureLock = lock
+        }
         do {
-            image = try runAsync(timeout: captureAttemptTimeout, onTimeout: CaptureTimedOut()) { try await grab(target, scale: scale) }
+            img = try runAsync(timeout: captureAttemptTimeout, onTimeout: CaptureTimedOut()) { try await grab(target, scale: scale) }
+            break
         } catch is CaptureTimedOut {
-            userCaptureLock?.release(); userCaptureLock = nil
-            captureLock?.release(); captureLock = nil
             try retryCaptureInFreshProcess()
         } catch let error as NSError where error.domain == SCStreamErrorDomain
                     && error.code == SCStreamError.Code.userDeclined.rawValue && declinedRetries > 0 {
@@ -46,7 +48,6 @@ func capture(_ target: CaptureTarget, to url: URL, scale: Double) throws -> CGSi
             usleep(200_000)
         }
     }
-    let img = image!
     let isJPG = ["jpg", "jpeg"].contains(url.pathExtension.lowercased())
     let type = isJPG ? UTType.jpeg : UTType.png
     // Encode to a sibling file so large screenshots need no in-memory encoded copy
@@ -65,7 +66,8 @@ func capture(_ target: CaptureTarget, to url: URL, scale: Double) throws -> CGSi
 
 /// A ScreenCaptureKit call that hangs stays hung until its process goes away, and keeps later
 /// captures hanging while it lives. Run this same command again, once, in a fresh process image:
-/// `exec` ends the stuck call, and capture.lock (close-on-exec) is already given up.
+/// `exec` ends the stuck call and closes the lock descriptors. Releasing either lock earlier
+/// could let another process enter ScreenCaptureKit while the stuck call is still alive.
 private func retryCaptureInFreshProcess() throws -> Never {
     let marker = "BACKSTAGE_CAPTURE_RETRY"
     guard ProcessInfo.processInfo.environment[marker] == nil else {
@@ -78,6 +80,7 @@ private func retryCaptureInFreshProcess() throws -> Never {
     setenv(marker, "1", 1)
     fflush(stdout); fflush(stderr)
     let argv: [UnsafeMutablePointer<CChar>?] = CommandLine.arguments.map { strdup($0) } + [nil]
+    defer { argv.forEach { free($0) } }
     execv(path, argv)
     throw CLIError("ScreenCaptureKit did not answer, and the retry could not start: \(String(cString: strerror(errno)))")
 }

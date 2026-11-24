@@ -127,7 +127,8 @@ it changed shape:
 
 Acquisition order: client → lifecycle → session → app → state. A launch still holds
 `lifecycle.lock` (shared) while LaunchServices identifies the new process: an unregistered app
-must not outlive the display. That wait (up to ~15 s) blocks daemon shutdown and `stop --all`.
+must not outlive the display. That wait (up to 60 s, 120 s under heavy load; see `launch` in
+USAGE.md) blocks daemon shutdown and `stop --all`.
 It used to block other sessions too: a `stop` waited for `lifecycle.lock` exclusively while
 holding `client.lock`, so every other session's launch queued behind it. `stop` now only
 tries the lock and, if a launch is in flight, leaves the daemon to its idle timer.

@@ -127,18 +127,24 @@ silent until it's relaunched. Measuring needs System Audio Recording (see
 
 ## Menu bar indicator
 
-While agents have apps running, a menu bar icon shows how many apps are running. It
-disappears when nothing is running, and goes away entirely when the daemon exits. While an
-app launched with `--audio` is making sound (muted, so you don't hear it), the icon turns into a small level
-meter, five bars of the loudest app's recent level; with Reduce Motion on, it shows a still
-waveform instead. The item's width never changes. The menu shows:
+While agents have apps running, an icon sits in the menu bar: a display behind a display, with
+the number of running apps beside it. It disappears when nothing is running, and goes away
+entirely when the daemon exits. Its tooltip says who is using how many apps. While an app
+launched with `--audio` is making sound (muted, so you don't hear it), the icon turns into a
+small level meter, five bars of the loudest app's recent level; with Reduce Motion on, it shows
+a still waveform instead. The icon's box never changes size. The menu shows:
 
-- a **live thumbnail** of the hidden agent display, refreshed every second while the menu is open
-- **stats:** agent sessions, apps, windows, and how long Backstage has been running
-- **each app**, with the agent that launched it (claude, codex, grok…), its age, and (for apps
-  launched with `--audio`) whether it's playing audio or silent. Its submenu has **Show on My Screen** (the same as `backstage show`)
-  and **Quit**
+- a **live picture** of the hidden agent display, refreshed every second while the menu is open.
+  Point at an app's row and its windows are picked out in the picture
+- **each app**, grouped by the agent session that launched it ("Claude — myproject": the agent,
+  then the name given with `BACKSTAGE_SESSION` or the folder the agent works in), with how long
+  it has been running, and a note if it has no windows or is playing sound (apps launched with
+  `--audio`). Its submenu has **Show on My Screen** (the same as `backstage show`), **Quit**
+  (hold Option for **Force Quit**), and its bundle ID and process ID
 - **Open Screenshots & Logs Folder**, and **Quit All Agent Apps**
+- a quiet footer with the version and a link to this repository
+
+Long app and session names are shortened in the middle, so nothing widens the menu.
 
 The daemon runs as a menu-bar-only app: no Dock icon, and it never takes focus. Set
 `BACKSTAGE_MENUBAR=off` to run without the icon.

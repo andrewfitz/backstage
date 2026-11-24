@@ -96,21 +96,22 @@ Refs look like w8432.3.1 (window ID, then child indices). Re-run tree/find after
 /// most recent launch. Every app-targeting command goes through here, so this is the one
 /// ownership check. Element refs resolve inside the selected app, so they're covered too.
 func managedApp(_ args: Args) throws -> ManagedApp {
-    let apps = try AppStore.read()
     let me = try Session.current().id
-    let mine = apps.filter { $0.session == me }
     if let p = args.int("pid") {
-        guard let a = apps.first(where: { $0.pid == p }) else { throw CLIError("pid \(p) is not a live managed app") }
+        guard let a = try AppStore.read(matching: { $0.pid == p }).first else { throw CLIError("pid \(p) is not a live managed app") }
         // Legacy records (from before sessions) have no owner, so an explicit PID still reaches them.
-        guard a.session == me || a.session == nil else {
+        guard a.session == nil || Session.sameID(a.session, me) else {
             throw CLIError("pid \(p) belongs to another backstage session; a session can only use apps it launched (see `backstage list`)")
         }
         return a
     }
+    let mine = try AppStore.read(matching: { Session.sameID($0.session, me) })
     if let name = args.opt("app") {
         let n = name.lowercased()
-        guard let a = mine.last(where: { $0.name.lowercased() == n || $0.bundleID?.lowercased() == n })
-                ?? mine.last(where: { $0.name.lowercased().contains(n) }) else {
+        guard let a = mine.reversed().lazy.filter({ $0.name.lowercased() == n || $0.bundleID?.lowercased() == n })
+                    .max(by: { $0.launchedAt < $1.launchedAt })
+                ?? mine.reversed().lazy.filter({ $0.name.lowercased().contains(n) })
+                    .max(by: { $0.launchedAt < $1.launchedAt }) else {
             throw CLIError("no managed app matching '\(name)' in this session. Yours: \(mine.map { "\($0.name)(\($0.pid))" }.joined(separator: ", "))")
         }
         return a
@@ -137,6 +138,7 @@ func requireInputGuard() throws {
         throw CLIError("the backstage daemon isn't running, and without its input guard the user's typing could reach this app "
             + "while one of its menus is open; `backstage stop --all`, then launch the app again")
     }
+    if d.protocolMismatch { throw daemonVersionError(d) }
     guard let up = d.inputGuard else {
         throw CLIError("the running backstage daemon (pid \(d.pid)) is from an older build without the input guard; "
             + "run `backstage stop --all` (quits every managed app) to replace it, then retry")
@@ -212,7 +214,7 @@ func cmdScreenshot(_ args: Args) throws -> [String: Any] {
     if args.has("full") {
         // The display is shared: capture every window of this session's apps (and nothing
         // else, from the same window snapshot), over the whole display.
-        let pids = Set(try AppStore.read().filter { $0.session == me }.map { $0.pid })
+        let pids = Set(try AppStore.read(matching: { Session.sameID($0.session, me) }).map(\.pid))
         guard !pids.isEmpty else { throw CLIError("no managed apps in this session; --full captures all of your session's apps, so launch one first") }
         let size = try capture(.apps(pids, display: d.displayID, crop: vd), to: out, scale: scale)
         return ["path": out.path, "width": Int(size.width), "height": Int(size.height), "origin": ["x": 0, "y": 0], "scale": scale,
@@ -277,15 +279,19 @@ func cmdWindow(_ args: Args, pid: pid_t) throws -> [String: Any] {
     // Move, resize, move again: the system may constrain a resize by where the window is.
     w.setPosition(target.origin)
     let rc = w.setSize(target.size)
+    guard rc == .success else {
+        w.setPosition(current.origin)
+        throw CLIError("could not resize window \(spec) (AXError \(rc.rawValue)); it may not be resizable")
+    }
     w.setPosition(target.origin)
-    guard rc == .success else { throw CLIError("could not resize window \(spec) (AXError \(rc.rawValue)); it may not be resizable") }
     pump(0.1)
-    let got = w.frame ?? target
+    guard let got = w.frame else { throw CLIError("could not read window \(spec) frame after resize") }
     var res: [String: Any] = ["ok": true, "pid": pid, "window": windowRef(w, index: Int(spec) ?? 0),
                               "frame": rectDict(got.offsetBy(dx: -d.bounds.minX, dy: -d.bounds.minY))]
-    if abs(got.width - target.width) > 1 || abs(got.height - target.height) > 1 {
+    if abs(got.width - target.width) > 1 || abs(got.height - target.height) > 1
+        || abs(got.minX - target.minX) > 1 || abs(got.minY - target.minY) > 1 {
         res["requested"] = rectDict(target.offsetBy(dx: -d.bounds.minX, dy: -d.bounds.minY))
-        res["note"] = "the app limited the window's size (minimum/maximum size or a fixed-size window)"
+        res["note"] = "the app or system constrained the window's frame"
     }
     return res
 }
@@ -301,23 +307,23 @@ func cmdTree(_ args: Args) throws {
     } else {
         var n = 0
         try walkTree(pid: pid, window: args.opt("window"), maxDepth: depth) { i, _ in
-            // Skip anonymous leaf-ish groups to keep output compact.
             print(i.line(origin: d.bounds.origin)); n += 1; return true
         }
         if n == 0 { print("(no windows — is the app still loading? try `backstage windows`)") }
     }
 }
 
+/// The query strings are normalized once per command, outside the AX traversal.
 func matches(_ i: ElementInfo, role: String?, text: String?) -> Bool {
-    if let role, !i.role.lowercased().contains(role.lowercased()) && i.subrole?.lowercased().contains(role.lowercased()) != true { return false }
-    if let text, !i.label.lowercased().contains(text.lowercased()) { return false }
+    if let role, !i.role.lowercased().contains(role) && i.subrole?.lowercased().contains(role) != true { return false }
+    if let text, !i.label.lowercased().contains(text) { return false }
     return true
 }
 
 func cmdFind(_ args: Args) throws -> [String: Any] {
     let d = try requireDaemon()
     let pid = try managedPid(args)
-    let role = args.opt("role"), text = args.opt("text") ?? args.pos(0)
+    let role = args.opt("role")?.lowercased(), text = (args.opt("text") ?? args.pos(0))?.lowercased()
     var out: [[String: Any]] = []
     try walkTree(pid: pid, window: args.opt("window"), maxDepth: 60) { i, _ in
         if matches(i, role: role, text: text) { out.append(i.json(origin: d.bounds.origin)) }
@@ -327,29 +333,32 @@ func cmdFind(_ args: Args) throws -> [String: Any] {
 }
 
 func cmdWait(_ args: Args) throws -> [String: Any] {
-    let d = try requireDaemon()
-    let pid = try managedPid(args)
     let role = args.opt("role"), text = args.opt("text") ?? args.pos(0)
     guard role != nil || text != nil else { throw CLIError("wait needs --text and/or --role") }
+    let d = try requireDaemon()
+    let pid = try managedPid(args)
+    let normalizedRole = role?.lowercased(), normalizedText = text?.lowercased()
+    let timeout = args.double("timeout") ?? 10
     let gone = args.has("gone")
-    let t0 = Date()
-    let found: [String: Any]? = try waitFor(timeout: args.double("timeout") ?? 10, interval: 0.2) {
+    let t0 = ProcessInfo.processInfo.systemUptime
+    let found: [String: Any]? = try waitFor(timeout: timeout, interval: 0.2) {
         var hit: ElementInfo?
         try walkTree(pid: pid, window: args.opt("window"), maxDepth: 60) { i, _ in
-            if matches(i, role: role, text: text) { hit = i; return false }
+            if matches(i, role: normalizedRole, text: normalizedText) { hit = i; return false }
             return true
         }
         if gone { return hit == nil ? ["gone": true] : nil }
         return hit.map { $0.json(origin: d.bounds.origin) }
     }
-    guard let found else { throw CLIError("timed out after \(args.double("timeout") ?? 10)s waiting for \(gone ? "disappearance of " : "")\(text ?? "") \(role ?? "")") }
-    return ["ok": true, "element": found, "seconds": (Date().timeIntervalSince(t0) * 100).rounded() / 100]
+    guard let found else { throw CLIError("timed out after \(timeout)s waiting for \(gone ? "disappearance of " : "")\(text ?? "") \(role ?? "")") }
+    return ["ok": true, "element": found, "seconds": ((ProcessInfo.processInfo.systemUptime - t0) * 100).rounded() / 100]
 }
 
 func cmdList(_ args: Args) throws -> [String: Any] {
     let origin = liveDaemon()?.bounds.origin ?? .zero
     let me = try Session.current().id
-    let apps = try AppStore.read().filter { args.has("all") || $0.session == me }.map { a -> [String: Any] in
+    let all = args.has("all")
+    let apps = try AppStore.read(matching: { all || Session.sameID($0.session, me) }).map { a -> [String: Any] in
         var d: [String: Any] = ["pid": a.pid, "name": a.name, "path": a.path, "session": a.owner,
                                 "windows": axWindowsSummary(a.pid, origin: origin)]
         if let b = a.bundleID { d["bundleID"] = b }
@@ -364,6 +373,15 @@ func cmdList(_ args: Args) throws -> [String: Any] {
     var out: [String: Any] = ["session": me, "apps": apps]
     let failures = recentAudioFailures(session: me, live: Set(apps.compactMap { $0["pid"] as? Int32 }))
     if !failures.isEmpty { out["audioFailures"] = failures }
+    // Launches that gave up waiting for their app: the daemon registers the app here if it starts.
+    let pending = Launching.records().filter { $0.handedOver == true && (all || Session.sameID($0.session, me)) }
+        .sorted { $0.startedAt < $1.startedAt }
+        .map { r -> [String: Any] in
+            ["launch": r.id, "path": r.executable ?? r.bundle, "log": r.log, "session": r.session,
+             "startedAt": ISO8601DateFormatter().string(from: Date(timeIntervalSince1970: r.startedAt)),
+             "until": ISO8601DateFormatter().string(from: Date(timeIntervalSince1970: r.startedAt + Launching.handOverWindow))]
+        }
+    if !pending.isEmpty { out["pendingLaunches"] = pending }
     return out
 }
 
@@ -374,8 +392,10 @@ func cmdStatus(doctor: Bool = false) throws -> [String: Any] {
         "accessibility": accessibility,
         "screenRecording": recording,
         "home": Paths.dir.path,
+        "version": backstageVersion,
     ]
-    if let d = liveDaemon() {
+    let live = liveDaemon()
+    if let d = live {
         var daemon: [String: Any] = ["pid": d.pid, "displayID": d.displayID, "size": ["w": Int(d.width), "h": Int(d.height)],
                                      "globalOrigin": ["x": Int(d.x), "y": Int(d.y)]]
         if let source = d.sizeSource { daemon["sizeSource"] = source }
@@ -402,13 +422,14 @@ func cmdStatus(doctor: Bool = false) throws -> [String: Any] {
         s["session"] = ["error": "\(error)"]
     }
     s["managedApps"] = try AppStore.read().map { ["pid": $0.pid, "name": $0.name, "session": $0.owner] }
-    let audio = doctor ? audioDoctor() : audioSummary(liveDaemon())
+    let audio = doctor ? audioDoctor() : audioSummary(live)
     s["audio"] = audio
     var problems: [String] = []
-    if doctor { problems += audioProblems(audio) }
-    else if !audioProblems(audio).isEmpty { s["warnings"] = audioProblems(audio) }
+    let audioIssues = audioProblems(audio)
+    if doctor { problems += audioIssues }
+    else if !audioIssues.isEmpty { s["warnings"] = audioIssues }
     if !accessibility { problems.append("Accessibility not granted: System Settings > Privacy & Security > Accessibility — enable the app that runs this CLI (your terminal / agent host).") }
-    if let d = liveDaemon(), d.inputGuard != true {
+    if let d = live, d.inputGuard != true {
         problems.append("The daemon's input guard isn't running (see \(Paths.log.path)), so input commands refuse to run. Check Accessibility, then `backstage stop --all`.")
     }
     if !recording { problems.append("Screen Recording not granted: System Settings > Privacy & Security > Screen & System Audio Recording — enable the terminal / agent host, then restart it.") }
@@ -422,7 +443,9 @@ func cmdQuit(_ args: Args) throws -> [String: Any] {
     let pid = target.pid
     let lock = try Locks.session(target.owner)
     defer { lock.release() }
-    guard let record = try AppStore.read().first(where: { $0.pid == pid && $0.processStart == target.processStart }) else {
+    guard let record = try AppStore.read(matching: {
+        $0.pid == pid && $0.processStart == target.processStart && Session.sameID($0.owner, target.owner)
+    }).first else {
         return ["ok": true, "note": "already gone"]
     }
     let force = args.has("force")
@@ -440,8 +463,8 @@ func cmdQuit(_ args: Args) throws -> [String: Any] {
 }
 
 func cmdLogs(_ args: Args) throws {
-    let pid = try managedPid(args)
-    guard let a = try AppStore.read().first(where: { $0.pid == pid }), let path = a.stdout else { throw CLIError("no log for pid \(pid)") }
+    let app = try managedApp(args)
+    guard let path = app.stdout else { throw CLIError("no log for pid \(app.pid)") }
     let n = args.int("lines") ?? 100
     let file = try FileHandle(forReadingFrom: URL(fileURLWithPath: path))
     defer { try? file.close() }
@@ -492,13 +515,22 @@ func run() throws {
     var input: (pid: pid_t, lock: StateLock)?
     if ["press", "focus", "action", "set", "click", "hover", "drag", "scroll", "type", "key", "menu", "window"].contains(cmd) {
         let app = try managedApp(args)
+        let lock = try Locks.app(app)
+        // A handoff may have completed while this input command was waiting for the app lock.
+        guard try !AppStore.read(matching: {
+            $0.pid == app.pid && $0.processStart == app.processStart && Session.sameID($0.owner, app.owner)
+        }).isEmpty else {
+            throw CLIError("pid \(app.pid) is no longer a live managed app in this session")
+        }
         if cmd != "window" { try requireInputGuard() }
-        input = (app.pid, try Locks.app(app))
+        input = (app.pid, lock)
     }
     defer { input?.lock.release() }
     func inputTarget() throws -> pid_t { try input?.pid ?? managedPid(args) }
 
     switch cmd {
+    case "__menu-thumbnail":
+        try runMenuThumbnail(args)
     case "__guard-selftest":
         let result = guardSelfTest()
         emit(result)
@@ -549,6 +581,7 @@ func run() throws {
         Daemon.shared = d
         try d.run()
     case "help", "-h", "--help": print(usage)
+    case "version", "--version": print("backstage \(backstageVersion)")
     case "start": let d = try ensureDaemon(); emit(["ok": true, "pid": d.pid, "displayID": d.displayID])
     case "stop":
         let result = try args.has("all") ? stopAll() : stopSession()
@@ -655,7 +688,7 @@ func run() throws {
         let pid = try inputTarget()
         let keys = try args.positional.map(parseCombo)
         try focusRef(args.opt("ref"), pid: pid)
-        for key in keys { postKey(pid: pid, key: key) }
+        postKeys(pid: pid, keys: keys)
         pump(0.1); emit(["ok": true])
     case "menu":
         let pid = try inputTarget()

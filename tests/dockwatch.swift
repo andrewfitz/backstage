@@ -57,7 +57,11 @@ case "watch":
     let start = now()
     var present = Set<String>(), shows = 0, samples = 0, last = 0.0, maxGap = 0.0
     // Items already in the Dock (e.g. a pinned app with the same name) don't count.
-    let preexisting = Set(dockTitles().filter { t in wanted.contains { t.localizedCaseInsensitiveContains($0) } })
+    let initialTitles = dockTitles()
+    guard counts.contains(where: { $0 > 0 }) else {
+        print("could not read any Dock items through Accessibility"); exit(2)
+    }
+    let preexisting = Set(initialTitles.filter { t in wanted.contains { t.localizedCaseInsensitiveContains($0) } })
     if !preexisting.isEmpty { print("preexisting \(preexisting.sorted())") }
     print("watching")
     while !FileManager.default.fileExists(atPath: stop) && now() - start < maxSecs * 1000 {
@@ -69,6 +73,9 @@ case "watch":
         for h in present.subtracting(hits) { print("gone \(h) at \(Int(t - start))ms") }
         present = hits
         usleep(10_000)
+    }
+    guard FileManager.default.fileExists(atPath: stop) else {
+        print("timed out before the Dock test finished"); exit(2)
     }
     print("shows=\(shows) samples=\(samples) maxgap=\(Int(maxGap))ms")
 case "type":

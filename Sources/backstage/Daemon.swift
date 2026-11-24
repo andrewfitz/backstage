@@ -4,12 +4,12 @@ import ApplicationServices
 import CBackstageAudio
 
 /// Place a window inside the agent display, cascading by `slot`, shrinking it if it doesn't fit.
-func placeOnAgentDisplay(_ w: AXUIElement, display b: CGRect, slot: Int) {
+func placeOnAgentDisplay(_ w: AXUIElement, display b: CGRect, slot: Int, size: CGSize? = nil) {
     let margin: CGFloat = 40, top: CGFloat = 60
     let off = CGFloat(slot % 8) * 30
     let insetX = min(margin, b.width / 10), insetY = min(top, b.height / 10)
     var x = insetX + off, y = insetY + off
-    if let s = w.size {
+    if let s = size ?? w.size {
         let maxW = b.width - insetX * 2, maxH = b.height - insetY * 2
         x = min(x, b.width - min(s.width, maxW) - insetX)
         y = min(y, b.height - min(s.height, maxH) - insetY)
@@ -56,6 +56,24 @@ func freeSpot(_ size: CGSize, occupied: [CGRect], display b: CGRect) -> CGPoint?
     return nil
 }
 
+/// One AX request for the geometry and minimized state needed by the window guard.
+private func guardWindowState(_ window: AXUIElement) -> (frame: CGRect, minimized: Bool)? {
+    AXUIElementSetMessagingTimeout(window, guardAXTimeout)
+    let attributes = [kAXPositionAttribute, kAXSizeAttribute, kAXMinimizedAttribute] as CFArray
+    var values: CFArray?
+    guard AXUIElementCopyMultipleAttributeValues(window, attributes, [], &values) == .success,
+          let values = values as? [AnyObject], values.count == 3 else { return nil }
+    if (values[2] as? Bool) == true { return (.null, true) }
+    guard CFGetTypeID(values[0]) == AXValueGetTypeID(), CFGetTypeID(values[1]) == AXValueGetTypeID() else { return nil }
+    var position = CGPoint.zero
+    var size = CGSize.zero
+    guard AXValueGetValue(values[0] as! AXValue, .cgPoint, &position),
+          AXValueGetValue(values[1] as! AXValue, .cgSize, &size) else { return nil }
+    return (CGRect(origin: position, size: size), false)
+}
+
+private let guardAXTimeout: Float = 0.1
+
 /// Move every window of `pid` that is not already on the agent display onto it.
 @discardableResult
 func adoptWindows(pid: pid_t, display b: CGRect, slotBase: Int = 0) -> Int {
@@ -65,6 +83,18 @@ func adoptWindows(pid: pid_t, display b: CGRect, slotBase: Int = 0) -> Int {
         if b.contains(f) { continue }
         if (w.attr(kAXMinimizedAttribute) as? Bool) == true { continue }
         placeOnAgentDisplay(w, display: b, slot: slotBase + i)
+        moved += 1
+    }
+    return moved
+}
+
+private func adoptVisibleWindows(pid: pid_t, display b: CGRect) -> Int {
+    var moved = 0
+    let app = AXUIElementCreateApplication(pid)
+    AXUIElementSetMessagingTimeout(app, guardAXTimeout)
+    for (i, w) in app.windows.enumerated() {
+        guard let state = guardWindowState(w), !state.minimized, !b.contains(state.frame) else { continue }
+        placeOnAgentDisplay(w, display: b, slot: Int(pid % 5) + i, size: state.frame.size)
         moved += 1
     }
     return moved
@@ -119,10 +149,13 @@ final class Daemon {
         display = try AgentDisplay(width: w, height: h, scale: scale)
     }
 
+    private let logLock = NSLock()
+    private let logDateFormatter = ISO8601DateFormatter()
+
     func log(_ s: String) {
-        let line = "\(ISO8601DateFormatter().string(from: Date())) \(s)\n"
-        if let h = try? FileHandle(forWritingTo: Paths.log) { h.seekToEndOfFile(); h.write(line.data(using: .utf8)!); try? h.close() }
-        else { try? line.write(to: Paths.log, atomically: true, encoding: .utf8) }
+        logLock.lock()
+        defer { logLock.unlock() }
+        appendLogLine("\(logDateFormatter.string(from: Date())) \(s)\n", to: Paths.log)
     }
 
     func run() throws -> Never {
@@ -147,11 +180,11 @@ final class Daemon {
                 if let back = self.lastUserApp, !back.isTerminated { back.activate() }
             } else {
                 self.lastUserApp = app
-                self.inputGuard.update(managed: self.managed, userPid: app.processIdentifier)
+                self.inputGuard.updateUser(app.processIdentifier)
             }
         }
         // Keep the user's input out of managed apps (an open menu takes the keyboard focus).
-        inputGuard.update(managed: managed, userPid: lastUserApp?.processIdentifier ?? 0)
+        inputGuard.updateUser(lastUserApp?.processIdentifier ?? 0)
         inputGuardUp = inputGuard.start()
         // Monitor arrangement changes (user plugs in a screen, another home's daemon adds its
         // display): guard the new layout at once, re-park if needed.
@@ -199,9 +232,9 @@ final class Daemon {
 
     /// The user's displays, and every backstage display but ours (other homes' daemons).
     var otherAgentScreens: [CGRect] = []
-    func refreshScreens() {
-        screens = userDisplayBounds()
-        otherAgentScreens = otherAgentDisplayBounds(excluding: display.id)
+    func refreshScreens(from ids: [CGDirectDisplayID] = activeDisplays()) {
+        screens = userDisplayBounds(from: ids)
+        otherAgentScreens = otherAgentDisplayBounds(excluding: display.id, from: ids)
     }
 
     var reparkPending = false
@@ -252,7 +285,8 @@ final class Daemon {
                                                startedAt: startedAt, processStart: processBirth(getpid()),
                                                protocol: DaemonInfo.currentProtocol, stopping: shutdownRequested ? true : nil,
                                                sizeSource: sizeSource, inputGuard: inputGuardUp,
-                                               audio: audioUnavailable == nil, audioReason: audioUnavailable, audioModes: true))
+                                               audio: audioUnavailable == nil, audioReason: audioUnavailable,
+                                               audioModes: true, delayedLaunchHandoff: true))
     }
 
     func markShutdown(_ requested: Bool) {
@@ -294,12 +328,15 @@ final class Daemon {
         registry.removeAll { !$0.matchesProcess }
         managed = Set(registry.map { $0.pid })
         if !registryUnreadable { pushAudioRegistry() }
-        inputGuard.update(managed: managed, userPid: lastUserApp?.processIdentifier ?? 0)
-        for pid in managed where observers[pid] == nil && now >= observeAfter[pid, default: 0] { observe(pid, now: now) }
+        var births: [pid_t: UInt64] = [:]
+        for app in registry {
+            births[app.pid] = app.processStart ?? processBirth(app.pid)
+        }
+        inputGuard.update(managed: managed, births: births)
         observeAfter = observeAfter.filter { managed.contains($0.key) }
         for pid in observers.keys where !managed.contains(pid) {
             if let o = observers.removeValue(forKey: pid) {
-                CFRunLoopRemoveSource(CFRunLoopGetMain(), AXObserverGetRunLoopSource(o), .defaultMode)
+                CFRunLoopRemoveSource(CFRunLoopGetMain(), AXObserverGetRunLoopSource(o), .commonModes)
             }
         }
     }
@@ -309,39 +346,49 @@ final class Daemon {
 
     func observe(_ pid: pid_t, now: Double) {
         var obs: AXObserver?
-        let cb: AXObserverCallback = { _, element, _, _ in
+        let cb: AXObserverCallback = { _, element, notification, _ in
             guard let d = Daemon.shared, !d.stopping else { return }
-            d.windowAppeared(element)
+            d.windowAppeared(element, created: notification as String == kAXWindowCreatedNotification)
         }
-        guard AXObserverCreate(pid, cb, &obs) == .success, let obs else { return }
-        let app = axApp(pid)
+        guard AXObserverCreate(pid, cb, &obs) == .success, let obs else {
+            observeAfter[pid] = now + 1
+            return
+        }
+        let app = AXUIElementCreateApplication(pid)
         // Registration fails while the app is still starting up; retry until it sticks. An app
         // whose main thread is busy (a slow launch) doesn't answer, and this runs on the guard
         // loop: wait briefly, and retry at most once a second, so the loop never stalls.
-        AXUIElementSetMessagingTimeout(app, 0.1)
+        AXUIElementSetMessagingTimeout(app, guardAXTimeout)
         let rc = AXObserverAddNotification(obs, app, kAXWindowCreatedNotification as CFString, nil)
         guard rc == .success || rc == .notificationAlreadyRegistered else { observeAfter[pid] = now + 1; return }
-        AXUIElementSetMessagingTimeout(app, 3)
         for n in [kAXFocusedWindowChangedNotification, kAXMainWindowChangedNotification, kAXWindowMovedNotification] {
             AXObserverAddNotification(obs, app, n as CFString, nil)
         }
-        CFRunLoopAddSource(CFRunLoopGetMain(), AXObserverGetRunLoopSource(obs), .defaultMode)
+        CFRunLoopAddSource(CFRunLoopGetMain(), AXObserverGetRunLoopSource(obs), .commonModes)
         observers[pid] = obs
         log("observing pid \(pid)")
     }
 
-    func windowAppeared(_ element: AXUIElement) {
-        // Notification element may be the window or something inside it.
-        var w = element
-        if w.role != "AXWindow", let win = w.attr(kAXWindowAttribute), CFGetTypeID(win) == AXUIElementGetTypeID() { w = win as! AXUIElement }
-        guard w.role == "AXWindow", managed.contains(w.pid), let f = w.frame else { return }
-        let b = display.bounds
-        if !b.contains(f) && (w.attr(kAXMinimizedAttribute) as? Bool) != true {
-            // Get it off the user's screen with one AX call first, then find it a tidy spot.
-            w.setPosition(CGPoint(x: b.minX + 40, y: b.minY + 60))
-            placeBeside(w, display: b)
-            log("observer moved new window '\(w.str(kAXTitleAttribute) ?? "")' of pid \(w.pid)")
+    func windowAppeared(_ element: AXUIElement, created: Bool) {
+        let pid = element.pid
+        guard managed.contains(pid) else { return }
+        if !created { AXUIElementSetMessagingTimeout(element, guardAXTimeout) }
+        // The window-created notification names the window. Other notifications can name
+        // an element inside it, so resolve their containing window before moving anything.
+        let w: AXUIElement
+        if created || element.role == kAXWindowRole {
+            w = element
+        } else {
+            guard let win = element.attr(kAXWindowAttribute), CFGetTypeID(win) == AXUIElementGetTypeID() else { return }
+            w = win as! AXUIElement
         }
+        let b = display.bounds
+        guard let state = guardWindowState(w), !state.minimized, !b.contains(state.frame) else { return }
+        let inset = CGPoint(x: b.minX + min(40, b.width / 10), y: b.minY + min(60, b.height / 10))
+        // Get the window off the user's screen before calculating a tidy spot.
+        guard w.setPosition(inset) == .success else { return }
+        placeBeside(w, display: b)
+        log("observer moved new window of pid \(pid)")
     }
 
     var nextReload = 0.0
@@ -354,29 +401,62 @@ final class Daemon {
         AppStore.load().contains { $0.pid == pid && $0.processStart == birth }
     }
 
-    /// Once a second: quit apps whose launch died before registering them (see LaunchRecord).
+    /// Once a second: quit apps whose launch died before registering them, and register those
+    /// whose launch gave up waiting for them (see LaunchRecord).
     func reapLaunches(now: Double) {
         guard now >= nextReap else { return }
         nextReap = now + 1
-        reapOrphanLaunches(deadSince: &orphanSince, registered: registered, log: log)
+        reapOrphanLaunches(deadSince: &orphanSince, registered: registered,
+                           didRegister: { pid, birth in self.toReveal[pid] = (birth, now + 15) }, log: log)
         launchesPending = !Launching.records().isEmpty
+        revealRegistered(now: now)
+    }
+
+    /// Apps registered here for a launch that gave up on them (still hidden, as LaunchServices
+    /// opened them), until their windows are on the agent display: then unhide, as `launch` does.
+    var toReveal: [pid_t: (birth: UInt64, until: Double)] = [:]
+    func revealRegistered(now: Double) {
+        let b = display.bounds
+        for (pid, entry) in toReveal {
+            guard processBirth(pid) == entry.birth else { toReveal[pid] = nil; continue }
+            let app = AXUIElementCreateApplication(pid)
+            AXUIElementSetMessagingTimeout(app, 0.25)   // never stall the guard loop on a busy app
+            guard let windows = try? app.readElements(kAXWindowsAttribute) else {
+                if now >= entry.until { toReveal[pid] = nil; log("pid \(pid): no accessibility answer; left hidden") }
+                continue
+            }
+            var placed = true
+            for (i, w) in windows.enumerated() {
+                guard let state = guardWindowState(w) else { placed = false; continue }
+                if state.minimized || b.contains(state.frame) { continue }
+                placeOnAgentDisplay(w, display: b, slot: i, size: state.frame.size)
+                if guardWindowState(w).map({ b.contains($0.frame) }) != true { placed = false }
+            }
+            // A windowless moment right after start: wait for a window (up to 15 s, like --timeout).
+            guard placed, !windows.isEmpty || now >= entry.until else {
+                if now >= entry.until { toReveal[pid] = nil; log("pid \(pid): windows not on the agent display; left hidden") }
+                continue
+            }
+            toReveal[pid] = nil
+            if let running = NSRunningApplication(processIdentifier: pid), !running.isTerminated { _ = running.unhide() }
+        }
     }
 
     var nextGuardLog = 0.0
     func tick() {
         guard !stopping else { return }
         let now = ProcessInfo.processInfo.systemUptime
-        if let reason = pendingShutdown { shutdown(reason: reason); return }
+        // The lifecycle lock may still be held by a launch. Keep guarding while we wait.
+        if let reason = pendingShutdown { shutdown(reason: reason) }
         reloadManaged(now: now)
-        reapLaunches(now: now)
         if now >= nextGuardLog { nextGuardLog = now + 1; inputGuard.logActivity(log) }
         if let m = statusMenu, now >= nextMenuUpdate {
             nextMenuUpdate = now + 0.5
             m.update(apps: managed.count)
         }
-        let b = display.bounds
         if now >= nextArrangementCheck { nextArrangementCheck = now + 0.25; checkArrangement() }
-        if now >= nextDockCheck { nextDockCheck = now + 1; guardDock() }
+        let b = display.bounds
+        if now >= nextDockCheck { nextDockCheck = now + 1; guardDock(displayBounds: b) }
 
         // 1. Keep managed windows off the user's screens, and off other homes' backstage
         //    displays (an app restoring a window to where it last was can land there).
@@ -392,13 +472,9 @@ final class Daemon {
                 }
             }
             for pid in offenders where registry.contains(where: { $0.pid == pid && $0.matchesProcess }) {
-                let n = adoptWindows(pid: pid, display: b, slotBase: Int(pid % 5))
+                let n = adoptVisibleWindows(pid: pid, display: b)
                 if n > 0 { log("moved \(n) window(s) of pid \(pid) to agent display") }
             }
-        } else if launchesPending {
-            idleSince = ProcessInfo.processInfo.systemUptime
-        } else if managed.isEmpty && !registryUnreadable && now - idleSince > idleTimeout {
-            shutdown(reason: "idle for \(Int(idleTimeout))s with no managed apps")
         }
 
         // 2. Keep the user's cursor off every backstage display: ours and other homes'.
@@ -407,21 +483,34 @@ final class Daemon {
             let points = screens.map { u in
                 CGPoint(x: min(max(loc.x, u.minX), u.maxX - 1), y: min(max(loc.y, u.minY), u.maxY - 1))
             }
-            guard let p = points.min(by: { hypot($0.x-loc.x, $0.y-loc.y) < hypot($1.x-loc.x, $1.y-loc.y) }) else { return }
-            CGWarpMouseCursorPosition(p)
-            CGAssociateMouseAndMouseCursorPosition(1)
+            if let p = points.min(by: { hypot($0.x-loc.x, $0.y-loc.y) < hypot($1.x-loc.x, $1.y-loc.y) }) {
+                CGWarpMouseCursorPosition(p)
+                CGAssociateMouseAndMouseCursorPosition(1)
+            }
+        }
+
+        // Accessibility registration and deferred launch recovery can block on another app.
+        // Do them after moving visible offenders, and attempt at most one registration per tick.
+        if let pid = managed.first(where: { observers[$0] == nil && now >= observeAfter[$0, default: 0] }) {
+            observe(pid, now: now)
+        }
+        reapLaunches(now: now)
+        if launchesPending { idleSince = ProcessInfo.processInfo.systemUptime }
+        if managed.isEmpty && !launchesPending && pendingShutdown == nil && !registryUnreadable && now - idleSince > idleTimeout {
+            shutdown(reason: "idle for \(Int(idleTimeout))s with no managed apps")
         }
     }
 
     /// The reconfiguration callback isn't delivered without an NSApplication (BACKSTAGE_MENUBAR=off),
     /// so watch the arrangement here too.
     var nextArrangementCheck = 0.0
-    var arrangement: [CGRect] = []
+    var arrangement: [CGDirectDisplayID: CGRect] = [:]
     func checkArrangement() {
-        let now = activeDisplays().map { CGDisplayBounds($0) }
+        let ids = activeDisplays()
+        let now = Dictionary(uniqueKeysWithValues: ids.map { ($0, CGDisplayBounds($0)) })
         guard now != arrangement else { return }
         arrangement = now
-        refreshScreens()
+        refreshScreens(from: ids)
         scheduleRepark()
     }
 
@@ -429,9 +518,9 @@ final class Daemon {
     var dockAway: CGRect?
     /// The Dock must stay on the user's screens. Parking (corner contact only) keeps macOS from
     /// moving it to a backstage display; this catches it if that ever happens anyway.
-    func guardDock() {
+    func guardDock(displayBounds: CGRect) {
         guard let dock = dockWindowBounds() else { return }
-        let ours = contact(dock, display.bounds) == .overlap
+        let ours = contact(dock, displayBounds) == .overlap
         let theirs = otherAgentScreens.contains { contact(dock, $0) == .overlap }
         guard ours || theirs else {
             if let away = dockAway { log("the Dock is back on the user's screen (was at \(away))"); dockAway = nil }
@@ -440,7 +529,7 @@ final class Daemon {
         if dockAway == nil {
             // macOS moves the Dock to a display arranged right below its own. Re-parking (which
             // runs on any arrangement change) brings it back by itself ~0.1 s after the move.
-            log("the Dock moved onto \(ours ? "this daemon's" : "another backstage") display at \(dock); this display at \(display.bounds)"
+            log("the Dock moved onto \(ours ? "this daemon's" : "another backstage") display at \(dock); this display at \(displayBounds)"
                 + (ours && display.isParked ? " though parked: not moving it (no undisruptive way known)" : ""))
         }
         if ours, !display.isParked { scheduleRepark() }
@@ -659,8 +748,8 @@ func stopSession() throws -> [String: Any] {
         let lock = try Locks.session(session.id)
         defer { lock.release() }
         // A launch in this session that started before now gives up instead of registering.
-        lock.stamp = Date().timeIntervalSince1970
-        let mine = try AppStore.read().filter { $0.session == session.id }
+        try lock.writeStamp(Date().timeIntervalSince1970)
+        let mine = try AppStore.read().filter { Session.sameID($0.session, session.id) }
         quit = mine.map { $0.pid }
         allGone = quitApps(mine)
         try AppStore.update { _ in }   // prune by process identity
@@ -694,7 +783,7 @@ private func stopDaemonIfIdle(session: String) throws -> String {
         // Exclusive, so no launch is between starting the daemon and registering its app; new
         // launches can't start while client.lock is held, so the emptiness check stays true.
         // Don't wait for it, though: a launch holds it shared through `open` and identifying
-        // its app (up to ~15 s), `show` while it hands an app over, and waiting here would keep
+        // its app (up to 60 s, 120 s under load), `show` while it hands an app over, and waiting here would keep
         // client.lock, and with it every other session's launch, blocked that long. A daemon
         // left running stops itself after its idle timeout.
         let lifecycle: StateLock
@@ -703,7 +792,7 @@ private func stopDaemonIfIdle(session: String) throws -> String {
         defer { lifecycle.release() }
         let remaining = try AppStore.read()
         if !remaining.isEmpty {
-            let mine = remaining.filter { $0.session == session }.count
+            let mine = remaining.filter { Session.sameID($0.session, session) }.count
             var parts: [String] = []
             if mine > 0 { parts.append("\(plural(mine, "app")) of this session didn't quit") }
             if remaining.count > mine { parts.append("\(plural(remaining.count - mine, "app")) in other sessions") }

@@ -16,11 +16,12 @@ set -uo pipefail
 cd "$(dirname "$0")"
 ROOT="$(cd .. && pwd)"
 if [[ -z ${BACKSTAGE_BIN:-} ]]; then
-    (cd "$ROOT" && swift build -c release)
-    BACKSTAGE_BIN="$(cd "$ROOT" && swift build -c release --show-bin-path)/backstage"
+    (cd "$ROOT" && make build) || exit 1
+    BIN_DIR="$(cd "$ROOT" && swift build -c release --show-bin-path)" || exit 1
+    BACKSTAGE_BIN="$BIN_DIR/backstage"
 fi
 BS="$BACKSTAGE_BIN"
-WORK="$(mktemp -d /tmp/backstage-audio.XXXX)"
+WORK="$(mktemp -d /tmp/backstage-audio.XXXX)" || exit 1
 HOMES=()
 FAIL=0
 pass() { echo "  ok   $*"; }
@@ -30,8 +31,8 @@ use_home() { export BACKSTAGE_HOME="$WORK/$1"; HOMES+=("$BACKSTAGE_HOME"); mkdir
 cleanup() {
     local result=$?
     trap - EXIT
-    for h in "${HOMES[@]}"; do
-        if [[ -f "$h/daemon.json" ]]; then BACKSTAGE_HOME="$h" "$BS" stop --all > /dev/null 2>&1 || result=1; fi
+    for h in ${HOMES[@]+"${HOMES[@]}"}; do
+        if [[ -f "$h/daemon.json" || -f "$h/apps.json" ]]; then BACKSTAGE_HOME="$h" "$BS" stop --all > /dev/null 2>&1 || result=1; fi
     done
     [[ -n ${LISTENER:-} ]] && kill "$LISTENER" 2>/dev/null
     echo "artifacts: $WORK"
@@ -75,7 +76,7 @@ launch() {  # extra --env args…; prints the pid. Measured (--audio) unless LAU
     local out flag=--audio
     [[ ${LAUNCH_AUDIO:-} == default ]] && flag=""
     out=$("$BS" launch "$APP" --env "TESTAPP_LOG=${FLOG:-$WORK/fixture-$BACKSTAGE_SESSION.log}" $flag "$@") || { echo "$out" >&2; return 1; }
-    echo "$out" | jq -r .pid
+    echo "$out" | jq -er '.pid | select(type == "number" and . > 0)'
 }
 audio() { "$BS" audio --pid "$1"; }
 near() { awk -v a="$1" -v b="$2" -v t="$3" 'BEGIN { d = a - b; if (d < 0) d = -d; exit !(d <= t) }'; }
@@ -99,25 +100,46 @@ echo "   default output: ${DEFOUT:-none}; loops back on input: ${DEFCH:-none} ($
 # 300 ms bursts 1.6 s apart to the default output from its first line: the second after its
 # tap's IO stopped (1 s after output stops), when IO runs at all. Pass: no tone at the loopback.
 default_leak() {  # label
-    local id p n
+    local id p n playback_status=0 listen_status=0
+    local listen_json="$WORK/defleak-$1.json" play_json="$WORK/defplay-$1.json"
+    local listen_log="$WORK/defleak-$1.log" stop_file="$WORK/defleak-$1.stop"
     id=$(uuidgen); mkdir -p "$BACKSTAGE_HOME/launching" "$BACKSTAGE_HOME/logs"; touch "$BACKSTAGE_HOME/logs/$id.log"
     printf '{"id":"%s","session":"%s","cliPID":%d,"cliStart":0,"bundle":"%s","log":"%s","startedAt":%s}' \
         "$id" "${BACKSTAGE_SESSION:-audio-a}" $$ "$APP" "$BACKSTAGE_HOME/logs/$id.log" "$(date +%s)" > "$BACKSTAGE_HOME/launching/$id.json"
-    "$PROBE" listen --device "$DEFLOOP" --channel "$DEFCH" --hz 18500 --secs 5 > "$WORK/defleak-$1.json" 2> /dev/null &
-    LISTENER=$!; sleep 0.4
-    BACKSTAGE_LAUNCH_ID=$id "$PROBE" play --device "$DEFLOOP" --hz 18500 --ms 300 --again-after-ms 1600 --hold-ms 200 > "$WORK/defplay-$1.json"
-    wait $LISTENER
+    "$PROBE" listen --device "$DEFLOOP" --channel "$DEFCH" --hz 18500 --secs 30 --stop-file "$stop_file" > "$listen_json" 2> "$listen_log" &
+    LISTENER=$!
+    for _ in $(seq 1 200); do
+        grep -qx LISTENING "$listen_log" && break
+        kill -0 "$LISTENER" 2>/dev/null || break
+        sleep 0.05
+    done
+    if ! grep -qx LISTENING "$listen_log"; then
+        kill "$LISTENER" 2>/dev/null
+        wait "$LISTENER" 2>/dev/null
+        LISTENER=
+        rm -f "$BACKSTAGE_HOME/launching/$id.json" "$BACKSTAGE_HOME/logs/$id.log"
+        fail "default output ($1): listener never received input samples: $(cat "$listen_log")"
+        return
+    fi
+    BACKSTAGE_LAUNCH_ID=$id "$PROBE" play --device "$DEFLOOP" --hz 18500 --ms 300 --again-after-ms 1600 --hold-ms 200 > "$play_json" || playback_status=$?
+    touch "$stop_file"
+    wait "$LISTENER" || listen_status=$?
+    LISTENER=
     rm -f "$BACKSTAGE_HOME/launching/$id.json" "$BACKSTAGE_HOME/logs/$id.log"
-    p=$(jq -r .pid "$WORK/defplay-$1.json")
-    n=$(jq -r .toneWindows "$WORK/defleak-$1.json")
-    if ! jq -e -s '.[0].start < .[1].outputStart and .[0].end > .[1].outputEnd' "$WORK/defleak-$1.json" "$WORK/defplay-$1.json" > /dev/null; then
-        fail "default output ($1): inconclusive, the listener didn't cover both bursts: $(jq -c -s '{listen: [.[0].start, .[0].end], play: [.[1].outputStart, .[1].outputEnd]}' "$WORK/defleak-$1.json" "$WORK/defplay-$1.json")"
+    if [[ $playback_status != 0 || $listen_status != 0 ]]; then
+        fail "default output ($1): player exited $playback_status, listener exited $listen_status: $(cat "$listen_log")"
+        return
+    fi
+    p=$(jq -r .pid "$play_json")
+    n=$(jq -r .toneWindows "$listen_json")
+    if ! jq -e -s '.[0].start < .[1].outputStart and .[0].end > .[1].outputEnd' "$listen_json" "$play_json" > /dev/null; then
+        fail "default output ($1): inconclusive, the listener didn't cover both bursts: $(jq -c -s '{listen: [.[0].start, .[0].end], play: [.[1].outputStart, .[1].outputEnd]}' "$listen_json" "$play_json")"
     elif ! grep -q "muted pid $p " "$BACKSTAGE_HOME/daemon.log" 2> /dev/null; then
         fail "default output ($1): the player (pid $p) was never tapped"
     elif [[ $n == 0 ]]; then
-        pass "default output ($1): nothing reached input $DEFCH of $DEFLOOP (best $(jq -r '(.toneDb * 10 | round) / 10' "$WORK/defleak-$1.json") dB at 18.5 kHz; IO: $(grep -c "IO on for pid $p " "$BACKSTAGE_HOME/daemon.log" 2> /dev/null) starts)"
+        pass "default output ($1): nothing reached input $DEFCH of $DEFLOOP (best $(jq -r '(.toneDb * 10 | round) / 10' "$listen_json") dB at 18.5 kHz; IO: $(grep -c "IO on for pid $p " "$BACKSTAGE_HOME/daemon.log" 2> /dev/null) starts)"
     else
-        fail "default output ($1): $n windows of the probe reached input $DEFCH of $DEFLOOP: $(cat "$WORK/defleak-$1.json")"
+        fail "default output ($1): $n windows of the probe reached input $DEFCH of $DEFLOOP: $(cat "$listen_json")"
     fi
 }
 
@@ -401,13 +423,15 @@ if [[ -n $LOOP ]]; then
         printf '{"id":"%s","session":"audio-a","cliPID":%d,"cliStart":0,"bundle":"%s","log":"%s","startedAt":%s}' \
             "$ID" $$ "$APP" "$BACKSTAGE_HOME/logs/$ID.log" "$(date +%s)" > "$BACKSTAGE_HOME/launching/$ID.json"
         listen 1.5 "$WORK/leak$i.json"
-        BACKSTAGE_LAUNCH_ID=$ID "$PROBE" play --device "$LOOP" --hz 18500 --ms 300 --hold-ms 300 > "$WORK/play$i.json"
-        wait $LISTENER
+        BACKSTAGE_LAUNCH_ID=$ID "$PROBE" play --device "$LOOP" --hz 18500 --ms 300 --hold-ms 300 > "$WORK/play$i.json" || exit 1
+        wait "$LISTENER" || exit 1
+        LISTENER=
         rm -f "$BACKSTAGE_HOME/launching/$ID.json" "$BACKSTAGE_HOME/logs/$ID.log"
         P=$(jq -r .pid "$WORK/play$i.json")
         MS=$(grep "muted pid $P " "$BACKSTAGE_HOME/daemon.log" | sed -E 's/.* ([0-9.]+) ms after sight.*/\1/')
         GAP=$(jq -r '((.outputStart - .processStart) * 1000 | floor)' "$WORK/play$i.json")
         N=$(jq -r .nonzeroFrames "$WORK/leak$i.json")
+        [[ -n $MS ]] || { fail "pending launch, run $i: no mute recorded for pid $P"; continue; }
         [[ $N == 0 ]] && pass "pending launch, run $i: 0 frames reached the loopback (sight-to-mute $MS ms; first HAL call to output start $GAP ms)" \
             || fail "pending launch, run $i: $N frames leaked (sight-to-mute $MS ms): $(cat "$WORK/leak$i.json")"
     done
@@ -415,10 +439,14 @@ if [[ -n $LOOP ]]; then
     # first line. It refuses to (and skips) while its own Microphone access is undecided, since
     # macOS would ask for it in the fixture's name: see tests/audio-leak.sh --grant-fixture-mic.
     listen 2.5 "$WORK/leak-launch.json"
-    LP=$(launch --env TESTAPP_TONE=18500 --env TESTAPP_TONE_DEVICE="$LOOP" --env TESTAPP_TONE_PATTERN=500 --env TESTAPP_TONE_ONCE=1)
-    wait $LISTENER
-    if grep -q "tone skipped" "$WORK/fixture-audio-a.log"; then
+    LEAK_LOG="$WORK/fixture-loopback.log"
+    LP=$(FLOG="$LEAK_LOG" launch --env TESTAPP_TONE=18500 --env TESTAPP_TONE_DEVICE="$LOOP" --env TESTAPP_TONE_PATTERN=500 --env TESTAPP_TONE_ONCE=1) || exit 1
+    wait "$LISTENER" || exit 1
+    LISTENER=
+    if grep -q "tone skipped" "$LEAK_LOG"; then
         skip "fixture → loopback through launch: the fixture's Microphone access isn't decided (tests/audio-leak.sh --grant-fixture-mic, once)"
+    elif ! grep -q "tone first render" "$LEAK_LOG"; then
+        fail "fixture through launch: the fixture did not render the probe"
     else
         N=$(jq -r .nonzeroFrames "$WORK/leak-launch.json")
         MS=$(grep "muted pid $LP " "$BACKSTAGE_HOME/daemon.log" | sed -E 's/.* ([0-9.]+) ms after sight.*/\1/')
@@ -441,10 +469,19 @@ echo "== crash handler: a crashing daemon kills its apps first (windowless fixtu
 use_home crash
 "$BS" start > /dev/null
 DP=$(jq -r .pid "$BACKSTAGE_HOME/daemon.json")
-BARE=$(launch --env TESTAPP_BARE=1 --timeout 1)
-kill -SEGV "$DP"
+BARE=$(launch --env TESTAPP_BARE=1 --timeout 1) || exit 1
+if ! [[ $DP =~ ^[1-9][0-9]*$ && $BARE =~ ^[1-9][0-9]*$ ]] || ! kill -0 "$BARE" 2>/dev/null; then
+    fail "crash control failed: expected a live windowless fixture (daemon $DP, fixture $BARE)"
+    exit 1
+fi
+kill -SEGV "$DP" || { fail "could not signal daemon $DP"; exit 1; }
 for _ in $(seq 1 30); do kill -0 "$BARE" 2>/dev/null || break; sleep 0.1; done
-kill -0 "$BARE" 2>/dev/null && { fail "the app outlived the crashed daemon"; kill -9 "$BARE"; } || pass "SIGSEGV in the daemon killed its app"
+if kill -0 "$BARE" 2>/dev/null; then
+    fail "the app outlived the crashed daemon"
+    kill -9 "$BARE" 2>/dev/null
+else
+    pass "SIGSEGV in the daemon killed its app"
+fi
 rm -f "$BACKSTAGE_HOME/daemon.json"
 
 echo

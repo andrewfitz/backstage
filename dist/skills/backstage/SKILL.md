@@ -164,6 +164,9 @@ Agents in the Claude and Codex desktop apps can also have computer-use tools. Tw
   An app that makes itself a regular app at startup shows up in the user's Dock anyway
   (`"dock": "visible (app made itself a regular app)"`); it still runs hidden, so carry on, but
   quit it as soon as you're done. Quit every app when done.
+- On a heavily loaded Mac `launch` can take up to two minutes. If it fails because the app's
+  process didn't appear, don't relaunch at once: `backstage list` shows it under
+  `pendingLaunches`, and the app moves to `apps` (yours to use and quit) if it starts late.
 - All instances of an app (the user's and other agents') share its preferences and app data.
   Don't rely on per-instance settings, and expect settings another instance changed.
 - The clipboard is shared with the user and other agents. Put text in with `set`/`type`, not

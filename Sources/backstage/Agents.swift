@@ -28,7 +28,8 @@ func hookCommand(_ payload: [String: Any]) -> String? {
 func shellSegments(_ s: String) -> [[String]] {
     var segments: [[String]] = [], words: [String] = [], cur = "", inWord = false
     var quote: Character? = nil
-    var it = Array(s), i = 0
+    let it = Array(s)
+    var i = 0
     func endWord() { if inWord { words.append(cur); cur = ""; inWord = false } }
     func endSeg() { endWord(); if !words.isEmpty { segments.append(words); words = [] } }
     while i < it.count {
@@ -46,7 +47,6 @@ func shellSegments(_ s: String) -> [[String]] {
         i += 1
     }
     endSeg()
-    it = []
     return segments
 }
 
@@ -204,7 +204,11 @@ func handOver(_ record: ManagedApp, wait: Bool = true) throws -> (unmuted: Bool,
     defer { lifecycle.release() }
     let owner = try Locks.session(record.owner, nonblocking: !wait)
     defer { owner.release() }
-    func same(_ a: ManagedApp) -> Bool { a.pid == pid && a.processStart == record.processStart && a.owner == record.owner }
+    let input = try Locks.app(record, nonblocking: !wait)
+    defer { input.release() }
+    func same(_ a: ManagedApp) -> Bool {
+        a.pid == pid && a.processStart == record.processStart && Session.sameID(a.owner, record.owner)
+    }
     guard AppStore.load().contains(where: same) else { throw CLIError("pid \(pid) is not a live managed app") }
     guard let target = userDisplayBounds().first else { throw CLIError("no user display available for handoff") }
     guard let app = NSRunningApplication(processIdentifier: pid), record.matchesProcess else { throw CLIError("app \(pid) is gone") }
@@ -233,8 +237,7 @@ private func logShown(_ s: String) {
     try? Paths.ensure()
     let line = "\(ISO8601DateFormatter().string(from: Date())) \(s)\n"
     let url = Paths.dir.appendingPathComponent("shown.log")
-    if let h = try? FileHandle(forWritingTo: url) { h.seekToEndOfFile(); h.write(line.data(using: .utf8)!); try? h.close() }
-    else { try? line.write(to: url, atomically: true, encoding: .utf8) }
+    appendLogLine(line, to: url)
 }
 
 // MARK: - install / uninstall into agents
@@ -291,6 +294,7 @@ private func ownedHook(_ hook: [String: Any]) -> Bool {
 }
 let tomlBegin = "# >>> backstage hook (managed by `backstage install`) >>>"
 let tomlEnd = "# <<< backstage hook <<<"
+private let tomlBeginAfterMissingNewline = tomlBegin + " (added separator)"
 
 private func backup(_ url: URL) throws {
     let bak = url.appendingPathExtension("backstage-bak")
@@ -343,31 +347,49 @@ private func editTOMLHooks(_ url: URL, matcher: String, command: String?) throws
     var text = FileManager.default.fileExists(atPath: url.path) ? try String(contentsOf: url, encoding: .utf8) : ""
     var removed = false
     let lines = text.components(separatedBy: "\n")
-    let starts = lines.indices.filter { lines[$0] == tomlBegin }
-    let ends = lines.indices.filter { lines[$0] == tomlEnd }
+    let markers = lines.map { $0.hasSuffix("\r") ? String($0.dropLast()) : $0 }
+    let starts = markers.indices.filter { markers[$0] == tomlBegin || markers[$0] == tomlBeginAfterMissingNewline }
+    let ends = markers.indices.filter { markers[$0] == tomlEnd }
     if !starts.isEmpty || !ends.isEmpty {
         guard starts.count == 1, ends.count == 1, starts[0] < ends[0] else {
             throw CLIError("incomplete or duplicate backstage hook markers in \(url.path)")
         }
         var kept = lines
         kept.removeSubrange(starts[0]...ends[0])
+        if starts[0] > 0, kept.count == starts[0] || (kept.count == starts[0] + 1 && kept.last == "") {
+            // The block is at EOF. Restore the original ending, even if an editor removed
+            // the newline after the closing marker.
+            if markers[starts[0]] == tomlBeginAfterMissingNewline {
+                if kept.count > starts[0] { kept.removeLast() }
+                if let last = kept.indices.last, kept[last].hasSuffix("\r") { kept[last].removeLast() }
+            } else if kept.count == starts[0] {
+                kept.append("")
+            }
+        }
         text = kept.joined(separator: "\n")
         removed = true
     }
     if let command {
-        func q(_ s: String) -> String { "\"" + s.replacingOccurrences(of: "\\", with: "\\\\").replacingOccurrences(of: "\"", with: "\\\"") + "\"" }
-        if !text.isEmpty && !text.hasSuffix("\n") { text += "\n" }
-        text += """
-        \(tomlBegin)
+        let encoder = JSONEncoder()
+        encoder.outputFormatting = .withoutEscapingSlashes
+        func q(_ s: String) throws -> String {
+            String(decoding: try encoder.encode(s), as: UTF8.self).replacingOccurrences(of: "\u{7f}", with: "\\u007f")
+        }
+        let newline = text.contains("\r\n") ? "\r\n" : "\n"
+        let needsSeparator = !text.isEmpty && text.utf8.last != 0x0a
+        if needsSeparator { text += newline }
+        let block = """
+        \(needsSeparator ? tomlBeginAfterMissingNewline : tomlBegin)
         [[hooks.PreToolUse]]
-        matcher = \(q(matcher))
+        matcher = \(try q(matcher))
           [[hooks.PreToolUse.hooks]]
           type = "command"
-          command = \(q(command))
+          command = \(try q(command))
           timeout = 5
         \(tomlEnd)
 
         """
+        text += block.replacingOccurrences(of: "\n", with: newline)
     } else if !removed {
         return "no backstage hook present"
     }
@@ -387,7 +409,7 @@ func selectedAgents(_ args: Args) -> [Agent] {
 /// Any version of backstage's own skill (its frontmatter names it), as opposed to a user's
 /// unrelated skill that happens to live in the same folder.
 func isBackstageSkill(_ text: String) -> Bool {
-    let lines = text.split(separator: "\n", maxSplits: 3, omittingEmptySubsequences: false)
+    let lines = text.split(maxSplits: 2, omittingEmptySubsequences: false, whereSeparator: \.isNewline)
     return lines.count > 1 && lines[0] == "---" && lines[1].trimmingCharacters(in: .whitespaces) == "name: backstage"
 }
 
@@ -400,26 +422,30 @@ func cmdInstall(_ args: Args) throws -> [String: Any] {
     for a in agents {
         var r: [String: Any] = [:]
         let skill = a.skillDir.appendingPathComponent("SKILL.md")
+        var skillNeedsWrite = true
         if FileManager.default.fileExists(atPath: skill.path) {
             let existing = try String(contentsOf: skill, encoding: .utf8)
             guard isBackstageSkill(existing) else {
                 throw CLIError("found a different skill at \(skill.path); move it before installing")
             }
-            // An older (or locally edited) backstage skill: upgrade it, keeping a copy if it differs.
-            if existing != skillMarkdown {
-                let bak = skill.appendingPathExtension("backstage-bak")
-                try? FileManager.default.removeItem(at: bak)
-                try FileManager.default.copyItem(at: skill, to: bak)
-                r["previousSkill"] = bak.path
-            }
+            skillNeedsWrite = existing != skillMarkdown
         }
         if args.has("hooks") {
             r["hook"] = a == .grok ? try editTOMLHooks(a.hookFile, matcher: a.hookMatcher, command: command)
                                    : try editJSONHooks(a.hookFile, matcher: a.hookMatcher, command: command)
             r["hookFile"] = a.hookFile.path
         }
-        try FileManager.default.createDirectory(at: a.skillDir, withIntermediateDirectories: true)
-        try skillMarkdown.write(to: skill, atomically: true, encoding: .utf8)
+        if skillNeedsWrite {
+            if FileManager.default.fileExists(atPath: skill.path) {
+                // An older or locally edited backstage skill: upgrade it, keeping a copy.
+                let bak = skill.appendingPathExtension("backstage-bak")
+                try? FileManager.default.removeItem(at: bak)
+                try FileManager.default.copyItem(at: skill, to: bak)
+                r["previousSkill"] = bak.path
+            }
+            try FileManager.default.createDirectory(at: a.skillDir, withIntermediateDirectories: true)
+            try skillMarkdown.write(to: skill, atomically: true, encoding: .utf8)
+        }
         r["skill"] = skill.path
         report[a.rawValue] = r
     }

@@ -79,10 +79,13 @@ func axApp(_ pid: pid_t) -> AXUIElement {
 func resolveWindow(_ pid: pid_t, _ spec: String) throws -> AXUIElement {
     let wins = try axApp(pid).readElements(kAXWindowsAttribute)
     if spec.hasPrefix("w"), let id = CGWindowID(spec.dropFirst()) {
-        guard let w = wins.first(where: { $0.windowID == id }) else {
-            throw CLIError("window \(spec) not found (closed?). Windows: \(wins.compactMap { $0.windowID }.map { "w\($0)" }.joined(separator: " "))")
+        var refs: [String] = []
+        for window in wins {
+            guard let windowID = window.windowID else { continue }
+            if windowID == id { return window }
+            refs.append("w\(windowID)")
         }
-        return w
+        throw CLIError("window \(spec) not found (closed?). Windows: \(refs.joined(separator: " "))")
     }
     guard let i = Int(spec), i >= 0, i < wins.count else { throw CLIError("bad window '\(spec)' (\(wins.count) windows)") }
     return wins[i]
@@ -234,9 +237,10 @@ func walkTree(pid: pid_t, window: String?, maxDepth: Int, maxNodes: Int = 4000, 
 
 func axWindowsSummary(_ pid: pid_t, origin: CGPoint) -> [[String: Any]] {
     axApp(pid).windows.enumerated().map { (i, w) in
-        var d: [String: Any] = ["ref": windowRef(w, index: i), "index": i, "title": w.str(kAXTitleAttribute) ?? "", "role": w.str(kAXSubroleAttribute) ?? w.role]
+        let id = w.windowID
+        var d: [String: Any] = ["ref": id.map { "w\($0)" } ?? "\(i)", "index": i, "title": w.str(kAXTitleAttribute) ?? "", "role": w.str(kAXSubroleAttribute) ?? w.role]
         if let f = w.frame { d["frame"] = rectDict(f.offsetBy(dx: -origin.x, dy: -origin.y)) }
-        if let id = w.windowID { d["windowID"] = id }
+        if let id { d["windowID"] = id }
         if (w.attr(kAXMinimizedAttribute) as? Bool) == true { d["minimized"] = true }
         return d
     }
@@ -244,20 +248,34 @@ func axWindowsSummary(_ pid: pid_t, origin: CGPoint) -> [[String: Any]] {
 
 /// Press a menu item by path, e.g. "File > Save As…". Matching is case-insensitive and prefix-tolerant.
 func pressMenu(pid: pid_t, path: String) throws {
+    func normalize(_ title: String) -> String {
+        title.lowercased().replacingOccurrences(of: "…", with: "").replacingOccurrences(of: "...", with: "").trimmingCharacters(in: .whitespaces)
+    }
     let parts = path.split(separator: ">", omittingEmptySubsequences: false).map { $0.trimmingCharacters(in: .whitespaces).lowercased() }
-    guard parts.allSatisfy({ !$0.isEmpty }) else { throw CLIError("empty item in menu path") }
+    let normalizedParts = parts.map(normalize)
+    guard normalizedParts.allSatisfy({ !$0.isEmpty }) else { throw CLIError("empty item in menu path") }
     guard let bar = axApp(pid).attr(kAXMenuBarAttribute), CFGetTypeID(bar) == AXUIElementGetTypeID() else { throw CLIError("app has no menu bar") }
     var current = bar as! AXUIElement
-    for (i, want) in parts.enumerated() {
-        var items = current.children
+    for (i, want) in normalizedParts.enumerated() {
+        let role = current.role
+        let children = current.children
         // Menu bar items and menu items both hold their items under an AXMenu child.
-        if current.role == "AXMenuBarItem" || current.role == "AXMenuItem" { items = current.children.first?.children ?? [] }
-        func norm(_ s: String) -> String { s.lowercased().replacingOccurrences(of: "…", with: "").replacingOccurrences(of: "...", with: "").trimmingCharacters(in: .whitespaces) }
-        let w = norm(want)
-        guard let hit = items.first(where: { norm($0.str(kAXTitleAttribute) ?? "") == w })
-                ?? items.first(where: { norm($0.str(kAXTitleAttribute) ?? "").hasPrefix(w) }) else {
-            let avail = items.compactMap { $0.str(kAXTitleAttribute) }.filter { !$0.isEmpty }
-            throw CLIError("menu item '\(want)' not found; available: \(avail.joined(separator: " | "))")
+        let items = (role == "AXMenuBarItem" || role == "AXMenuItem") ? children.first?.children ?? [] : children
+        var exactMatch: AXUIElement?
+        var prefixMatch: AXUIElement?
+        var availableTitles: [String] = []
+        for item in items {
+            guard let title = item.str(kAXTitleAttribute), !title.isEmpty else { continue }
+            let normalizedTitle = normalize(title)
+            if normalizedTitle == want {
+                exactMatch = item
+                break
+            }
+            if prefixMatch == nil, normalizedTitle.hasPrefix(want) { prefixMatch = item }
+            availableTitles.append(title)
+        }
+        guard let hit = exactMatch ?? prefixMatch else {
+            throw CLIError("menu item '\(parts[i])' not found; available: \(availableTitles.joined(separator: " | "))")
         }
         if i == parts.count - 1 {
             let rc = AXUIElementPerformAction(hit, kAXPressAction as CFString)

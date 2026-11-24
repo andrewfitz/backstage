@@ -105,6 +105,19 @@ tile on purpose: `"visible (--dock)"`. Qt apps are kept out of the Dock with
 launches; you get a `warning`, and any window it opens later is still pulled onto the agent
 display.
 
+Before that, `launch` waits for the app's process to appear, however short `--timeout` is: up
+to 60 s, or 120 s while the system is under heavy load (1-minute load average above the CPU
+count); `BACKSTAGE_LAUNCH_DEADLINE=S` overrides it. LaunchServices normally reports the new
+process at once, but under heavy load (or a WindowServer stall) it can answer tens of seconds
+late, or never, though the app is already running. `launch` doesn't depend on that answer: it
+also recognises the process by the `BACKSTAGE_LAUNCH_ID` token in its environment (or its log
+as stdout) and registers it as usual, with a `warning` that LaunchServices answered late or not
+at all. Once LaunchServices has answered, the process gets 15 s (30 s under load) more to be
+recognised. If no process appears in time, `launch` fails, but LaunchServices may still start
+the app later: the daemon then registers it to your session (`list` shows it, and `quit`/`stop`
+reach it). Until then `list` shows the launch under `pendingLaunches` (for up to 10 minutes).
+If your session runs `stop` in the meantime, the daemon quits the app instead.
+
 `audio` is how the app's sound is handled (see [Hear](#hear)):
 
 | `audio` | When | Speakers | Screen sharing, remote desktop, recordings | `audio`, `wait --sound`, `audio record` |
@@ -153,7 +166,10 @@ Your session's apps with their windows. `--all` lists every session's apps; each
 `session` field (`legacy` for apps from before sessions). `audio` is the launch's mode
 (`inaudible`, `muted` or `metered`, as in `launch`). `tap` is the app's audio tap
 (`muted`, `armed` or `failed`); apps the daemon quit because their audio couldn't be muted are
-listed under `audioFailures` for 10 minutes.
+listed under `audioFailures` for 10 minutes. `pendingLaunches` lists launches that failed
+because their process hadn't appeared yet (see `launch`): `launch` (its id), `path`, `log`,
+`startedAt`, and `until` (when the daemon stops waiting for it). If the app starts, the daemon
+registers it to the session and it moves to `apps`.
 
 ### `quit [--force]`
 Quits the app. If it refuses, for example because of a "Save changes?" sheet, you get
@@ -224,7 +240,9 @@ daemon also exits by itself after `BACKSTAGE_IDLE_TIMEOUT` seconds (default 1800
 session has managed apps, or when no physical display is left.
 
 A launch that dies before its app is registered (an agent's tool timeout, Ctrl-C) leaves a
-record behind; the daemon quits the app it started, so nothing is left unowned.
+record behind; the daemon quits the app it started, so nothing is left unowned. A launch that
+fails because the app's process hadn't appeared in time hands its record to the daemon
+instead, which registers the app to the session if it starts within 10 minutes (see `launch`).
 
 After upgrading backstage, a daemon from the older version is replaced automatically if it
 has no apps. If it still has apps, commands that need the daemon fail and ask you to run

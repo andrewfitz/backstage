@@ -16,11 +16,12 @@ set -uo pipefail
 cd "$(dirname "$0")"
 ROOT="$(cd .. && pwd)"
 if [[ -z ${BACKSTAGE_BIN:-} ]]; then
-    (cd "$ROOT" && swift build -c release)
-    BACKSTAGE_BIN="$(cd "$ROOT" && swift build -c release --show-bin-path)/backstage"
+    (cd "$ROOT" && make build) || exit 1
+    BIN_DIR="$(cd "$ROOT" && swift build -c release --show-bin-path)" || exit 1
+    BACKSTAGE_BIN="$BIN_DIR/backstage"
 fi
 BS="$BACKSTAGE_BIN"
-WORK="$(mktemp -d /tmp/backstage-focus.XXXX)"
+WORK="$(mktemp -d /tmp/backstage-focus.XXXX)" || exit 1
 export BACKSTAGE_HOME="$WORK/state"
 unset BACKSTAGE_SESSION
 WATCH=

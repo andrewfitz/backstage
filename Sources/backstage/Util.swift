@@ -47,8 +47,9 @@ func runAsync<T>(timeout: Double? = nil, onTimeout: @autoclosure () -> Error = C
     }
     let deadline = timeout.map { ProcessInfo.processInfo.systemUptime + $0 }
     while pending.wait(timeout: .now()) != .success {
-        if let deadline, ProcessInfo.processInfo.systemUptime >= deadline { throw onTimeout() }
-        pump(0.01)
+        let remaining = deadline.map { $0 - ProcessInfo.processInfo.systemUptime } ?? 0.01
+        if remaining <= 0 { throw onTimeout() }
+        pump(min(0.01, remaining))
     }
     return try result!.get()
 }
@@ -131,7 +132,10 @@ struct Args {
             case "fill": arity = 1...1
             case "size":
                 arity = 3...3
-                if positional.count == 3, !positional.dropFirst().allSatisfy({ Double($0).map { $0.isFinite && $0 >= 1 } ?? false }) {
+                if positional.count == 3, !positional.dropFirst().allSatisfy({
+                    guard let dimension = Double($0), dimension >= 1 else { return false }
+                    return Int(exactly: dimension.rounded()) != nil
+                }) {
                     throw CLIError("window size needs a width and height in points (at least 1)")
                 }
             default: throw CLIError("usage: backstage window fill [--window W]  |  backstage window size <w> <h> [--window W]")
@@ -170,6 +174,7 @@ struct Args {
         case "__inaudible-check": allowed = ["audio", "inaudible"]; arity = 1...1
         case "scroll": allowed = target + ["scale", "dx", "dy"]; arity = 2...2
         case "drag": allowed = target + ["scale", "steps"]; arity = 4...4
+        case "__menu-thumbnail": allowed = []; arity = 4...4
         default: allowed = []; arity = 0...0
         }
         if let unexpected = switches.union(options.keys).subtracting(allowed).sorted().first {
@@ -192,6 +197,9 @@ struct Args {
             guard let n = double(name), n.isFinite, n >= 0, name != "scale" || n > 0 else {
                 throw CLIError("invalid --\(name)")
             }
+            if name == "timeout", ["launch", "open"].contains(command), Int(exactly: n.rounded(.towardZero)) == nil {
+                throw CLIError("invalid --timeout")
+            }
         }
     }
     func has(_ s: String) -> Bool { switches.contains(s) }
@@ -200,4 +208,20 @@ struct Args {
     func double(_ k: String) -> Double? { opt(k).flatMap(Double.init) }
     func int(_ k: String) -> Int? { opt(k).flatMap(Int.init) }
     func pos(_ i: Int) -> String? { positional.indices.contains(i) ? positional[i] : nil }
+}
+
+func appendLogLine(_ line: String, to url: URL) {
+    let fd = open(url.path, O_WRONLY | O_CREAT | O_APPEND | O_CLOEXEC, 0o600)
+    guard fd >= 0 else { return }
+    defer { close(fd) }
+    Data(line.utf8).withUnsafeBytes { bytes in
+        guard let base = bytes.baseAddress else { return }
+        var written = 0
+        while written < bytes.count {
+            let n = write(fd, base.advanced(by: written), bytes.count - written)
+            if n < 0 && errno == EINTR { continue }
+            guard n > 0 else { return }
+            written += n
+        }
+    }
 }

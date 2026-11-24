@@ -5,18 +5,19 @@ set -euo pipefail
 cd "$(dirname "$0")"
 ROOT="$(cd .. && pwd)"
 if [[ -z ${BACKSTAGE_BIN:-} ]]; then
-    (cd "$ROOT" && swift build -c release)
+    (cd "$ROOT" && make build)
     BACKSTAGE_BIN="$(cd "$ROOT" && swift build -c release --show-bin-path)/backstage"
 fi
 BS="$BACKSTAGE_BIN"
 WORK="$(mktemp -d /tmp/backstage-e2e.XXXX)"
 export BACKSTAGE_HOME="$WORK/state"
+unset BACKSTAGE_SESSION
 LOG="$WORK/fixture.log"
 WATCH=
 cleanup() {
     local result=$?
     trap - EXIT
-    if [[ -f "$BACKSTAGE_HOME/daemon.json" ]]; then "$BS" stop || result=1; fi
+    if [[ -f "$BACKSTAGE_HOME/daemon.json" || -f "$BACKSTAGE_HOME/apps.json" ]]; then "$BS" stop --all || result=1; fi
     if [[ -n "$WATCH" ]]; then
         touch "$WORK/watch.stop"
         wait "$WATCH" || result=1

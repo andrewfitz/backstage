@@ -7,8 +7,10 @@
 //                                       the inaudible probe (>= 18 kHz, -60 dBFS, 10 ms ramps, <= 2 s),
 //                                       from the first rendered frame, through a raw HAL IOProc, on
 //                                       output channels 1-2 (optionally a second burst after a pause)
-//   audioprobe listen --device U --hz H --secs S [--channel N]
-//                                       read a loopback device's input: what really reached it
+//   audioprobe listen --device U --hz H --secs S [--channel N] [--stop-file FILE]
+//                                       read a loopback device's input: what really reached it.
+//                                       With --stop-file, wait for FILE (bounded by S), then
+//                                       record another 250 ms to cover loopback and analysis lag.
 //   audioprobe capture --hz H --secs S [--sck] [--ready FILE]
 //                                       what system-wide captures get: an UNMUTED private global tap
 //                                       (excluding nothing) and, with --sck, our own ScreenCaptureKit
@@ -55,8 +57,13 @@ func channels(_ d: AudioObjectID, input: Bool) -> Int {
     return UnsafeMutableAudioBufferListPointer(raw.assumingMemoryBound(to: AudioBufferList.self)).reduce(0) { $0 + Int($1.mNumberChannels) }
 }
 func scalar<T>(_ d: AudioObjectID, _ s: AudioObjectPropertySelector, _ v: T) -> T {
-    var a = addr(s); var v = v; var size = UInt32(MemoryLayout<T>.size)
-    AudioObjectGetPropertyData(d, &a, 0, nil, &size, &v); return v
+    var a = addr(s), value = v
+    let expectedSize = UInt32(MemoryLayout<T>.size)
+    var size = expectedSize
+    let result = withUnsafeMutablePointer(to: &value) {
+        AudioObjectGetPropertyData(d, &a, 0, nil, &size, $0)
+    }
+    return result == noErr && size == expectedSize ? value : v
 }
 func audioClock() -> Double {
     var tb = mach_timebase_info_data_t(); mach_timebase_info(&tb)
@@ -135,16 +142,24 @@ case "listen":
     // carry live signal, so leak checks there count tone windows rather than non-zero frames.
     let d = device(opt("device") ?? "")
     let hz = Double(opt("hz") ?? "18500")!, secs = Double(opt("secs") ?? "3")!
+    guard secs.isFinite, secs > 0, secs <= 3600 else { fail("invalid listening duration") }
+    let stopFile = opt("stop-file")
     let want = max(Int(opt("channel") ?? "1") ?? 1, 1) - 1
     let rate = scalar(d, kAudioDevicePropertyNominalSampleRate, Float64(48000))
     let coeff = 2 * cos(2 * Double.pi * hz / rate), win = Int(rate / 10)
-    let n = max(channels(d, input: true), 1)
+    let n = channels(d, input: true)
+    guard want < n else { fail("input channel \(want + 1) is unavailable") }
     var s1 = [Double](repeating: 0, count: n), s2 = s1, best = [Double](repeating: -200, count: n)
     var k = 0, toneWindows = 0, nonzero = 0, firstNonzero = 0.0
     let lock = NSLock()
+    let ready = DispatchSemaphore(value: 0)
+    var listenStart = 0.0, listenEnd = 0.0
+    var timebase = mach_timebase_info_data_t()
+    mach_timebase_info(&timebase)
+    let hostTimeScale = Double(timebase.numer) / Double(timebase.denom) / 1e9
     var proc: AudioDeviceIOProcID?
-    AudioDeviceCreateIOProcIDWithBlock(&proc, d, nil) { _, input, inTime, _, _ in
-        let t = Double(inTime.pointee.mHostTime) * { var tb = mach_timebase_info_data_t(); mach_timebase_info(&tb); return Double(tb.numer) / Double(tb.denom) / 1e9 }()
+    let create = AudioDeviceCreateIOProcIDWithBlock(&proc, d, nil) { _, input, inTime, _, _ in
+        let t = Double(inTime.pointee.mHostTime) * hostTimeScale
         lock.lock(); defer { lock.unlock() }
         var chans: [(UnsafeMutablePointer<Float>, Int, Int)] = []   // (buffer, stride, offset) per device channel
         var frames = 0
@@ -153,6 +168,12 @@ case "listen":
             let ch = max(Int(b.mNumberChannels), 1); frames = Int(b.mDataByteSize) / 4 / ch
             for c in 0..<ch where chans.count < n { chans.append((p, ch, c)) }
         }
+        guard frames > 0, chans.indices.contains(want), t > 0 else { return }
+        if listenStart == 0 {
+            listenStart = t
+            ready.signal()
+        }
+        listenEnd = t + Double(frames) / rate
         for i in 0..<frames {
             for (c, (p, stride, offset)) in chans.enumerated() {
                 let x = Double(p[i * stride + offset])
@@ -173,12 +194,24 @@ case "listen":
             }
         }
     }
-    AudioDeviceStart(d, proc)
-    let listenStart = audioClock()
-    FileHandle.standardError.write("LISTENING\n".data(using: .utf8)!)
-    usleep(UInt32(secs * 1_000_000))
-    let listenEnd = audioClock()
-    AudioDeviceStop(d, proc); AudioDeviceDestroyIOProcID(d, proc!)
+    guard create == noErr, let proc else { fail("cannot create input IOProc: \(create)") }
+    let start = AudioDeviceStart(d, proc)
+    guard start == noErr else { fail("cannot start input IOProc: \(start)") }
+    guard ready.wait(timeout: .now() + 8) == .success else { fail("no input samples received") }
+    FileHandle.standardError.write(Data("LISTENING\n".utf8))
+    if let stopFile {
+        let deadline = audioClock() + secs
+        while !FileManager.default.fileExists(atPath: stopFile) {
+            guard audioClock() < deadline else { fail("timed out waiting for the player to finish") }
+            usleep(20_000)
+        }
+        usleep(250_000)
+    } else {
+        Thread.sleep(forTimeInterval: secs)
+    }
+    let stop = AudioDeviceStop(d, proc)
+    guard stop == noErr else { fail("cannot stop input IOProc: \(stop)") }
+    AudioDeviceDestroyIOProcID(d, proc)
     lock.lock()
     emit(["nonzeroFrames": nonzero, "toneDb": (best[min(want, n - 1)] * 10).rounded() / 10, "toneWindows": toneWindows,
           "firstNonzero": firstNonzero, "start": listenStart, "end": listenEnd, "channel": want + 1, "channelToneDb": best.map { ($0 * 10).rounded() / 10 }])
