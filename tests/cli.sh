@@ -12,8 +12,9 @@ mkdir "$BACKSTAGE_HOME"
 child=$!
 cleanup() {
     if [[ -n "$child" ]]; then
-        kill "$child" 2>/dev/null || :
-        wait "$child" 2>/dev/null || :
+        # shellcheck disable=SC2086 # one PID, or several separated by spaces
+        kill $child 2>/dev/null || :
+        wait $child 2>/dev/null || :
     fi
     rm -rf "$work"
 }
@@ -294,4 +295,78 @@ reject 'exclude each other' launch "$work/adhoc" --audio --inaudible
 reject "can't launch hardened inaudible: .*hardened runtime" launch "$work/hardened" --inaudible
 BACKSTAGE_INAUDIBLE_DYLIB= reject "can't launch adhoc inaudible: .*wasn't found" launch "$work/adhoc" --inaudible
 reject 'not an option' audio --inaudible
+
+# Apps the user sent backstage (owner "user"): any session reaches them with an explicit --pid
+# or --app, none gets them as its default target, a session's plain `stop` leaves them, and
+# `stop --all` quits them. Two windowless processes stand in for the apps.
+/bin/sleep 300 &
+sent=$!
+/bin/sleep 300 &
+own=$!
+child="$sent $own"
+: > "$work/sent.log"
+jq -n --argjson sent "$sent" --argjson sb "$("$work/birth" "$sent")" --argjson own "$own" --argjson ob "$("$work/birth" "$own")" \
+    --arg log "$work/sent.log" \
+    '[{pid:$sent,name:"SentApp",path:"/bin/sleep",launchedAt:now,stdout:$log,processStart:$sb,session:"user",audio:"muted"},
+      {pid:$own,name:"OwnApp",path:"/bin/sleep",launchedAt:now,stdout:$log,processStart:$ob,session:"owner-a",audio:"muted"}]' \
+    > "$BACKSTAGE_HOME/apps.json"
+BACKSTAGE_SESSION=user reject 'reserved for apps the user sent' list
+for s in owner-a owner-b; do
+    BACKSTAGE_SESSION=$s "$bin" logs --pid "$sent" --lines 1 > /dev/null
+    BACKSTAGE_SESSION=$s "$bin" logs --app SentApp --lines 1 > /dev/null
+    BACKSTAGE_SESSION=$s "$bin" list | jq -e --argjson sent "$sent" \
+        '(.apps | map(.pid) | index($sent) | not) and .sentByUser[0].pid == $sent and (.note | test("--pid"))' >/dev/null
+done
+BACKSTAGE_SESSION=owner-b reject 'no managed apps in this session' logs
+BACKSTAGE_SESSION=owner-b reject 'another backstage session' logs --pid "$own"
+BACKSTAGE_SESSION=owner-a "$bin" list --all | jq -e --argjson sent "$sent" '.apps | map(select(.pid == $sent and .session == "user")) | length == 1' >/dev/null
+BACKSTAGE_SESSION=owner-a "$bin" stop | jq -e --argjson own "$own" '.ok and .quit == [$own] and (.daemon | test("not running|user sent"))' >/dev/null
+wait "$own" 2>/dev/null || :
+kill -0 "$sent"
+BACKSTAGE_SESSION=owner-b "$bin" stop | jq -e '.ok and .quit == []' >/dev/null
+kill -0 "$sent"
+"$bin" stop --all | jq -e --argjson sent "$sent" '.ok and .quit == [$sent]' >/dev/null
+wait "$sent" 2>/dev/null || :
+! kill -0 "$sent" 2>/dev/null
+child=
+
+# Send Front Window Backstage: what is never sent (the static rules), and the test hook's gate.
+refused() { "$bin" __send-refusal "$@" | jq -e '.refused | type == "string"' >/dev/null; }
+allowed() { "$bin" __send-refusal "$@" | jq -e '.refused == null' >/dev/null; }
+refused --bundle-id com.apple.finder --name Finder --path /System/Library/CoreServices/Finder.app
+refused --bundle-id com.apple.dock --name Dock
+refused --name WindowServer --path /System/Library/PrivateFrameworks/SkyLight.framework/Resources/WindowServer
+refused --bundle-id com.apple.Terminal --name Terminal --path /System/Applications/Utilities/Terminal.app
+refused --bundle-id com.mitchellh.ghostty --name Ghostty
+refused --bundle-id com.googlecode.iterm2 --name iTerm2
+refused --bundle-id com.anthropic.claudefordesktop --name Claude
+refused --bundle-id com.openai.codex --name ChatGPT
+refused --bundle-id tv.parsec.www --name Parsec
+refused --name herdr
+allowed --bundle-id com.apple.TextEdit --name TextEdit --path /System/Applications/TextEdit.app
+allowed --bundle-id com.apple.Safari --name Safari --path /Applications/Safari.app
+allowed --bundle-id dev.example.thing --name Thing --path /Applications/Thing.app
+BACKSTAGE_TEST_REFUSE=dev.example "$bin" __send-refusal --bundle-id dev.example.thing --name Thing | jq -e '.refused | type == "string"' >/dev/null
+reject 'internal command' __send-backstage --pid 1
+reject 'focus-to' __send-backstage --pid 1 --focus-to 0
+
+# Settings: round trip through settings.json, validation, and `status`.
+"$bin" settings | jq -e '.keepInMenuBar == false and .hotkey == "off" and (.hotkeyNote | test("off by default")) and .daemon == "not running"' >/dev/null
+"$bin" settings keep-in-menu-bar on | jq -e '.ok and .keepInMenuBar == true and (.note | test("backstage start"))' >/dev/null
+jq -e '.keepInMenuBar == true' "$BACKSTAGE_HOME/settings.json" >/dev/null
+"$bin" settings hotkey cmd+opt+b | jq -e '.hotkey == "opt+cmd+b" and .hotkeySymbols == "⌥⌘B" and .keepInMenuBar == true' >/dev/null
+"$bin" settings hotkey Control+Option+Command+F5 | jq -e '.hotkey == "ctrl+opt+cmd+f5"' >/dev/null
+"$bin" settings hotkey default | jq -e '.hotkey == "ctrl+opt+cmd+b" and .hotkeySymbols == "⌃⌥⌘B"' >/dev/null
+reject 'at least two modifiers' settings hotkey ctrl+b
+reject 'at least two modifiers' settings hotkey shift+opt+b
+reject 'letter, a digit or F1' settings hotkey ctrl+opt+tab
+reject 'letter, a digit or F1' settings hotkey ctrl+opt+f13
+reject 'more than one key' settings hotkey ctrl+opt+a+b
+reject 'no key' settings hotkey ctrl+opt
+reject 'usage' settings keep-in-menu-bar maybe
+reject 'usage' settings colour blue
+"$bin" status | jq -e '.settings.keepInMenuBar == true and .settings.hotkey == "ctrl+opt+cmd+b"' >/dev/null
+"$bin" settings hotkey off | jq -e '.hotkey == "off" and (.hotkeySymbols | not)' >/dev/null
+"$bin" settings keep-in-menu-bar off | jq -e '.keepInMenuBar == false' >/dev/null
+jq -e '.keepInMenuBar == false and .hotkey == "off"' "$BACKSTAGE_HOME/settings.json" >/dev/null
 echo "CLI regression checks passed"

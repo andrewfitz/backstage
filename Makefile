@@ -11,7 +11,7 @@ define fresh_bin
 testdir=$$(mktemp -d /tmp/backstage-test.XXXXXX) && trap 'rm -f "$$testdir/backstage" "$$testdir/$(DYLIB_NAME)"; rmdir "$$testdir"' EXIT && cp "$(BIN)" "$$testdir/backstage" && cp "$(DYLIB)" "$$testdir/$(DYLIB_NAME)"
 endef
 
-.PHONY: build install uninstall dist test test-cli test-agents test-multi test-concurrency test-focus test-computer-use test-audio test-dock test-launch load
+.PHONY: build install uninstall dist test test-cli test-agents test-multi test-concurrency test-focus test-computer-use test-audio test-dock test-launch test-send load
 
 build:
 	swift build -c release
@@ -79,6 +79,9 @@ test-dock: build
 test-launch: build
 	$(fresh_bin) && BACKSTAGE_BIN="$$testdir/backstage" tests/launch.sh
 
+test-send: build
+	$(fresh_bin) && BACKSTAGE_BIN="$$testdir/backstage" tests/send.sh
+
 test: test-cli test-agents
 	$(fresh_bin) && BACKSTAGE_BIN="$$testdir/backstage" tests/e2e.sh
 	$(fresh_bin) && BACKSTAGE_BIN="$$testdir/backstage" tests/launch.sh
@@ -88,6 +91,7 @@ test: test-cli test-agents
 	$(fresh_bin) && BACKSTAGE_BIN="$$testdir/backstage" tests/computer-use.sh
 	$(fresh_bin) && BACKSTAGE_BIN="$$testdir/backstage" tests/audio.sh
 	$(fresh_bin) && BACKSTAGE_BIN="$$testdir/backstage" tests/dock.sh
+	$(fresh_bin) && BACKSTAGE_BIN="$$testdir/backstage" tests/send.sh
 
 # Load harness (docs/LOAD_TESTING.md), not part of `make test`. Defaults to a short 2-session
 # smoke run. Full runs (8/16/32 sessions, with --dedicated) belong on a separate macOS user

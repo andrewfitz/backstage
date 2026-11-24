@@ -29,7 +29,7 @@ and a session owns the apps it launches: its default target, `list`, `logs`, scr
 error. Sessions keep cooperating agents out of each other's way; they aren't a security
 boundary. The session is worked out per command, first match wins:
 
-1. `BACKSTAGE_SESSION=<name>`, if set and non-empty. `legacy` is reserved.
+1. `BACKSTAGE_SESSION=<name>`, if set and non-empty. `legacy` and `user` are reserved.
 2. The nearest agent process above the command (claude, codex, grok, cursor-agent, gemini,
    opencode, aider, amp, goose, including one run by `node`, `python`, `bun` or `deno`, which
    is recognised from its arguments), using that agent's own session variable if it sets one
@@ -70,9 +70,18 @@ session. They're never a default target and plain `stop` leaves them alone. `lis
 them, `stop --all` quits them, and an explicit `--pid` still reaches them, since no session
 owns them.
 
+**Apps the user sent backstage** (Send Front Window Backstage, ⌃⌥⌘B: see the README's
+[Menu bar indicator](../README.md#send-front-window-backstage)) belong to the `user` session.
+The user hands them to agents on purpose, so any session reaches one with an explicit `--pid`
+or `--app` (`--app` looks in your own apps first). They're never a default target, a session's
+`list` names them only under `sentByUser` (with a note), and plain `stop` leaves them alone.
+`list --all` shows them, and `stop --all`, the menu's Quit All Agent Apps or the app's own Quit
+quit them. `quit --pid P` works too, but they hold the user's work: quit one only when asked.
+Their `audio` is `muted` (they were already running, so they can't be made inaudible).
+
 **App selection.** Commands that act on an app take `--pid P` or `--app NAME` (a managed
-app's name or bundle id), within your session. With neither, they target your session's most
-recently launched app.
+app's name or bundle id), within your session (or an app the user sent backstage). With
+neither, they target your session's most recently launched app.
 
 **Element refs.** `tree` and `find` label elements like `w8432.0.3`: the window ID, then
 child indices. Refs survive windows being reordered, but not UI changes inside the window,
@@ -182,7 +191,9 @@ The last N lines (default 100) of the app's stdout and stderr.
 ### `status` / `doctor`
 Shows the permissions (Accessibility, Screen Recording), the daemon and display, the current
 session (`id`, and `from`: which rule above produced it), and every session's managed apps.
-When something's missing, `problems` lists what to grant and where.
+When something's missing, `problems` lists what to grant and where. `settings` shows your
+settings (see [`settings`](#settings)), and with a daemon running, `hotkeyRegistered` (and
+`hotkeyError` if the shortcut couldn't be registered).
 
 `audio` describes muting and measuring:
 
@@ -232,12 +243,44 @@ running stops itself once idle). A launch your session started before the `stop`
 rather than registered. If something fails, `ok` is false and `error` says what, but `quit`
 still lists the apps that were quit.
 
-`stop --all` is the admin form. It quits every app in every session, `legacy` included, and
-stops the daemon. Both forms are safe to run twice.
+`stop --all` is the admin form. It quits every app in every session, `legacy` and `user`
+included, and stops the daemon. Both forms are safe to run twice. Apps the user sent backstage
+are quit gracefully only: one that doesn't quit within 3 s (an unsaved-changes dialog) is given
+back to the user's screen instead of being forced.
+
+With Keep in Menu Bar on, plain `stop` never stops the daemon (`daemon` says so); `stop --all`
+still does.
 
 Apps are always quit *before* the display is removed, so nothing falls onto your screen. The
 daemon also exits by itself after `BACKSTAGE_IDLE_TIMEOUT` seconds (default 1800) once no
-session has managed apps, or when no physical display is left.
+session has managed apps (never while Keep in Menu Bar is on; the timeout starts over when it's
+turned off), or when no physical display is left.
+
+### `settings`
+
+```
+backstage settings                          # show them
+backstage settings keep-in-menu-bar on|off  # keep the menu bar icon (and the daemon) with no apps
+backstage settings hotkey <combo|off>       # the Send Front Window Backstage shortcut
+```
+Stored in `$BACKSTAGE_HOME/settings.json`. The running daemon applies a change within half a
+second, without a restart; the command waits for it and reports `hotkeyRegistered` (plus
+`hotkeyError`, e.g. when the combo is a macOS keyboard shortcut). With no daemon, `daemon` is
+`"not running"`: `backstage start` brings up the icon after a restart (nothing starts at login).
+
+- **keep-in-menu-bar** (default off): the icon stays with no apps (icon only, no count), the
+  daemon doesn't exit when idle, plain `stop` leaves it running, and the menu's Quit All quits
+  the apps but keeps it. Off again with no apps: the idle timeout runs from then. Ignored with
+  `BACKSTAGE_MENUBAR=off`.
+- **hotkey** (default `ctrl+opt+cmd+b`, ⌃⌥⌘B): two or more of `ctrl`/`control`, `opt`/`option`/
+  `alt`, `shift`, `cmd`/`command`, one of them `cmd` or `ctrl`, then a letter, digit or `f1`–`f12`
+  (keys by their place on a US keyboard). `default` restores ⌃⌥⌘B; `off` turns it off. It's
+  reported in canonical form (`opt+cmd+b`) with `hotkeySymbols` (`⌥⌘B`). The daemon registers it
+  with Carbon's `RegisterEventHotKey` (no permission needed) and needs the menu bar: there's none
+  with `BACKSTAGE_MENUBAR=off`. A combo that's an enabled macOS keyboard shortcut is refused and
+  logged; one another app registered the same way can't be detected, since macOS accepts both.
+  Only the daemon in `~/.backstage` has a shortcut by default: a daemon with another
+  `BACKSTAGE_HOME` registers one only if its settings name it (`hotkeyNote` says so).
 
 A launch that dies before its app is registered (an agent's tool timeout, Ctrl-C) leaves a
 record behind; the daemon quits the app it started, so nothing is left unowned. A launch that
@@ -259,7 +302,8 @@ stays inaudible (`"audio": "inaudible"`): it silenced itself, and only relaunchi
 that (`show <app>`, or `launch --audio` then `show --pid`). An app `launch` kept out of
 the Dock becomes a regular app again first: `"dock": "restored"` (or `"visible"` if it already
 had a Dock tile). Menu bar apps whose own Info.plist sets `LSUIElement` have no Dock tile to
-restore; `dock` then says why.
+restore; `dock` then says why. `show --pid P` also gives back an app the user sent backstage
+(`list --all`, session `user`), the same way: on their screen, focused, audible again.
 
 ### `show <app|file|url>`
 Opens anything on the user's screen, the way `open` would. If backstage is running a hidden
@@ -568,11 +612,14 @@ variables only reorder the advice: nothing extra is allowed.
 | Variable | Default | Effect |
 |---|---|---|
 | `BACKSTAGE_HOME` | `~/.backstage` | State, logs, screenshots. Each home has its own daemon and agent display; daemons of different homes run side by side, their displays chained diagonally off the corner, each touching the next only at a corner point |
-| `BACKSTAGE_SESSION` | derived | The session this command belongs to (see Sessions); `legacy` is reserved |
+| `BACKSTAGE_SESSION` | derived | The session this command belongs to (see Sessions); `legacy` and `user` are reserved |
 | `BACKSTAGE_WIDTH` / `BACKSTAGE_HEIGHT` | main display's size | Agent display size in points (set before the daemon starts) |
 | `BACKSTAGE_SCALE` | 2 | Agent display backing scale: `2` is Retina, `1` gives a 1x display (set before the daemon starts) |
-| `BACKSTAGE_IDLE_TIMEOUT` | 1800 | Seconds with no managed apps before the daemon exits |
-| `BACKSTAGE_MENUBAR` | on | `off` hides the menu bar indicator (set before the daemon starts) |
+| `BACKSTAGE_IDLE_TIMEOUT` | 1800 | Seconds with no managed apps before the daemon exits (not while Keep in Menu Bar is on) |
+| `BACKSTAGE_MENUBAR` | on | `off` hides the menu bar indicator, and with it the hotkey and Keep in Menu Bar (set before the daemon starts) |
+| `BACKSTAGE_TEST_HOOKS` | — | Tests only: `1` allows `backstage __send-backstage --pid P`, the Send Front Window Backstage path the menu and hotkey run |
+| `BACKSTAGE_TEST_REFUSE` | — | Tests only: one more bundle-ID prefix Send Front Window Backstage refuses |
+| `BACKSTAGE_TEST_SEND_REQUESTS` | — | Tests only (set before the daemon starts): `1` makes the daemon send a pid written to `$BACKSTAGE_HOME/send-request` through its hotkey path, in place of the frontmost app |
 | `BACKSTAGE_HOOK` | on | `off` disables the hook |
 | `BACKSTAGE_SHOW` | — | `1` as a command prefix lets that command past the hook |
 | `BACKSTAGE_TEST_AUDIO` | — | Tests only (set before the daemon starts): `mute-fail`, `tap-fail` or `no-capture` simulate those failures |

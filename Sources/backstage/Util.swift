@@ -68,7 +68,8 @@ struct Args {
         let flags: Set<String> = ["help", "json", "force", "double", "right", "raw", "gone", "full", "claude", "codex", "grok", "hooks", "all", "sound", "dock",
                                 "audio", "inaudible"]
         let values: Set<String> = ["pid", "app", "env", "timeout", "lines", "scale", "o", "out",
-                                   "window", "depth", "role", "text", "ref", "steps", "dx", "dy", "since", "min-db", "seconds"]
+                                   "window", "depth", "role", "text", "ref", "steps", "dx", "dy", "since", "min-db", "seconds",
+                                   "focus-to", "bundle-id", "name", "path"]
         var i = 0
         while i < raw.count {
             let token = raw[i]
@@ -175,6 +176,9 @@ struct Args {
         case "scroll": allowed = target + ["scale", "dx", "dy"]; arity = 2...2
         case "drag": allowed = target + ["scale", "steps"]; arity = 4...4
         case "__menu-thumbnail": allowed = []; arity = 4...4
+        case "settings": allowed = []; arity = 0...2
+        case "__send-backstage": allowed = ["pid", "focus-to"]; arity = 0...0
+        case "__send-refusal": allowed = ["bundle-id", "name", "path"]; arity = 0...0
         default: allowed = []; arity = 0...0
         }
         if let unexpected = switches.union(options.keys).subtracting(allowed).sorted().first {
@@ -183,6 +187,7 @@ struct Args {
         guard arity.contains(positional.count) else { throw CLIError("wrong number of arguments for \(command). Run backstage help.") }
         guard opt("pid") == nil || opt("app") == nil else { throw CLIError("choose one of --pid and --app") }
         if let pid = opt("pid"), (Int32(pid) ?? 0) <= 0 { throw CLIError("--pid needs a positive process ID") }
+        if let pid = opt("focus-to"), (Int32(pid) ?? 0) <= 0 { throw CLIError("--focus-to needs a positive process ID") }
         if opt("app") == "" { throw CLIError("--app needs a name or bundle identifier") }
         for name in ["lines", "depth", "steps"] where opt(name) != nil {
             guard let n = int(name), n >= (name == "steps" ? 1 : 0) else { throw CLIError("invalid --\(name)") }

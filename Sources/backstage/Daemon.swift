@@ -122,6 +122,20 @@ final class Daemon {
     let sizeSource: String
     let inputGuard = InputGuard()
     var inputGuardUp = false
+    /// The user's app switches, most recent first (Send Front Window Backstage hands focus back).
+    var recentUserApps: [NSRunningApplication] = []
+    var sendInFlight = false
+    /// settings.json as last applied, and its stamp (published in daemon.json).
+    var settings = Settings()
+    var settingsApplied: String?
+    var nextSettingsCheck = 0.0
+    var hotKey: GlobalHotKey?
+    /// The hotkey settings asked for when last applied, and why it couldn't be registered.
+    var hotkeyWanted: String??
+    var hotkeyError: String?
+    /// Keep in Menu Bar is on and there is a menu bar item to keep: no idle exit.
+    var keepActive: Bool { settings.keep && statusMenu != nil }
+    let testSendRequests = ProcessInfo.processInfo.environment["BACKSTAGE_TEST_SEND_REQUESTS"] == "1"
 
     init() throws {
         owner = try StateLock("daemon.lock", nonblocking: true)
@@ -173,6 +187,7 @@ final class Daemon {
         refreshScreens()
 
         lastUserApp = NSWorkspace.shared.frontmostApplication
+        if let front = lastUserApp { noteUserApp(front) }
         NSWorkspace.shared.notificationCenter.addObserver(forName: NSWorkspace.didActivateApplicationNotification, object: nil, queue: .main) { [weak self] n in
             guard let self, let app = n.userInfo?[NSWorkspace.applicationUserInfoKey] as? NSRunningApplication else { return }
             if self.managed.contains(app.processIdentifier) {
@@ -181,6 +196,7 @@ final class Daemon {
             } else {
                 self.lastUserApp = app
                 self.inputGuard.updateUser(app.processIdentifier)
+                if app.processIdentifier != getpid() { self.noteUserApp(app) }
             }
         }
         // Keep the user's input out of managed apps (an open menu takes the keyboard focus).
@@ -214,6 +230,7 @@ final class Daemon {
             NSApplication.shared.setActivationPolicy(.accessory)
             statusMenu = StatusMenu(daemon: self)
         }
+        applySettings()
         let timer = Timer(timeInterval: 0.05, repeats: true) { [weak self] _ in
             autoreleasepool {
                 let started = ProcessInfo.processInfo.systemUptime
@@ -286,13 +303,68 @@ final class Daemon {
                                                protocol: DaemonInfo.currentProtocol, stopping: shutdownRequested ? true : nil,
                                                sizeSource: sizeSource, inputGuard: inputGuardUp,
                                                audio: audioUnavailable == nil, audioReason: audioUnavailable,
-                                               audioModes: true, delayedLaunchHandoff: true))
+                                               audioModes: true, delayedLaunchHandoff: true,
+                                               hotkey: hotKey?.registered?.spec, hotkeyError: hotkeyError, settingsApplied: settingsApplied))
     }
 
     func markShutdown(_ requested: Bool) {
         guard shutdownRequested != requested else { return }
         shutdownRequested = requested
         do { try writeInfo() } catch { log("cannot update display state: \(error)") }
+    }
+
+    /// Read settings.json and apply what changed: Keep in Menu Bar, and the hotkey (re-registered
+    /// without a restart). Publishes the result in daemon.json.
+    func applySettings() {
+        let stamp = settingsStamp()
+        let old = settings
+        settings = Settings.load()
+        let first = settingsApplied == nil
+        settingsApplied = stamp
+        if first || old.keep != settings.keep {
+            log("keep in menu bar: \(settings.keep ? "on" : "off")" + (settings.keep && statusMenu == nil ? " (ignored: BACKSTAGE_MENUBAR=off)" : ""))
+            if !settings.keep { idleSince = ProcessInfo.processInfo.systemUptime }
+        }
+        let want = settings.effectiveHotKey
+        if hotkeyWanted == nil || hotkeyWanted! != want {
+            hotkeyWanted = .some(want)
+            hotkeyError = nil
+            if let spec = want {
+                if statusMenu == nil {
+                    hotkeyError = "the hotkey needs the menu bar (BACKSTAGE_MENUBAR=off)"
+                } else if let combo = try? HotKeyCombo(spec) {
+                    let key = hotKey ?? GlobalHotKey { [weak self] in self?.sendFrontWindowBackstage(from: "hotkey") }
+                    hotKey = key
+                    hotkeyError = key.register(combo)
+                } else {
+                    hotKey?.unregister()
+                    hotkeyError = "settings.json has an invalid hotkey '\(spec)'"
+                }
+                log(hotkeyError.map { "hotkey: not registered: \($0)" }
+                    ?? "hotkey: \(hotKey?.registered?.symbols ?? spec) registered for Send Front Window Backstage")
+            } else {
+                hotKey?.unregister()
+                log("hotkey: off")
+            }
+        }
+        do { try writeInfo() } catch { log("cannot update display state: \(error)") }
+        statusMenu?.update(apps: managed.count)
+    }
+
+    /// The menu's Quit All while Keep in Menu Bar is on: quit every app (agents' gracefully then
+    /// forcefully; the user's own apps gracefully, given back if they don't quit), but keep the
+    /// daemon and its icon.
+    func quitAllApps() {
+        let records = registry.filter { $0.matchesProcess }
+        log("quitting all \(records.count) app(s) from the menu bar (keep in menu bar is on)")
+        for record in records { try? record.requestTermination(force: false) }
+        DispatchQueue.main.asyncAfter(deadline: .now() + 3) { [weak self] in
+            guard let self, !self.stopping else { return }
+            for record in records where record.matchesProcess {
+                if Session.isUser(record.session) { releaseToUser(record, log: self.log) }
+                else { try? record.requestTermination(force: true) }
+            }
+        }
     }
 
     // Each registry update atomically replaces the file. Read and decode it only after replacement.
@@ -327,6 +399,12 @@ final class Daemon {
         nextReload = now + 0.25
         registry.removeAll { !$0.matchesProcess }
         managed = Set(registry.map { $0.pid })
+        // An app the user just sent backstage was their frontmost app: never hand focus (or
+        // redirected keys) back to it.
+        if let last = lastUserApp, managed.contains(last.processIdentifier) {
+            lastUserApp = nextUserApp(excluding: last.processIdentifier)
+            inputGuard.updateUser(lastUserApp?.processIdentifier ?? 0)
+        }
         if !registryUnreadable { pushAudioRegistry() }
         var births: [pid_t: UInt64] = [:]
         for app in registry {
@@ -450,6 +528,13 @@ final class Daemon {
         if let reason = pendingShutdown { shutdown(reason: reason) }
         reloadManaged(now: now)
         if now >= nextGuardLog { nextGuardLog = now + 1; inputGuard.logActivity(log) }
+        if now >= nextSettingsCheck {
+            nextSettingsCheck = now + 0.5
+            if settingsStamp() != settingsApplied { applySettings() }
+            if testSendRequests { checkTestSendRequest() }
+        }
+        // Keep in Menu Bar: never idle. Turning it off starts the idle timeout from then.
+        if keepActive { idleSince = now }
         if let m = statusMenu, now >= nextMenuUpdate {
             nextMenuUpdate = now + 0.5
             m.update(apps: managed.count)
@@ -560,17 +645,25 @@ final class Daemon {
         let entries = registry.map(AudioRegistryEntry.init)
         guard entries != audioRegistry else { return }
         audioRegistry = entries
-        bs_crash_set(0, entries.map { Int32($0.pid) }, entries.map { $0.birth }, Int32(entries.count))
+        // A crash kills agent apps, never apps the user sent here: those come back to the
+        // user's screen with the display's windows.
+        let killable = entries.filter { !Session.isUser($0.session) }
+        bs_crash_set(0, killable.map { Int32($0.pid) }, killable.map { $0.birth }, Int32(killable.count))
         audioTaps?.updateRegistry(entries)
     }
 
     /// The tap manager couldn't mute an app: quit it at once, like `stop` (gracefully, then forcefully).
     func quitOverAudio(pid: pid_t, birth: UInt64, registered: Bool) {
         if registered, let record = registry.first(where: { $0.pid == pid && $0.processStart == birth }) {
+            // The user's own app is given back, audible, rather than quit.
+            if Session.isUser(record.session) { releaseToUser(record, log: log); return }
             try? record.requestTermination(force: false)
             DispatchQueue.main.asyncAfter(deadline: .now() + 1) { if record.matchesProcess { try? record.requestTermination(force: true) } }
             return
         }
+        // Registered, but no longer in the registry: handed over (Show on My Screen) a moment ago.
+        // It left management, so it's not quit here.
+        if registered { return }
         guard processBirth(pid) == birth else { return }
         kill(pid, SIGTERM)
         DispatchQueue.main.asyncAfter(deadline: .now() + 1) { if processBirth(pid) == birth { kill(pid, SIGKILL) } }
@@ -587,7 +680,7 @@ final class Daemon {
               let legacyLifecycle = try? StateLock("session.lock", nonblocking: true) else { pendingShutdown = reason; return }
         defer { withExtendedLifetime((lifecycle, legacyLifecycle)) {} }
         pendingShutdown = nil
-        let records: [ManagedApp]
+        var records: [ManagedApp]
         do {
             records = try AppStore.read(allowMissing: !registryUnreadable && !registry.contains { $0.matchesProcess })
         } catch {
@@ -605,17 +698,28 @@ final class Daemon {
         // No launch can be running (lifecycle.lock is ours), so every provisional record is an
         // orphan: quit what it started before the display goes.
         let orphans = reapOrphanLaunches(deadSince: &orphanSince, registered: { _, _ in false }, final: true, log: log)
+        // Apps the user sent here are quit only when the user asked for it (`stop --all`, a
+        // signal, the menu). Any other shutdown (the last monitor unplugged, the display couldn't
+        // be parked) gives them back instead: their windows follow the display's to the user's screen.
+        if !(reason.hasPrefix("signal") || reason == "stopped from the menu bar") {
+            for record in records where Session.isUser(record.session) { releaseToUser(record, log: log) }
+            records.removeAll { Session.isUser($0.session) }
+        }
         for record in records {
             do { try record.requestTermination(force: false) } catch { log("quit pid \(record.pid): \(error)") }
         }
         _ = waitFor(timeout: 2) { orphans.contains { processAlive($0) } ? nil : true }
         _ = waitFor(timeout: 3) { records.contains { $0.matchesProcess } ? nil : true }
-        for record in records where record.matchesProcess {
+        // Apps the user sent here are never force-quit (an unsaved-changes dialog is their work):
+        // one still running goes back to the user's screen instead.
+        let (userApps, agentApps) = (records.filter { Session.isUser($0.session) }, records.filter { !Session.isUser($0.session) })
+        for record in userApps where record.matchesProcess { releaseToUser(record, log: log) }
+        for record in agentApps where record.matchesProcess {
             do { try record.requestTermination(force: true) } catch { log("force quit pid \(record.pid): \(error)") }
         }
-        _ = waitFor(timeout: 1) { records.contains { $0.matchesProcess } ? nil : true }
+        _ = waitFor(timeout: 1) { agentApps.contains { $0.matchesProcess } ? nil : true }
         do {
-            guard !records.contains(where: { $0.matchesProcess }) else {
+            guard !agentApps.contains(where: { $0.matchesProcess }) else {
                 throw CLIError("managed processes are still running")
             }
             try AppStore.update { remaining in
@@ -793,12 +897,16 @@ private func stopDaemonIfIdle(session: String) throws -> String {
         let remaining = try AppStore.read()
         if !remaining.isEmpty {
             let mine = remaining.filter { Session.sameID($0.session, session) }.count
+            let sent = remaining.filter { Session.isUser($0.session) }.count
             var parts: [String] = []
             if mine > 0 { parts.append("\(plural(mine, "app")) of this session didn't quit") }
-            if remaining.count > mine { parts.append("\(plural(remaining.count - mine, "app")) in other sessions") }
+            if remaining.count > mine + sent { parts.append("\(plural(remaining.count - mine - sent, "app")) in other sessions") }
+            if sent > 0 { parts.append("\(plural(sent, "app")) the user sent backstage") }
             return "running (" + parts.joined(separator: "; ") + ")"
         }
         guard let d = readJSON(Paths.daemon, DaemonInfo.self), d.matchesProcess else { return "not running" }
+        // The user pinned the icon: only `stop --all` (or the menu) takes it down.
+        if Settings.load().keep { return "running (Keep in Menu Bar is on; `backstage stop --all` stops it)" }
         if !Launching.records().isEmpty { return "running (a launch is being cleaned up)" }
         guard kill(d.pid, SIGTERM) == 0 || errno == ESRCH else { throw CLIError("failed to signal daemon") }
         daemon = d
@@ -826,8 +934,13 @@ func stopAll() throws -> [String: Any] {
         } else {
             let records = try AppStore.read()
             quit = records.map { $0.pid }
-            guard quitApps(records) else { throw CLIError("some managed apps did not quit") }
-            try AppStore.update { _ in }
+            // Apps the user sent backstage are asked to quit, never forced: with no daemon there's
+            // no display, so one that stays (an unsaved-changes dialog) is already on their screen.
+            let sent = records.filter { Session.isUser($0.session) }
+            for record in sent { try? record.requestTermination(force: false) }
+            guard quitApps(records.filter { !Session.isUser($0.session) }) else { throw CLIError("some managed apps did not quit") }
+            _ = waitFor(timeout: 3) { sent.contains { $0.matchesProcess } ? nil : true }
+            try AppStore.update { $0.removeAll { Session.isUser($0.session) } }
         }
     }
     if let daemon {

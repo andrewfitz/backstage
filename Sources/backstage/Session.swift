@@ -36,6 +36,13 @@ struct Session {
     /// Owner of app records written before sessions existed. Only `--all` forms list or stop
     /// them; an explicit `--pid` can still address them because nobody else owns them.
     static let legacy = "legacy"
+    /// Owner of apps the user sent backstage themselves (Send Front Window Backstage). Like
+    /// legacy records, any session reaches them with an explicit `--pid` or `--app`, but they're
+    /// never a session's default target and only `stop --all` (or the menu) quits them.
+    static let user = "user"
+
+    /// The app was sent backstage by the user, not launched by an agent.
+    static func isUser(_ owner: String?) -> Bool { sameID(owner, user) }
 
     private static var cached: Session?
     static func current() throws -> Session {
@@ -63,6 +70,7 @@ struct Session {
     static func derive(_ env: [String: String]) throws -> Session {
         if let name = env["BACKSTAGE_SESSION"], !name.isEmpty {
             guard name != legacy else { throw CLIError("BACKSTAGE_SESSION=legacy is reserved for apps launched before sessions existed") }
+            guard !isUser(name) else { throw CLIError("BACKSTAGE_SESSION=user is reserved for apps the user sent backstage") }
             guard !name.unicodeScalars.contains(where: { CharacterSet.controlCharacters.contains($0) }) else {
                 throw CLIError("BACKSTAGE_SESSION must not contain control characters")
             }

@@ -1,10 +1,12 @@
 import Foundation
 import AppKit
+import QuartzCore
 import ScreenCaptureKit
 import ImageIO
 import UniformTypeIdentifiers
 
-/// Menu bar indicator owned by the daemon. Visible only while agents have apps running.
+/// Menu bar indicator owned by the daemon. Visible while apps are running backstage, or always
+/// with Keep in Menu Bar on.
 ///
 /// The menu answers, in this order: what is going on back there (a sentence and a live picture
 /// of this daemon's agent display), who is doing it (apps grouped by agent session), and what
@@ -73,18 +75,48 @@ final class StatusMenu: NSObject, NSMenuDelegate {
 
     /// Called from the daemon tick (cheap): show/hide the item and keep its tooltip current.
     func update(apps: Int) {
-        let visible = apps > 0
+        let visible = apps > 0 || daemon?.keepActive == true
         if item.isVisible != visible {
             item.isVisible = visible
             meter?.layoutChanged()
         }
         meter?.setActive(visible && (fakeAudio != nil || daemon?.registry.contains { $0.audioMode.metered } == true))
         if visible {
-            // Set only on change: touching the button redraws every copy of the item.
-            let title = " \(apps)"
+            // Set only on change: touching the button redraws every copy of the item. With no
+            // apps (Keep in Menu Bar), the icon stands alone: no "0".
+            let title = apps > 0 ? " \(apps)" : ""
             if let button = item.button, button.title != title { button.title = title; meter?.layoutChanged() }
             updateLabel()
         }
+    }
+
+    /// A note for the tooltip after Send Front Window Backstage, until it expires.
+    private var cueNote: (text: String, until: Double)?
+
+    /// Quiet feedback for Send Front Window Backstage: a VoiceOver announcement, a line in the
+    /// tooltip, and a short animation of the icon (two soft blinks when sent, a small shake when
+    /// refused; with Reduce Motion, one dim). No sound, no alert, nothing that takes focus.
+    func sendCue(text: String, success: Bool) {
+        cueNote = (text, ProcessInfo.processInfo.systemUptime + 6)
+        updateLabel()
+        guard let button = item.button else { return }
+        NSAccessibility.post(element: button, notification: .announcementRequested,
+                             userInfo: [.announcement: text, .priority: NSAccessibilityPriorityLevel.high.rawValue])
+        guard item.isVisible, let layer = button.layer else { return }
+        let reduce = meter?.reduceMotion ?? NSWorkspace.shared.accessibilityDisplayShouldReduceMotion
+        let animation: CAAnimation
+        if reduce || success {
+            let blink = CAKeyframeAnimation(keyPath: "opacity")
+            blink.values = reduce ? [1, 0.4, 1] : [1, 0.25, 1, 0.25, 1]
+            blink.duration = reduce ? 0.5 : 0.7
+            animation = blink
+        } else {
+            let shake = CAKeyframeAnimation(keyPath: "transform.translation.x")
+            shake.values = [0, -3, 3, -2, 2, 0]
+            shake.duration = 0.35
+            animation = shake
+        }
+        layer.add(animation, forKey: "sendCue")
     }
 
     /// VoiceOver label and tooltip. Set only when they change: touching the button redraws the
@@ -98,6 +130,9 @@ final class StatusMenu: NSObject, NSMenuDelegate {
             label += ". \(name) is playing sound, muted"
             tip += "\n\(name) is playing sound (muted, you can't hear it)"
         }
+        if let note = cueNote {
+            if ProcessInfo.processInfo.systemUptime < note.until { tip += "\n" + note.text } else { cueNote = nil }
+        }
         if button.accessibilityLabel() != label { button.setAccessibilityLabel(label) }
         if button.toolTip != tip { button.toolTip = tip }
     }
@@ -110,8 +145,18 @@ final class StatusMenu: NSObject, NSMenuDelegate {
                              "opencode": "OpenCode", "aider": "Aider", "amp": "Amp", "goose": "Goose"]
 
     /// One sentence for the top of the menu and the tooltip: who is using how many apps.
-    static func summary(_ apps: [ManagedApp]) -> String {
-        guard !apps.isEmpty else { return "No apps running" }
+    static func summary(_ all: [ManagedApp]) -> String {
+        guard !all.isEmpty else { return "No apps running" }
+        // Apps the user sent here are theirs, not an agent's.
+        let sent = all.filter { Session.isUser($0.session) }.count
+        let apps = all.filter { !Session.isUser($0.session) }
+        let sentPart = sent == 1 ? "1 app you sent" : "\(sent) apps you sent"
+        if apps.isEmpty { return "\(sentPart) \(sent == 1 ? "is" : "are") on a hidden display" }
+        let agentPart = agentSummary(apps)
+        return sent == 0 ? agentPart : "\(agentPart), with \(sentPart)"
+    }
+
+    private static func agentSummary(_ apps: [ManagedApp]) -> String {
         let what = apps.count == 1 ? "1 app" : "\(apps.count) apps"
         var agents: [String] = []
         for app in apps.sorted(by: { $0.launchedAt < $1.launchedAt }) {
@@ -132,7 +177,7 @@ final class StatusMenu: NSObject, NSMenuDelegate {
     /// itself (`claude:<uuid>`, `tty:<sid>-<start>`, `<process>:<pid>-<start>`), which mean
     /// nothing to anyone.
     static func givenSessionName(_ owner: String) -> String? {
-        if owner == Session.legacy { return nil }
+        if owner == Session.legacy || Session.isUser(owner) { return nil }
         guard let colon = owner.firstIndex(of: ":") else { return owner }
         let kind = String(owner[..<colon])
         if Session.knownAgents.contains(kind) || kind == "tty" || kind == "process" { return nil }
@@ -171,7 +216,7 @@ final class StatusMenu: NSObject, NSMenuDelegate {
             let agent = apps.lazy.compactMap { $0.agent }.first
             let who = agent.map { agentNames[$0] ?? $0 } ?? (owner.hasPrefix("tty:") ? "Terminal" : "Other")
             let detail = givenSessionName(owner) ?? apps.lazy.compactMap(folder).first
-            var label = clipped(detail.map { "\(who) — \($0)" } ?? who, to: 40)
+            var label = Session.isUser(owner) ? "Sent by you" : clipped(detail.map { "\(who) — \($0)" } ?? who, to: 40)
             used[label, default: 0] += 1
             if let n = used[label], n > 1 { label += " (\(n))" }
             return (label, apps)
@@ -180,16 +225,18 @@ final class StatusMenu: NSObject, NSMenuDelegate {
 
     /// "Running for 12 min", plus only what's worth a second look: no windows, or sound. If
     /// that's too long for the menu's width, how long it has run is the part that goes.
-    static func detail(launchedAt: Double, now: Double, windows: Int, playing: Bool) -> String {
+    /// `sent`: the user sent it backstage (launchedAt is when), so its age is "Sent … ago".
+    static func detail(launchedAt: Double, now: Double, windows: Int, playing: Bool, sent: Bool = false) -> String {
         let minutes = max(0, Int(now - launchedAt)) / 60, hours = minutes / 60
-        let age: String
+        var age: String
         switch minutes {
-        case ..<1: age = "Just launched"
-        case ..<60: age = "Running for \(minutes) min"
-        case ..<600: age = "Running for \(hours) hr" + (minutes % 60 == 0 ? "" : " \(minutes % 60) min")
-        case ..<2880: age = "Running for \(hours) hr"
-        default: age = "Running for \(hours / 24) days"
+        case ..<1: age = sent ? "Just sent" : "Just launched"
+        case ..<60: age = "\(minutes) min"
+        case ..<600: age = "\(hours) hr" + (minutes % 60 == 0 ? "" : " \(minutes % 60) min")
+        case ..<2880: age = "\(hours) hr"
+        default: age = "\(hours / 24) days"
         }
+        if minutes >= 1 { age = sent ? "Sent \(age) ago" : "Running for \(age)" }
         var parts = [age]
         if windows == 0 { parts.append("No windows") }
         if playing { parts.append("Playing sound (muted)") }
@@ -289,7 +336,7 @@ final class StatusMenu: NSObject, NSMenuDelegate {
         let apps = daemon?.registry.filter { $0.matchesProcess } ?? []
         rowsKey = Self.key(apps)
         if apps.isEmpty {
-            let none = NSMenuItem(title: "No Apps Running", action: nil, keyEquivalent: "")
+            let none = NSMenuItem(title: "No apps running", action: nil, keyEquivalent: "")
             none.isEnabled = false
             menu.addItem(none)
         }
@@ -303,16 +350,27 @@ final class StatusMenu: NSObject, NSMenuDelegate {
             }
         }
         menu.addItem(.separator())
+        menu.addItem(sendItem())
         let folder = NSMenuItem(title: "Open Screenshots & Logs Folder", action: #selector(openFolder), keyEquivalent: "")
         folder.target = self
         menu.addItem(folder)
-        // Last and on its own: it ends every agent's work in progress.
+        // On its own: it ends every agent's work in progress.
         menu.addItem(.separator())
+        let keep = daemon?.keepActive == true
         let stop = NSMenuItem(title: "Quit All Agent Apps", action: #selector(stopAll), keyEquivalent: "")
         stop.target = self
         stop.isEnabled = !apps.isEmpty
-        stop.toolTip = "Quits every app agents are running here and removes the hidden display. Your own apps aren't touched."
+        stop.toolTip = "Quits every app running here, including apps you sent backstage"
+            + (keep ? ". Backstage stays in the menu bar." : ", and removes the hidden display.")
+            + " Apps on your screen aren't touched."
         menu.addItem(stop)
+        menu.addItem(.separator())
+        let keepItem = NSMenuItem(title: "Keep in Menu Bar", action: #selector(toggleKeep), keyEquivalent: "")
+        keepItem.target = self
+        keepItem.state = daemon?.settings.keep == true ? .on : .off
+        keepItem.toolTip = "Keeps Backstage here with no apps running, so Send Front Window Backstage and its shortcut are always at hand. "
+            + "After a restart, `backstage start` brings it back."
+        menu.addItem(keepItem)
         menu.addItem(.separator())
         let footer = NSMenuItem()
         footer.view = MenuFooterView(width: MenuHeroView.width(previewWidth: Self.thumbWidth)) { [weak self] in
@@ -348,7 +406,8 @@ final class StatusMenu: NSObject, NSMenuDelegate {
             return item
         }
         let show = action("Show on My Screen", #selector(showApp(_:)))
-        show.toolTip = "Moves \(name) to your screen and hands it over to you: agents can no longer use it. "
+        show.toolTip = (Session.isUser(app.session) ? "Brings \(name) back to your screen: agents can no longer use it. "
+                        : "Moves \(name) to your screen and hands it over to you: agents can no longer use it. ")
             + (app.audioMode == .inaudible ? "It stays silent until it's relaunched." : "You'll hear its sound again.")
         sub.addItem(show)
         sub.addItem(.separator())
@@ -384,7 +443,8 @@ final class StatusMenu: NSObject, NSMenuDelegate {
         let now = Date().timeIntervalSince1970
         for app in apps {
             guard let row = rows[app.pid] else { continue }
-            let detail = Self.detail(launchedAt: app.launchedAt, now: now, windows: windows[app.pid] ?? 0, playing: playing.contains(app.pid))
+            let detail = Self.detail(launchedAt: app.launchedAt, now: now, windows: windows[app.pid] ?? 0, playing: playing.contains(app.pid),
+                                     sent: Session.isUser(app.session))
             if #available(macOS 14.4, *) {
                 if row.subtitle != detail { row.subtitle = detail }
             } else if row.toolTip != detail {
@@ -497,6 +557,43 @@ final class StatusMenu: NSObject, NSMenuDelegate {
         return record
     }
 
+    /// "Send Front Window Backstage", with the hotkey beside it when it's registered. Disabled,
+    /// with the reason in its tooltip, when the frontmost app is one that's never sent.
+    private func sendItem() -> NSMenuItem {
+        let send = NSMenuItem(title: "Send Front Window Backstage", action: #selector(sendFront), keyEquivalent: "")
+        send.target = self
+        if let combo = daemon?.hotKey?.registered {
+            send.keyEquivalent = combo.keyEquivalent
+            send.keyEquivalentModifierMask = combo.modifierMask
+        }
+        var tip = "Moves the frontmost app, with all its windows, to the hidden display, where agents can use it "
+            + "(`backstage list --all`, then `--pid`). It's muted; Show on My Screen brings it back."
+        if let error = daemon?.hotkeyError { tip += "\nShortcut unavailable: \(error)" }
+        if let front = NSWorkspace.shared.frontmostApplication {
+            let path = front.bundleURL?.path ?? front.executableURL?.path
+            if front.processIdentifier == getpid() || daemon?.managed.contains(front.processIdentifier) == true {
+                send.isEnabled = false
+            } else if let why = sendRefusal(bundleID: front.bundleIdentifier, name: front.localizedName, path: path) {
+                send.isEnabled = false
+                tip = "Can't send \(front.localizedName ?? "the frontmost app") backstage: \(why)."
+            }
+        }
+        send.toolTip = tip
+        return send
+    }
+
+    @objc private func sendFront() {
+        daemon?.sendFrontWindowBackstage(from: "menu")
+    }
+
+    @objc private func toggleKeep() {
+        guard let d = daemon else { return }
+        var settings = Settings.load()
+        settings.keepInMenuBar = !d.settings.keep
+        do { try settings.save() } catch { d.log("couldn't save settings: \(error)"); return }
+        d.applySettings()
+    }
+
     @objc private func showApp(_ sender: NSMenuItem) {
         guard let rec = currentApp(sender) else { NSSound.beep(); return }
         do { try handOver(rec, wait: false) } catch { NSSound.beep(); daemon?.log("menu show failed (busy launch/stop?): \(error)") }
@@ -517,7 +614,9 @@ final class StatusMenu: NSObject, NSMenuDelegate {
     }
 
     @objc private func stopAll() {
-        daemon?.shutdown(reason: "stopped from the menu bar")
+        guard let d = daemon else { return }
+        // With Keep in Menu Bar on, the apps go but Backstage stays.
+        if d.keepActive { d.quitAllApps() } else { d.shutdown(reason: "stopped from the menu bar") }
     }
 }
 

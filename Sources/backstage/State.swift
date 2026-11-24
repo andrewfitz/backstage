@@ -7,6 +7,11 @@ enum Paths {
         if let o = ProcessInfo.processInfo.environment["BACKSTAGE_HOME"] { return URL(fileURLWithPath: o) }
         return FileManager.default.homeDirectoryForCurrentUser.appendingPathComponent(".backstage")
     }()
+    /// BACKSTAGE_HOME unset or naming ~/.backstage itself.
+    static var isDefaultHome: Bool {
+        let standard = FileManager.default.homeDirectoryForCurrentUser.appendingPathComponent(".backstage")
+        return dir.resolvingSymlinksInPath().standardizedFileURL.path == standard.resolvingSymlinksInPath().standardizedFileURL.path
+    }
     static var daemon: URL { dir.appendingPathComponent("daemon.json") }
     static var apps: URL { dir.appendingPathComponent("apps.json") }
     static var log: URL { dir.appendingPathComponent("daemon.log") }
@@ -60,6 +65,13 @@ struct DaemonInfo: Codable {
     var audioModes: Bool? = nil
     /// The daemon can register a launch that appears after its CLI stopped waiting.
     var delayedLaunchHandoff: Bool? = nil
+    /// The Send Front Window Backstage hotkey the daemon holds (canonical spec), and why it
+    /// couldn't register the one settings.json asks for. Both nil: none asked for.
+    var hotkey: String? = nil
+    var hotkeyError: String? = nil
+    /// The settings.json stamp (`settingsStamp()`) the daemon last applied; absent in daemons
+    /// from before settings.
+    var settingsApplied: String? = nil
 
     static let currentProtocol = 2
     var protocolMismatch: Bool { (self.protocol ?? 1) != DaemonInfo.currentProtocol }

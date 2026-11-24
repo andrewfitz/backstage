@@ -78,7 +78,7 @@ The full command reference is in **[docs/USAGE.md](docs/USAGE.md)**, or run `bac
 | Input | AX actions (press/set/focus/menus), plus keyboard and mouse events posted straight to the app's process (`CGEventPostToPid`). Mouse events get window-local coordinates. A private "you are active" event goes to the app only, so AppKit doesn't swallow the click as a focus click. Nothing goes through the HID system, so your real cursor and keyboard are never touched. Every event backstage posts is tagged (event source user data). |
 | Your input stays yours | An app with an open menu (a context menu, a menu bar menu, a pop-up button's list) takes macOS's keyboard focus, even in the background, so your typing would go to the hidden app. The daemon runs an event tap on its own thread that sees every key, click and scroll after macOS has picked the receiving app: untagged input headed for a managed app is yours, so keys are handed to your frontmost app instead and clicks and scrolls are dropped. It costs a few microseconds per event. If macOS disables the tap, it is re-enabled at once; if the tap can't be installed, input commands refuse to run and `backstage status` says why. |
 | Silence | Every agent app is muted the moment it first uses Core Audio: a private, muted process tap per app (helper processes included), inside a private tap-only aggregate device. Nothing reaches your speakers, whatever device the app picks; your apps, output device and volume aren't touched. If an app can't be muted, it isn't launched, or is quit. Dev builds and test runners are also made inaudible from inside (a small injected library), so they're silent in screen sharing, remote desktop and recordings too. Only apps launched with `--audio` are measured (`backstage audio`, `wait --sound`). |
-| Teardown | `backstage stop` quits the calling session's apps, and stops the daemon when no session has apps left. `backstage stop --all` (or the daemon getting SIGTERM/SIGINT/SIGHUP) quits every app *before* removing the display, so nothing lands on your screen. After 30 min with no managed apps in any session, the daemon exits by itself. |
+| Teardown | `backstage stop` quits the calling session's apps, and stops the daemon when no session has apps left. `backstage stop --all` (or the daemon getting SIGTERM/SIGINT/SIGHUP) quits every app *before* removing the display, so nothing lands on your screen. After 30 min with no managed apps in any session, the daemon exits by itself, unless Keep in Menu Bar is on. |
 | Several agents | Each agent session owns the apps it launches, so concurrent agents never pick up, type into, screenshot or stop each other's apps. Commands on one app are serialized with a per-app lock. See [Sessions](docs/USAGE.md#concepts). |
 
 ## Sound
@@ -127,9 +127,9 @@ silent until it's relaunched. Measuring needs System Audio Recording (see
 
 ## Menu bar indicator
 
-While agents have apps running, an icon sits in the menu bar: a display behind a display, with
-the number of running apps beside it. It disappears when nothing is running, and goes away
-entirely when the daemon exits. Its tooltip says who is using how many apps. While an app
+While apps are running backstage, an icon sits in the menu bar: a display behind a display, with
+the number of running apps beside it. It disappears when nothing is running (unless you turn on
+**Keep in Menu Bar**), and goes away entirely when the daemon exits. Its tooltip says who is using how many apps. While an app
 launched with `--audio` is making sound (muted, so you don't hear it), the icon turns into a
 small level meter, five bars of the loudest app's recent level; with Reduce Motion on, it shows
 a still waveform instead. The icon's box never changes size. The menu shows:
@@ -141,13 +141,63 @@ a still waveform instead. The icon's box never changes size. The menu shows:
   it has been running, and a note if it has no windows or is playing sound (apps launched with
   `--audio`). Its submenu has **Show on My Screen** (the same as `backstage show`), **Quit**
   (hold Option for **Force Quit**), and its bundle ID and process ID
-- **Open Screenshots & Logs Folder**, and **Quit All Agent Apps**
+- **Send Front Window Backstage** (⌃⌥⌘B), described below, and **Open Screenshots & Logs Folder**
+- **Quit All Agent Apps**: every app running here, including ones you sent backstage
+- **Keep in Menu Bar**, described below
 - a quiet footer with the version and a link to this repository
 
 Long app and session names are shortened in the middle, so nothing widens the menu.
 
 The daemon runs as a menu-bar-only app: no Dock icon, and it never takes focus. Set
-`BACKSTAGE_MENUBAR=off` to run without the icon.
+`BACKSTAGE_MENUBAR=off` to run without the icon (and without the hotkey and Keep in Menu Bar).
+
+### Keep in Menu Bar
+
+Check **Keep in Menu Bar** (or run `backstage settings keep-in-menu-bar on`) and the icon stays
+with nothing running: icon only, no count, and the menu says "No apps running" above the live
+picture of the empty display. The daemon then doesn't exit when idle, and a session's plain
+`backstage stop` leaves it running (`stop --all` still stops it). **Quit All Agent Apps** quits
+the apps but keeps the icon. Turn it off and, with no apps left, the daemon exits after the usual
+idle timeout. The setting lives in `~/.backstage/settings.json`. It doesn't start anything at
+login: after a restart, `backstage start` brings the icon back (a login item may come later).
+
+### Send Front Window Backstage
+
+The reverse of **Show on My Screen**: press **⌃⌥⌘B** (Control-Option-Command-B), or choose
+**Send Front Window Backstage** from the menu, and the app you're using moves to the hidden
+display. backstage manages whole processes, so all of the app's windows go, not just the front
+one. Keyboard focus goes back to the app you used before it. The icon blinks twice and VoiceOver
+announces "Sent … backstage"; nothing else happens on your screen.
+- **Your agents can use it.** It shows in the menu under **Sent by you**. Any agent session can
+  drive it with an explicit `--pid` (or `--app`) after finding it with `backstage list --all`
+  (session `user`). It's never a session's default target, and a session's plain `stop` leaves it
+  alone. Only `stop --all`, **Quit All Agent Apps** or its own **Quit** quit it. If it doesn't
+  quit when the daemon stops (an unsaved-changes dialog), or its sound can't be muted, it comes
+  back to your screen instead: backstage never force-quits your app by itself.
+- **Bring it back** with **Show on My Screen** (or `backstage show --pid P`): its windows come
+  back to your screen, it's focused, and you hear it again.
+- **Muted, not inaudible.** It was already running, so it can only be muted with a tap (see
+  [Sound](#sound)): screen sharing and recordings can still hear it.
+- **Its Dock tile stays**, because you opened it normally. Clicking the tile or ⌘-Tabbing to it
+  doesn't bring it forward: the daemon hands focus straight back, and the input guard keeps your
+  typing out of it. Use Show on My Screen.
+- **Never sent** (the icon gives a small shake instead, and the reason goes to
+  `~/.backstage/daemon.log`): Finder, the Dock, Control Center, Notification Center, Spotlight,
+  loginwindow and anything else in `/System/Library`; menu bar and background apps; backstage
+  itself; an app that's already backstage; an app in full screen; an app with no open window; and
+  apps you need in front of you to stay in control: Terminal, Ghostty, iTerm, Warp, kitty,
+  Alacritty, WezTerm, herdr, Claude, ChatGPT/Codex, Parsec, and the terminal or agent host the
+  daemon runs under. The menu item is disabled, with the reason in its tooltip, when the
+  frontmost app is one of these.
+- **The shortcut** works whenever the daemon runs, so it pairs with Keep in Menu Bar. Change it
+  with `backstage settings hotkey <combo>` (two or more modifiers, one of them ⌘ or ⌃, and a
+  letter, digit or F1–F12; keys are named by their place on a US keyboard), or turn it off with
+  `backstage settings hotkey off`. The running daemon picks the change up at once. The menu shows
+  the current shortcut beside the item; if it couldn't be registered (it's a macOS keyboard
+  shortcut), the item shows none, and `backstage status` and the daemon log say why. A shortcut
+  another app registered the same way can't be detected (macOS accepts both). Only the daemon in
+  `~/.backstage` has a shortcut by default; one started with another `BACKSTAGE_HOME` (tests, for
+  instance) registers one only if its own settings name it.
 
 ## Installing into Claude Code, Codex and Grok
 
@@ -268,6 +318,8 @@ Settings (environment for the daemon): `BACKSTAGE_WIDTH`/`BACKSTAGE_HEIGHT` (poi
 `BACKSTAGE_SCALE` (default 2, Retina; `1` for a 1x display),
 `BACKSTAGE_IDLE_TIMEOUT` (seconds, default 1800), `BACKSTAGE_HOME` (default `~/.backstage`),
 `BACKSTAGE_MENUBAR=off` (no menu bar icon). Per command: `BACKSTAGE_SESSION=<name>` picks the session.
+Your settings: `backstage settings keep-in-menu-bar on|off` and `backstage settings hotkey <combo|off>`
+(see [Menu bar indicator](#menu-bar-indicator)); `backstage settings` and `status` show them.
 
 ## Limits (read these)
 
@@ -382,7 +434,8 @@ make test           # all of the above, then a GUI fixture app driven through ev
                     # the input guard with computer-use helpers' input and an unmanaged app
                     # (tests/computer-use.sh; `make test-computer-use`), then audio: muting, levels, sounds, show, refusals, and `audio record`'s
                     # WAVs checked by tests/wavcheck.swift (tests/audio.sh; `make test-audio`;
-                    # leak checks run when a loopback device exists)
+                    # leak checks run when a loopback device exists), then Send Front Window
+                    # Backstage and Keep in Menu Bar (tests/send.sh; `make test-send`)
 tests/audio-leak.sh --dedicated   # audio leak suite: dedicated Mac with a loopback as default output
 make dist           # regenerate dist/skills/backstage/SKILL.md from Sources/backstage/Skill.swift
 make load           # load harness, 2-session smoke (not in `make test`); full runs need a

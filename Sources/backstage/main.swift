@@ -16,7 +16,8 @@ worked out automatically (the agent's own session ID, or its process); set BACKS
 to choose one, e.g. one per subagent. `status` shows the current session.
 
 APP SELECTION: --pid P, or --app NAME (managed app name/bundle id), within your session.
-Default: your session's most recently launched app.
+Default: your session's most recently launched app. Apps the user sent backstage themselves
+(session "user", see `list --all`) are reachable with an explicit --pid/--app, never by default.
 
 LIFECYCLE
   launch <App.app|bundle.id|Name|/path/to/executable> [--env K=V]... [--timeout S] [--dock]
@@ -34,7 +35,12 @@ LIFECYCLE
                                     doctor also runs the audio self-test (inaudible, muted probe)
   start                             start the daemon
   stop                              quit your session's apps (and the daemon, if no apps are left)
-  stop --all                        quit every session's apps and stop the daemon
+  stop --all                        quit every session's apps (and apps the user sent backstage)
+                                    and stop the daemon
+  settings                          show settings (also in `status`)
+  settings keep-in-menu-bar on|off  keep the menu bar icon (and the daemon) up with no apps running
+  settings hotkey <combo|off>       Send Front Window Backstage shortcut (default ctrl+opt+cmd+b);
+                                    two or more modifiers incl. cmd or ctrl, plus a letter, digit or F-key
   logs [--pid P] [--lines N]        tail the app's stdout/stderr
 
 HIDDEN OR SHOWN? Use launch for your own work (build checks, tests, debugging, screenshots).
@@ -99,8 +105,9 @@ func managedApp(_ args: Args) throws -> ManagedApp {
     let me = try Session.current().id
     if let p = args.int("pid") {
         guard let a = try AppStore.read(matching: { $0.pid == p }).first else { throw CLIError("pid \(p) is not a live managed app") }
-        // Legacy records (from before sessions) have no owner, so an explicit PID still reaches them.
-        guard a.session == nil || Session.sameID(a.session, me) else {
+        // Legacy records (from before sessions) have no owner, and apps the user sent backstage
+        // were handed to agents on purpose: an explicit PID reaches both.
+        guard a.session == nil || Session.sameID(a.session, me) || Session.isUser(a.session) else {
             throw CLIError("pid \(p) belongs to another backstage session; a session can only use apps it launched (see `backstage list`)")
         }
         return a
@@ -108,11 +115,15 @@ func managedApp(_ args: Args) throws -> ManagedApp {
     let mine = try AppStore.read(matching: { Session.sameID($0.session, me) })
     if let name = args.opt("app") {
         let n = name.lowercased()
-        guard let a = mine.reversed().lazy.filter({ $0.name.lowercased() == n || $0.bundleID?.lowercased() == n })
-                    .max(by: { $0.launchedAt < $1.launchedAt })
-                ?? mine.reversed().lazy.filter({ $0.name.lowercased().contains(n) })
-                    .max(by: { $0.launchedAt < $1.launchedAt }) else {
-            throw CLIError("no managed app matching '\(name)' in this session. Yours: \(mine.map { "\($0.name)(\($0.pid))" }.joined(separator: ", "))")
+        func pick(_ apps: [ManagedApp]) -> ManagedApp? {
+            apps.reversed().lazy.filter({ $0.name.lowercased() == n || $0.bundleID?.lowercased() == n })
+                .max(by: { $0.launchedAt < $1.launchedAt })
+                ?? apps.reversed().lazy.filter({ $0.name.lowercased().contains(n) }).max(by: { $0.launchedAt < $1.launchedAt })
+        }
+        // Your own apps first, then apps the user sent backstage (never another session's).
+        let sent = try AppStore.read(matching: { Session.isUser($0.session) })
+        guard let a = pick(mine) ?? pick(sent) else {
+            throw CLIError("no managed app matching '\(name)' in this session or sent backstage by the user. Yours: \(mine.map { "\($0.name)(\($0.pid))" }.joined(separator: ", "))")
         }
         return a
     }
@@ -371,6 +382,14 @@ func cmdList(_ args: Args) throws -> [String: Any] {
         return d
     }
     var out: [String: Any] = ["session": me, "apps": apps]
+    if !all {
+        let sent = try AppStore.read(matching: { Session.isUser($0.session) })
+        if !sent.isEmpty {
+            out["sentByUser"] = sent.map { ["pid": $0.pid, "name": $0.name] }
+            out["note"] = "the user sent \(sent.count == 1 ? "an app" : "\(sent.count) apps") backstage (session \"user\"): "
+                + "use one only if the user asked you to, with an explicit --pid; `list --all` shows their windows"
+        }
+    }
     let failures = recentAudioFailures(session: me, live: Set(apps.compactMap { $0["pid"] as? Int32 }))
     if !failures.isEmpty { out["audioFailures"] = failures }
     // Launches that gave up waiting for their app: the daemon registers the app here if it starts.
@@ -422,6 +441,9 @@ func cmdStatus(doctor: Bool = false) throws -> [String: Any] {
         s["session"] = ["error": "\(error)"]
     }
     s["managedApps"] = try AppStore.read().map { ["pid": $0.pid, "name": $0.name, "session": $0.owner] }
+    var settings = Settings.load().json()
+    if let d = live { settings.merge(hotkeyState(d, wanted: Settings.load().effectiveHotKey)) { _, new in new } }
+    s["settings"] = settings
     let audio = doctor ? audioDoctor() : audioSummary(live)
     s["audio"] = audio
     var problems: [String] = []
@@ -571,6 +593,12 @@ func run() throws {
         }
         out["audio"] = (try? planAudio(args, executable: exe, name: url.lastPathComponent).mode.rawValue) ?? NSNull()
         emit(out)
+    case "__send-backstage":
+        let result = try cmdSendBackstage(args)
+        emit(result)
+        if result["ok"] as? Bool != true { exit(1) }
+    case "__send-refusal": emit(cmdSendRefusal(args))
+    case "settings": emit(try cmdSettings(args))
     case "__dock-restore":
         // Tests: give a managed app its Dock tile back as `show` does, without moving or activating it.
         let app = try managedApp(args)

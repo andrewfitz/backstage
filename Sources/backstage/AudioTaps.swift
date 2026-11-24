@@ -12,10 +12,13 @@ struct AudioRegistryEntry: Equatable {
     /// Launched with --audio: the tap's IO runs while it plays (levels, sounds, the ring). Other
     /// apps are only muted.
     let metered: Bool
+    /// Made inaudible from inside (injected): a tap that attaches late can't have let anything through.
+    let inaudible: Bool
 
     init(_ app: ManagedApp) {
         pid = app.pid; birth = app.processStart ?? 0; name = app.name; session = app.session
         metered = app.audioMode.metered
+        inaudible = app.audioMode == .inaudible
     }
 
     static func == (lhs: AudioRegistryEntry, rhs: AudioRegistryEntry) -> Bool {
@@ -113,9 +116,10 @@ private final class AppTap {
     var version = 0
     /// Launched with --audio. Otherwise the tap only mutes: no IO, no ring, no levels.
     var metered: Bool
+    var inaudible = false
 
-    init(key: AppKey, name: String, session: String?, metered: Bool) {
-        self.key = key; self.name = name; self.session = session; self.metered = metered
+    init(key: AppKey, name: String, session: String?, metered: Bool, inaudible: Bool = false) {
+        self.key = key; self.name = name; self.session = session; self.metered = metered; self.inaudible = inaudible
         members = [key]
     }
     var gain: Double { outputChannels > 2 ? Double(outputChannels) / 2 : 1 }
@@ -306,12 +310,12 @@ final class AudioTapManager: AudioTapControl, AudioLevelSource {
             let key = AppKey(pid: e.pid, birth: e.birth)
             if apps[key] == nil { added = true }
             let app = apps[key] ?? {
-                let a = AppTap(key: key, name: e.name, session: e.session, metered: e.metered)
+                let a = AppTap(key: key, name: e.name, session: e.session, metered: e.metered, inaudible: e.inaudible)
                 apps[key] = a
                 return a
             }()
             if !app.everRegistered || app.name != e.name || !Session.sameID(app.session, e.session) || app.metered != e.metered { app.version += 1 }
-            app.everRegistered = true; app.name = e.name; app.session = e.session
+            app.everRegistered = true; app.name = e.name; app.session = e.session; app.inaudible = e.inaudible
             if app.metered != e.metered {
                 app.metered = e.metered
                 if e.metered { prepareIO(app); evaluateIO(app) } else { stopIO(app) }
@@ -436,7 +440,8 @@ final class AudioTapManager: AudioTapControl, AudioLevelSource {
             let name = launch.map { URL(fileURLWithPath: $0.executable ?? $0.bundle).deletingPathExtension().lastPathComponent }
                 ?? processPath(top).map { ($0 as NSString).lastPathComponent } ?? "pid \(top)"
             // Measured only when launched with --audio (a record without a mode predates modes).
-            let a = AppTap(key: key, name: name, session: launch?.session, metered: launch.map { AudioMode($0.audio).metered } ?? false)
+            let a = AppTap(key: key, name: name, session: launch?.session, metered: launch.map { AudioMode($0.audio).metered } ?? false,
+                               inaudible: launch.map { AudioMode($0.audio) == .inaudible } ?? false)
             a.launchID = token
             apps[key] = a
             publishCrashTable()
@@ -545,6 +550,14 @@ final class AudioTapManager: AudioTapControl, AudioLevelSource {
         if wasPlaying && audioClock() - restartedAt < 10 {
             // Apps resume by themselves after a coreaudiod restart; the gap was already audible.
             log("audio: pid \(pid) was playing again after the coreaudiod restart when re-tapped")
+        } else if wasPlaying && Session.isUser(app.session) {
+            // The user sent an app that was already running (and maybe playing): it's muted from
+            // now on, and what it played before was theirs to hear.
+            log("audio: pid \(pid) (sent backstage by the user) was already playing; muted from now on")
+        } else if wasPlaying && app.inaudible {
+            // Inaudible from its first instruction (the injected library), so nothing was heard;
+            // the tap is only a second layer. Common under heavy load, when the tap attaches late.
+            log("audio: pid \(pid) (inaudible launch) was already playing when tapped; nothing was audible")
         } else if wasPlaying {
             fail(app, "pid \(pid) was already playing audio when backstage first saw it, so some of it was audible")
             return
@@ -708,11 +721,14 @@ final class AudioTapManager: AudioTapControl, AudioLevelSource {
         app.state = "failed"
         app.reason = why
         app.version += 1
-        log("audio: FAILED for pid \(app.key.pid) (\(app.name)): \(why); quitting it")
+        log("audio: FAILED for pid \(app.key.pid) (\(app.name)): \(why); \(Session.isUser(app.session) ? "giving it back to the user" : "quitting it")")
         guard !app.quitRequested else { return }
         app.quitRequested = true
         let registered = registry.contains { $0.pid == app.key.pid && $0.birth == app.key.birth }
-        for m in app.members { quit(m.pid, m.birth, registered && m == app.key) }
+        // An app the user sent backstage is given back to them (the daemon's quit callback does
+        // that for registered user apps), and its helpers are left alone: never quit their work.
+        if Session.isUser(app.session) { if registered { quit(app.key.pid, app.key.birth, true) } }
+        else { for m in app.members { quit(m.pid, m.birth, registered && m == app.key) } }
         // Publish now: `launch` may be waiting on this app.
         let status = AudioAppStatus(pid: app.key.pid, birth: app.key.birth, name: app.name, session: app.session, tap: "failed",
                                     reason: why, processes: app.pids, ioRunning: false, playing: false, peakDb: nil, rmsDb: nil,
@@ -794,7 +810,8 @@ final class AudioTapManager: AudioTapControl, AudioLevelSource {
     }
 
     private func publishCrashTable() {
-        let keys = apps.values.flatMap { $0.members }
+        // Apps the user sent backstage (and their helpers) survive a daemon crash.
+        let keys = apps.values.filter { !Session.isUser($0.session) }.flatMap { $0.members }
         let pids = keys.map { Int32($0.pid) }, births = keys.map { $0.birth }
         bs_crash_set(1, pids, births, Int32(keys.count))
     }

@@ -81,6 +81,12 @@ backstage quit                          # always clean up; `backstage stop` quit
   apps it launched (its own `list`, default target, logs and screenshots). Another
   session's PID or ref is an error, and `backstage stop` only quits your own apps. Never use
   `stop --all` unless the user asks: it quits every agent's apps.
+- **Apps the user sent backstage:** the user can move one of their own running apps to the
+  hidden display for you (Send Front Window Backstage, ⌃⌥⌘B). It's listed by
+  `backstage list --all` under session `user` (your `list` names it under `sentByUser`). Work on
+  it only when the user asks you to, always with an explicit `--pid P` (or `--app`): it's never
+  your default target, and your `stop` leaves it running. It's the user's live app with their
+  work in it: don't quit it unless they ask. `backstage show --pid P` gives it back to them.
 - **Subagents:** Claude Code subagents share their parent's session (Codex subagents get
   their own). If you're a subagent launching your own apps, or you start subagents that do,
   give each its own session by prefixing every command:
