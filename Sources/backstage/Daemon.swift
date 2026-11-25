@@ -485,34 +485,78 @@ final class Daemon {
     }
 
     func answer(_ request: DisplayRequest, wall: Double) -> DisplayReply {
-        func refuse(_ why: String) -> DisplayReply { DisplayReply(ok: false, slot: nil, error: why) }
-        if request.want == "new" {
+        do { return DisplayReply(ok: true, slot: try grantDisplay(request.want, session: request.session, override: false), error: nil) }
+        catch { return DisplayReply(ok: false, slot: nil, error: "\(error)") }
+    }
+
+    /// A display for `session`: "new" (created and reserved for it) or a number (created if this
+    /// daemon may run it). Another session's reservation refuses it, unless `override` (the
+    /// user, from the menu: their choice wins). Returns the slot.
+    func grantDisplay(_ want: String, session: String, override: Bool) throws -> Int {
+        let wall = Date().timeIntervalSince1970
+        if want == "new" {
             let free = extraSlots.filter { extras[$0] == nil }
-            guard !free.isEmpty else { return refuse("no free display left: this daemon runs \(allDisplays.count) (\(allDisplays.map { String($0.slot) }.joined(separator: ", ")))") }
-            do {
-                let d = try makeExtraDisplay(.lowestFree(free))
-                reservations[d.slot] = (request.session, Date().timeIntervalSince1970 + reservationSeconds)
-                log("display \(d.slot) reserved for session \(request.session) for \(Int(reservationSeconds))s")
-                return DisplayReply(ok: true, slot: d.slot, error: nil)
-            } catch { return refuse("\(error)") }
+            guard !free.isEmpty else { throw CLIError("no free display left: this daemon runs \(allDisplays.count) (\(allDisplays.map { String($0.slot) }.joined(separator: ", ")))") }
+            let d = try makeExtraDisplay(.lowestFree(free))
+            reservations[d.slot] = (session, wall + reservationSeconds)
+            log("display \(d.slot) reserved for session \(session) for \(Int(reservationSeconds))s")
+            try? writeInfo()
+            return d.slot
         }
-        guard let n = Int(request.want), displaySlots.contains(n) else { return refuse("--display takes a display number (1-8) or new") }
-        if n == display.slot { return DisplayReply(ok: true, slot: n, error: nil) }
+        guard let n = Int(want), displaySlots.contains(n) else { throw CLIError("--display takes a display number (1-8) or new") }
+        if n == display.slot { return n }
         if extras[n] != nil {
-            if let r = reservations[n], r.until > wall, !Session.sameID(r.session, request.session) {
+            if !override, let r = reservations[n], r.until > wall, !Session.sameID(r.session, session) {
                 let until = DateFormatter.localizedString(from: Date(timeIntervalSince1970: r.until), dateStyle: .none, timeStyle: .short)
-                return refuse("display \(n) is reserved for another session until \(until)")
+                throw CLIError("display \(n) is reserved for another session until \(until)")
             }
             // A grant is a lease: the display stays at least the grace period from now, while
             // the caller writes its launch record or moves its app.
             extraCreated[n] = ProcessInfo.processInfo.systemUptime
-            return DisplayReply(ok: true, slot: n, error: nil)
+            return n
         }
         guard extraSlots.contains(n) else {
-            return refuse("display \(n) isn't one this daemon runs (it runs \(display.slot), and can add \(extraSlots.map(String.init).joined(separator: ", ")))")
+            throw CLIError("display \(n) isn't one this daemon runs (it runs \(display.slot), and can add \(extraSlots.map(String.init).joined(separator: ", ")))")
         }
-        do { return DisplayReply(ok: true, slot: try makeExtraDisplay(.exactly(n)).slot, error: nil) }
-        catch { return refuse("\(error)") }
+        let slot = try makeExtraDisplay(.exactly(n)).slot
+        try? writeInfo()
+        return slot
+    }
+
+    /// Where the user's own sent apps live: the display of the most recent one, else the primary.
+    func userDisplay() -> Int {
+        let mine = registry.filter { Session.isUser($0.session) && $0.matchesProcess }.max { $0.launchedAt < $1.launchedAt }
+        if let slot = mine?.display, extras[slot] != nil { return slot }
+        return display.slot
+    }
+
+    /// The menu's Move to: put one of the managed apps (any session's: the user decides) on
+    /// another display. Nil on success, else why not.
+    func moveApp(_ record: ManagedApp, to want: String) -> String? {
+        guard record.matchesProcess else { return "\(record.name) isn't running" }
+        let slot: Int
+        do { slot = try grantDisplay(want, session: Session.user, override: true) } catch { return "\(error)" }
+        guard let target = allDisplays.first(where: { $0.slot == slot }) else { return "display \(slot) isn't running" }
+        guard let lock = try? Locks.app(record, nonblocking: true) else { return "\(record.name) is busy (an agent is using it); try again" }
+        defer { lock.release() }
+        var updated = 0
+        do {
+            try AppStore.update { apps in
+                for i in apps.indices where apps[i].pid == record.pid && apps[i].processStart == record.processStart {
+                    apps[i].display = slot == display.slot ? nil : slot
+                    updated += 1
+                }
+            }
+        } catch { return "couldn't update the app registry: \(error)" }
+        guard updated > 0 else { return "\(record.name) is no longer managed" }
+        reloadManaged(now: ProcessInfo.processInfo.systemUptime)
+        var placed: [CGRect] = []
+        for w in axApp(record.pid).windows where (w.attr(kAXMinimizedAttribute) as? Bool) != true {
+            placed.append(placeBeside(w, display: target.bounds, avoiding: placed))
+        }
+        log("moved pid \(record.pid) (\(record.name)) to display \(slot) from the menu")
+        try? writeInfo()
+        return nil
     }
 
     /// Create, park and size an extra display, like the primary at startup.
@@ -880,7 +924,7 @@ final class Daemon {
         if now >= nextSettingsCheck {
             nextSettingsCheck = now + 0.5
             if settingsStamp() != settingsApplied { applySettings() }
-            if testSendRequests { checkTestSendRequest() }
+            if testSendRequests { checkTestSendRequest(); checkTestMoveRequest() }
         }
         // Keep in Menu Bar: never idle. Turning it off starts the idle timeout from then.
         if keepActive { idleSince = now }

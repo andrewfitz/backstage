@@ -93,6 +93,8 @@ backstage quit                          # always clean up; `backstage stop` quit
   it only when the user asks you to, always with an explicit `--pid P` (or `--app`): it's never
   your default target, and your `stop` leaves it running. It's the user's live app with their
   work in it: don't quit it unless they ask. `backstage show --pid P` gives it back to them.
+  The user may keep their sent apps on a display of their own (`list` shows each app's
+  `display`); leave it there, and don't put your apps on it (`--display N` onto it is refused).
 - **Subagents:** Claude Code subagents share their parent's session (Codex subagents get
   their own). If you're a subagent launching your own apps, or you start subagents that do,
   give each its own session by prefixing every command:

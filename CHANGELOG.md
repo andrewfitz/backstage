@@ -12,7 +12,10 @@
   (reserved for 30 minutes, removed when its apps quit); `launch --display N`; `move --display`;
   launches follow their session's display; `"crowded": true` when a window found no free spot.
   Coordinates, screenshots and input are relative to the app's own display.
-- **Menu:** with several displays, two pictures stacked with labels, and ‹ › to page.
+- **Menu:** with several displays, two pictures stacked with labels, and ‹ › to page. Each
+  app's **Move to ▸** puts it on another display (or a new one), and **Send Front Window To ▸**
+  sends your app to the display you pick; a display you create is kept for you, and later sends
+  follow your apps there.
 - A daemon that fails to start now says why (it used to say only "see daemon.log").
 - Protocol 3: replace a running older daemon with `backstage stop --all`.
 

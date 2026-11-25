@@ -20,6 +20,7 @@
 set -euo pipefail
 # backstage's own tests use displays 7-8, never the ones agents use (docs/MULTI_DISPLAY_PLAN.md).
 export BACKSTAGE_DISPLAY=${BACKSTAGE_DISPLAY:-7}
+export BACKSTAGE_EXTRA_DISPLAYS=8   # Send Front Window To / Move to a new display take 8
 cd "$(dirname "$0")"
 ROOT="$(cd .. && pwd)"
 if [[ -z ${BACKSTAGE_BIN:-} ]]; then
@@ -39,7 +40,7 @@ RNAME="BackstageSendRefused$TAG"
 RBID="dev.backstage.sendtest-refuse.$TAG"
 # Test-only: one more bundle-ID prefix the send path refuses (it reads this in the hook process).
 export BACKSTAGE_TEST_REFUSE=dev.backstage.sendtest-refuse
-WATCH= HOLD= PID= RPID= SLEEPER=
+WATCH= HOLD= PID= RPID= SLEEPER= PID2=
 cleanup() {
     local result=$?
     trap - EXIT
@@ -51,13 +52,14 @@ cleanup() {
     if [[ -f "$BACKSTAGE_HOME/daemon.json" || -f "$BACKSTAGE_HOME/apps.json" ]]; then "$BS" stop --all > /dev/null || result=1; fi
     if [[ -n "$PID" ]]; then "$WORK/sendhelper" terminate "$PID" "$WORK/$NAME.app" || result=1; fi
     if [[ -n "$RPID" ]]; then "$WORK/sendhelper" terminate "$RPID" "$WORK/$RNAME.app" || result=1; fi
+    if [[ -n "$PID2" ]]; then "$WORK/sendhelper" terminate "$PID2" "$WORK/$NAME2.app" || result=1; fi
     if [[ -n "$WATCH" ]]; then
         touch "$WORK/watch.stop"
         wait "$WATCH" || result=1
         tail -5 "$WORK/watch.out"
     fi
     local lsregister=/System/Library/Frameworks/CoreServices.framework/Frameworks/LaunchServices.framework/Support/lsregister
-    for bundle in "$WORK/$NAME.app" "$WORK/$RNAME.app"; do
+    for bundle in "$WORK/$NAME.app" "$WORK/$RNAME.app" "$WORK/${NAME2:-none}.app"; do
         [[ -d "$bundle" ]] && "$lsregister" -u "$bundle" > /dev/null 2>&1 || true
     done
     echo "artifacts: $WORK"
@@ -76,7 +78,8 @@ wait_items() { for _ in $(seq 1 40); do [[ $(items | jq '.items | length') == "$
 waitlog() { for _ in $(seq 1 50); do grep -q "$1" "$2" 2>/dev/null && return 0; sleep 0.1; done; return 1; }
 
 echo "== build fixtures"
-for pair in "$NAME:$BID" "$RNAME:$RBID"; do
+NAME2="${NAME}Two"
+for pair in "$NAME:$BID" "$RNAME:$RBID" "$NAME2:$BID.two"; do
     n=${pair%%:*} id=${pair#*:}
     mkdir -p "$WORK/$n.app/Contents/MacOS"
     swiftc -O TestApp.swift -o "$WORK/$n.app/Contents/MacOS/$n"
@@ -178,6 +181,32 @@ fi
     && pass "a session's own list names it under sentByUser only" || fail "list: $("$BS" list | jq -c .)"
 for _ in $(seq 1 20); do items | jq -e '.items[0].title // "" | test("1")' > /dev/null && break; sleep 0.1; done
 items | jq -e '.items | length == 1' > /dev/null && pass "status item shows: $(items | jq -c '.items[0] | {title, description}')" || fail "status item: $(items)"
+
+echo "== displays: Send Front Window To, Move to, and an agent's move of a sent app"
+PID2=$("$WORK/sendhelper" launch "$WORK/$NAME2.app" "TESTAPP_LOG=$WORK/app2.log" TESTAPP_POLICY=none)
+waitlog "launched" "$WORK/app2.log" || fail "second fixture didn't start"
+sleep 0.5
+echo "$PID2 new" > "$BACKSTAGE_HOME/send-request"   # the menu's Send Front Window To > New Display
+waitlog "send backstage: sent pid $PID2 " "$LOG" || fail "Send Front Window To didn't send it"
+on_display() { "$BS" list --all | jq -r --argjson p "$1" '.apps[] | select(.pid == $p) | .display'; }
+in_bounds() { BACKSTAGE_SESSION=send-other "$BS" windows --pid "$1" | jq -e --argjson s "$SIZE" '(.windows | length) > 0 and all(.windows[];
+        .frame.x >= 0 and .frame.y >= 0 and .frame.x + .frame.w <= $s.w and .frame.y + .frame.h <= $s.h)' > /dev/null; }
+[[ $(on_display "$PID2") == 8 ]] && in_bounds "$PID2" && pass "Send Front Window To > New Display put it on display 8" \
+    || fail "send to new display: display $(on_display "$PID2"), $(BACKSTAGE_SESSION=send-other "$BS" windows --pid "$PID2" | jq -c .windows)"
+"$BS" status | jq -e '.daemon.displays[] | select(.display == 8) | .reservedBy == "user"' > /dev/null \
+    && pass "display 8 is kept for the user" || fail "display 8 reservation: $("$BS" status | jq -c .daemon.displays)"
+echo "$PID 8" > "$BACKSTAGE_HOME/move-request"     # the menu's Move to > Display 8
+for _ in $(seq 1 50); do [[ -f "$BACKSTAGE_HOME/move-result" ]] && break; sleep 0.1; done
+[[ $(cat "$BACKSTAGE_HOME/move-result" 2>/dev/null) == ok && $(on_display "$PID") == 8 ]] && in_bounds "$PID" \
+    && pass "Move to > Display 8 moved the first sent app there" || fail "menu move: $(cat "$BACKSTAGE_HOME/move-result" 2>/dev/null), display $(on_display "$PID")"
+rm -f "$BACKSTAGE_HOME/move-result"
+OUT=$(BACKSTAGE_SESSION=send-other "$BS" move --pid "$PID" --display 7 2>&1)
+[[ $(echo "$OUT" | jq -r .display) == 7 && $(on_display "$PID") == 7 ]] && in_bounds "$PID" \
+    && pass "an agent moved a sent app back to display 7 with move --pid" || fail "agent move: $OUT"
+OUT8=$(BACKSTAGE_SESSION=send-other "$BS" move --pid "$PID" --display 8 2>&1)
+echo "$OUT8" | jq -e '.ok == false and (.error | test("reserved"))' > /dev/null \
+    && pass "but can't move it onto the user's own display 8: $(echo "$OUT8" | jq -r .error)" || fail "agent onto the user's display: $OUT8"
+"$WORK/sendhelper" terminate "$PID2" "$WORK/$NAME2.app" && PID2= || fail "quit second fixture"
 
 echo "== refusals"
 refusal() { "$BS" __send-backstage --pid "$1" | jq -r '.refused // "NOT REFUSED"' || true; }

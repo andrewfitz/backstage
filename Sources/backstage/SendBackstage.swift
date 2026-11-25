@@ -67,7 +67,7 @@ private func sendLog(_ s: String) {
 /// Adopt the app `pid` as a user-sent managed app. `focusTo` is the app to give keyboard focus to
 /// if `pid` is frontmost (the daemon passes the app the user used before it). Refusals come back
 /// as `ok: false` with `refused`; nothing is changed then.
-func sendBackstage(pid: pid_t, focusTo: pid_t?) -> [String: Any] {
+func sendBackstage(pid: pid_t, focusTo: pid_t?, display slot: Int? = nil) -> [String: Any] {
     var name = processPath(pid).map { ($0 as NSString).lastPathComponent } ?? "pid \(pid)"
     func refuse(_ why: String) -> [String: Any] {
         sendLog("refused pid \(pid) (\(name)): \(why)")
@@ -121,7 +121,10 @@ func sendBackstage(pid: pid_t, focusTo: pid_t?) -> [String: Any] {
 
     let record = ManagedApp(pid: pid, name: name, bundleID: app.bundleIdentifier, path: path ?? "",
                             launchedAt: Date().timeIntervalSince1970, stdout: nil, processStart: birth,
-                            agent: nil, agentPID: nil, session: Session.user, audio: AudioMode.muted.rawValue)
+                            agent: nil, agentPID: nil, session: Session.user, audio: AudioMode.muted.rawValue,
+                            display: slot == current.primarySlot ? nil : slot)
+    // The display the daemon chose (it created it if needed); the primary if it's gone meanwhile.
+    guard let target = current.on(slot) ?? liveDaemon()?.on(slot) else { return refuse("display \(slot ?? 0) isn't running") }
     let placement: StateLock
     do {
         placement = try Locks.app(record, nonblocking: true)
@@ -136,7 +139,7 @@ func sendBackstage(pid: pid_t, focusTo: pid_t?) -> [String: Any] {
     defer { placement.release() }
     lifecycle.release()
 
-    let vd = current.bounds
+    let vd = target.bounds
     func released() -> Bool {
         !AppStore.load().contains { $0.pid == pid && $0.processStart == birth && Session.isUser($0.session) }
     }
@@ -196,7 +199,7 @@ private func handFocus(awayFrom pid: pid_t, to candidate: pid_t?) -> String {
     return moved ? "handed to \(who)" : "asked \(who) to take it, unconfirmed (the daemon hands it back if the app keeps it)"
 }
 
-/// `backstage __send-backstage --pid P [--focus-to N]`: the daemon's child for the hotkey and
+/// `backstage __send-backstage --pid P [--focus-to N] [--display D]`: the daemon's child for the hotkey and
 /// menu, and the test hook (BACKSTAGE_TEST_HOOKS=1) for the same path.
 func cmdSendBackstage(_ args: Args) throws -> [String: Any] {
     let fromDaemon = liveDaemon().map { $0.pid == getppid() } ?? false
@@ -207,7 +210,7 @@ func cmdSendBackstage(_ args: Args) throws -> [String: Any] {
         throw CLIError("usage: backstage __send-backstage --pid P [--focus-to N]")
     }
     let focusTo = args.opt("focus-to").flatMap(pid_t.init)
-    return sendBackstage(pid: pid, focusTo: focusTo)
+    return sendBackstage(pid: pid, focusTo: focusTo, display: args.opt("display").flatMap(Int.init))
 }
 
 /// Give a user-sent app back without quitting it: out of the registry (the daemon removes its
@@ -242,7 +245,9 @@ func releaseToUser(_ record: ManagedApp, log: (String) -> Void) {
 extension Daemon {
     /// The hotkey or the menu: send the frontmost app's process backstage, in a child.
     /// `target` replaces the frontmost app (the daemon's test trigger only).
-    func sendFrontWindowBackstage(from origin: String, target: NSRunningApplication? = nil) {
+    /// `to`: "new" or a display number (the menu's Send Front Window To); nil: the display the
+    /// user's sent apps are on, else the primary.
+    func sendFrontWindowBackstage(from origin: String, target: NSRunningApplication? = nil, to want: String? = nil) {
         guard !stopping, !shutdownRequested else { return }
         guard !sendInFlight else { log("send backstage (\(origin)): already sending one; ignored"); return }
         guard let front = target ?? NSWorkspace.shared.frontmostApplication, !front.isTerminated else {
@@ -254,8 +259,16 @@ extension Daemon {
         guard proc_pidpath(getpid(), &executable, UInt32(executable.count)) > 0 else { return }
         let process = Process()
         process.executableURL = URL(fileURLWithPath: String(cString: executable))
+        let slot: Int
+        do { slot = try want.map { try grantDisplay($0, session: Session.user, override: true) } ?? userDisplay() }
+        catch {
+            log("send backstage (\(origin)): refused: \(error)")
+            statusMenu?.sendCue(text: "Can't send \(front.localizedName ?? "the app") backstage: \(error)", success: false)
+            return
+        }
         var arguments = ["__send-backstage", "--pid", String(front.processIdentifier)]
         if let next = nextUserApp(excluding: front.processIdentifier) { arguments += ["--focus-to", String(next.processIdentifier)] }
+        if slot != display.slot { arguments += ["--display", String(slot)] }
         process.arguments = arguments
         let output = Pipe()
         process.standardOutput = output
@@ -299,9 +312,28 @@ extension Daemon {
         let url = Paths.dir.appendingPathComponent("send-request")
         guard let text = try? String(contentsOf: url, encoding: .utf8) else { return }
         try? FileManager.default.removeItem(at: url)
-        guard let pid = pid_t(text.trimmingCharacters(in: .whitespacesAndNewlines)),
+        // "PID" (Send Front Window Backstage) or "PID DISPLAY" (Send Front Window To).
+        let parts = text.split(whereSeparator: { $0 == " " || $0.isNewline }).map(String.init)
+        guard let pid = parts.first.flatMap(pid_t.init),
               let app = NSRunningApplication(processIdentifier: pid) else { log("send backstage (test): no app for '\(text)'"); return }
-        sendFrontWindowBackstage(from: "test", target: app)
+        sendFrontWindowBackstage(from: "test", target: app, to: parts.dropFirst().first)
+        // "move-request": "PID DISPLAY", the menu's Move to, through the same daemon path.
+    }
+
+    /// TEST ONLY (BACKSTAGE_TEST_SEND_REQUESTS=1): "PID DISPLAY" in $BACKSTAGE_HOME/move-request
+    /// moves that managed app as the menu's Move to does; the result goes to move-result.
+    func checkTestMoveRequest() {
+        let url = Paths.dir.appendingPathComponent("move-request")
+        guard let text = try? String(contentsOf: url, encoding: .utf8) else { return }
+        try? FileManager.default.removeItem(at: url)
+        let parts = text.split(whereSeparator: { $0 == " " || $0.isNewline }).map(String.init)
+        let result: String
+        if parts.count == 2, let pid = pid_t(parts[0]), let record = registry.first(where: { $0.pid == pid }) {
+            result = moveApp(record, to: parts[1]) ?? "ok"
+        } else {
+            result = "no managed app for '\(text)'"
+        }
+        try? result.write(to: Paths.dir.appendingPathComponent("move-result"), atomically: true, encoding: .utf8)
     }
 
     /// The app the user used most recently before `pid`: where focus goes when `pid` is sent.

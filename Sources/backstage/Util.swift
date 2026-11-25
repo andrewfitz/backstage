@@ -195,7 +195,7 @@ struct Args {
             }
         case "cleanup-displays": allowed = []; arity = 0...0
         case "settings": allowed = []; arity = 0...2
-        case "__send-backstage": allowed = ["pid", "focus-to"]; arity = 0...0
+        case "__send-backstage": allowed = ["pid", "focus-to", "display"]; arity = 0...0
         case "__send-refusal": allowed = ["bundle-id", "name", "path"]; arity = 0...0
         case "__guard-selftest": allowed = ["pid"]; arity = 0...0
         case "help", "-h", "--help", "version", "--version", "start", "status", "doctor",

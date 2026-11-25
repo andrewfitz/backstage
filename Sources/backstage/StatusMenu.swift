@@ -502,6 +502,7 @@ final class StatusMenu: NSObject, NSMenuDelegate {
         }
         menu.addItem(.separator())
         menu.addItem(sendItem())
+        menu.addItem(sendToItem())
         let folder = NSMenuItem(title: "Open Screenshots & Logs Folder", action: #selector(openFolder), keyEquivalent: "")
         folder.target = self
         menu.addItem(folder)
@@ -561,6 +562,7 @@ final class StatusMenu: NSObject, NSMenuDelegate {
                         : "Moves \(name) to your screen and hands it over to you: agents can no longer use it. ")
             + (app.audioMode == .inaudible ? "It stays silent until it's relaunched." : "You'll hear its sound again.")
         sub.addItem(show)
+        sub.addItem(moveItem(for: app, name: name))
         sub.addItem(.separator())
         sub.addItem(action("Quit \(name)", #selector(quitApp(_:))))
         // Hold Option, as in the Apple menu.
@@ -790,6 +792,78 @@ final class StatusMenu: NSObject, NSMenuDelegate {
 
     @objc private func sendFront() {
         daemon?.sendFrontWindowBackstage(from: "menu")
+    }
+
+    /// The displays as menu choices: "Display 1" (each this daemon runs, with who reserved it),
+    /// then "New Display" unless every extra slot is taken. `current` is checked and disabled.
+    private func displayChoices(current: Int?, action: Selector, payload: (String) -> Any) -> [NSMenuItem] {
+        guard let d = daemon else { return [] }
+        let apps = d.registry.filter { $0.matchesProcess }
+        var items: [NSMenuItem] = []
+        for shown in d.allDisplays {
+            let n = apps.filter { ($0.display ?? d.display.slot) == shown.slot }.count
+            var title = "Display \(shown.slot)"
+            if let r = d.reservations[shown.slot], r.until > Date().timeIntervalSince1970 {
+                title += Session.isUser(r.session) ? " (yours)" : " (reserved by an agent)"
+            }
+            let item = NSMenuItem(title: title, action: action, keyEquivalent: "")
+            item.target = self
+            item.representedObject = payload(String(shown.slot))
+            item.toolTip = n == 1 ? "1 app" : "\(n) apps"
+            if shown.slot == current { item.state = .on; item.isEnabled = false }
+            items.append(item)
+        }
+        items.append(.separator())
+        let new = NSMenuItem(title: "New Display", action: action, keyEquivalent: "")
+        new.target = self
+        new.representedObject = payload("new")
+        new.isEnabled = d.extraSlots.contains { d.extras[$0] == nil }
+        new.toolTip = new.isEnabled ? "A fresh hidden display, kept for you; it goes away when its apps quit"
+            : "Every display backstage may add is in use"
+        items.append(new)
+        return items
+    }
+
+    /// An app's Move to ▸: put it on another hidden display (any session's app: your choice wins
+    /// over an agent's reservation).
+    private func moveItem(for app: ManagedApp, name: String) -> NSMenuItem {
+        let item = NSMenuItem(title: "Move to", action: nil, keyEquivalent: "")
+        let sub = NSMenu()
+        sub.autoenablesItems = false
+        for choice in displayChoices(current: app.display ?? daemon?.display.slot, action: #selector(moveApp(_:)),
+                                     payload: { [app, $0] as [Any] }) { sub.addItem(choice) }
+        item.submenu = sub
+        item.toolTip = "Moves \(name) to another hidden display. Agents still reach it by its PID; coordinates follow it."
+        return item
+    }
+
+    /// Send Front Window To ▸: like Send Front Window Backstage, onto a display you pick, e.g. a
+    /// display of your own while agents work on display 1.
+    private func sendToItem() -> NSMenuItem {
+        let item = NSMenuItem(title: "Send Front Window To", action: nil, keyEquivalent: "")
+        let sub = NSMenu()
+        sub.autoenablesItems = false
+        for choice in displayChoices(current: nil, action: #selector(sendFrontTo(_:)), payload: { $0 }) { sub.addItem(choice) }
+        item.submenu = sub
+        let plain = sendItem()
+        item.isEnabled = plain.isEnabled
+        item.toolTip = plain.isEnabled ? "Sends the frontmost app to the hidden display you pick. Later sends follow it there."
+            : plain.toolTip
+        return item
+    }
+
+    @objc private func sendFrontTo(_ sender: NSMenuItem) {
+        guard let want = sender.representedObject as? String else { return }
+        daemon?.sendFrontWindowBackstage(from: "menu", to: want)
+    }
+
+    @objc private func moveApp(_ sender: NSMenuItem) {
+        guard let pair = sender.representedObject as? [Any], pair.count == 2, let selected = pair[0] as? ManagedApp, let want = pair[1] as? String,
+              let record = daemon?.registry.first(where: { $0.pid == selected.pid && $0.processStart == selected.processStart }) else { return }
+        if let why = daemon?.moveApp(record, to: want) {
+            daemon?.log("menu move failed: \(why)")
+            sendCue(text: "Can't move \(record.name): \(why)", success: false)
+        }
     }
 
     @objc private func toggleKeep() {

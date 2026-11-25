@@ -165,9 +165,12 @@ a still waveform instead. The icon's box never changes size. The menu shows:
 - **each app**, grouped by the agent session that launched it ("Claude — myproject": the agent,
   then the name given with `BACKSTAGE_SESSION` or the folder the agent works in), with how long
   it has been running, and a note if it has no windows or is playing sound (apps launched with
-  `--audio`). Its submenu has **Show on My Screen** (the same as `backstage show`), **Quit**
-  (hold Option for **Force Quit**), and its bundle ID and process ID
-- **Send Front Window Backstage** (⌃⌥⌘B), described below, and **Open Screenshots & Logs Folder**
+  `--audio`). Its submenu has **Show on My Screen** (the same as `backstage show`), **Move to ▸**
+  (another hidden display, or a new one), **Quit** (hold Option for **Force Quit**), and its
+  bundle ID and process ID
+- **Send Front Window Backstage** (⌃⌥⌘B), described below; **Send Front Window To ▸**, the same
+  onto a display you pick (say, a display of your own while agents work on display 1: later sends
+  follow it there); and **Open Screenshots & Logs Folder**
 - **Quit All Agent Apps**: every app running here, including ones you sent backstage
 - **Keep in Menu Bar**, described below
 - a quiet footer with the version and a link to this repository

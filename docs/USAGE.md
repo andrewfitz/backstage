@@ -607,6 +607,14 @@ waiting up to 5 s (a display that just stopped can linger a moment).
   recording) when there's more than one.
 - The menu bar menu shows up to two displays' pictures stacked, labelled, with ‹ › to page
   through more.
+- **From the menu, the user moves apps too:** each app's **Move to ▸** (a display, or **New
+  Display**), and **Send Front Window To ▸** for an app of their own. A display the user creates is
+  kept for them (reserved for session `user`): agents' automatic placement never goes there, and
+  an agent's `launch --display N` or `move --display N` onto it is refused. Plain Send Front Window
+  Backstage (and ⌃⌥⌘B) goes to the display the user's sent apps are on, else display 1. The
+  user's choices override agents' reservations.
+- Agents can `move --display N --pid P` an app the user sent (explicit `--pid`), like any other
+  command on it.
 
 ### For display and color tools
 
