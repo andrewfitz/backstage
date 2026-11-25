@@ -35,6 +35,9 @@ LIFECYCLE
   list [--all]                      your session's apps + their windows (--all: every session)
   quit [--pid P] [--force]          quit a managed app
   move --display N|new [--pid P]    move an app to another display (coordinates follow it)
+  close-display N [--force]         remove extra display N; its apps move to the first display and
+                                    keep running (the first display always stays). --force: even
+                                    with another session's apps or reservation on it
   status | doctor                   daemon/display/permission status, and the display's
                                     `screencapture -D` index (to record it with standard tools;
                                     with several displays, each one's under daemon.displays);
@@ -707,6 +710,7 @@ func run() throws {
     case "__menu-render": emit(try runMenuRender(args))
     case "move": emit(try cmdMove(args))
     case "recover": emit(try cmdRecover(args))
+    case "close-display": emit(try cmdCloseDisplay(args))
     case "audio": emit(try cmdAudio(args))
     case "launch", "open": emit(try launch(args))
     case "list", "ps": emit(try cmdList(args))

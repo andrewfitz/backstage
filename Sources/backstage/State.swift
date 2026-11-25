@@ -111,13 +111,17 @@ struct DaemonInfo: Codable {
 struct DisplayRequest: Codable {
     var id: String          // the daemon uses the request's file name instead
     var session: String
-    var want: String        // "new", or a slot number
+    var want: String        // "new", a slot number, or "close:N" (`close-display`)
     var at: Double
+    /// `close-display --force`: close it even with another session's apps or reservation.
+    var force: Bool? = nil
 }
 struct DisplayReply: Codable {
     var ok: Bool
     var slot: Int?
     var error: String?
+    /// `close-display`: the apps that moved to the primary display.
+    var moved: [Int32]? = nil
 }
 
 /// One of a daemon's displays, as published in daemon.json.

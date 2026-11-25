@@ -439,7 +439,17 @@ final class StatusMenu: NSObject, NSMenuDelegate {
         page = shown.page
         visibleSlots = shown.visible
         for (i, preview) in hero.previews.enumerated() {
-            guard let slot = visibleSlots[safe: i] else {
+            // Extra displays get an ⓧ; the primary always stays.
+            let slotHere = visibleSlots[safe: i]
+            if let slot = slotHere, slot != d.display.slot {
+                let n = sources[slot]?.apps.count ?? 0
+                preview.onClose = { [weak self] in self?.closeDisplay(slot) }
+                preview.closeToolTip = "Close Display \(slot)" + (n == 0 ? "" : n == 1 ? ": its app moves to Display \(d.display.slot)"
+                                                                  : ": its \(n) apps move to Display \(d.display.slot)")
+            } else {
+                preview.onClose = nil
+            }
+            guard let slot = slotHere else {
                 hero.setLabel(nil, at: i)
                 if preview.shownSlot != nil {
                     preview.shownSlot = nil
@@ -801,6 +811,12 @@ final class StatusMenu: NSObject, NSMenuDelegate {
         return send
     }
 
+    private func closeDisplay(_ slot: Int) {
+        daemon?.closeDisplayFromMenu(slot)
+        page = 0
+        rebuild()
+    }
+
     @objc private func recoverWindows() {
         daemon?.recoverFromMenu()
     }
@@ -1001,6 +1017,7 @@ func runMenuRender(_ args: Args) throws -> [String: Any] {
     for (i, preview) in view.previews.enumerated() {
         if n > 1 { view.setLabel(i < shown.visible.count ? "Display \(shown.visible[i]) · \(i + 1) apps" : nil, at: i) }
         guard i < shown.visible.count else { continue }
+        preview.onClose = shown.visible[i] == 1 ? nil : {}
         let size = CGSize(width: 64, height: 40)
         let image = NSImage(size: size, flipped: false) { r in colors[(shown.visible[i] - 1) % colors.count].setFill(); r.fill(); return true }
         var rect = CGRect(origin: .zero, size: size)
@@ -1014,6 +1031,6 @@ func runMenuRender(_ args: Args) throws -> [String: Any] {
     }
     return ["width": view.bounds.width, "height": view.bounds.height, "visible": shown.visible,
             "first": shown.first, "last": shown.last, "canBack": shown.canBack, "canForward": shown.canForward,
-            "previews": view.previews.map { ["y": $0.frame.minY, "height": $0.frame.height, "hidden": $0.isHidden] },
+            "previews": view.previews.map { ["y": $0.frame.minY, "height": $0.frame.height, "hidden": $0.isHidden, "closable": $0.closable] },
             "pager": view.pagerFrames ?? NSNull()]
 }

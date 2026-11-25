@@ -195,6 +195,7 @@ struct Args {
             }
         case "cleanup-displays": allowed = []; arity = 0...0
         case "recover": allowed = ["dry-run"]; arity = 0...0
+        case "close-display": allowed = ["force"]; arity = 1...1
         case "settings": allowed = []; arity = 0...2
         case "__send-backstage": allowed = ["pid", "focus-to", "display"]; arity = 0...0
         case "__send-refusal": allowed = ["bundle-id", "name", "path"]; arity = 0...0

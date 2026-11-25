@@ -87,7 +87,9 @@ backstage quit                          # always clean up; `backstage stop` quit
   app's `display`), and `screenshot --full --display N` captures one display when your apps
   span several. Coordinates are always relative to the app's own display. Creating a display
   can briefly flicker the user's monitor, so don't do it routinely: the shared display 1 is
-  the default for a reason.
+  the default for a reason. Done with your display? `close-display N` removes it now (your
+  apps on it move to the first display and keep running); otherwise it goes 30 minutes after
+  its last app.
 - **A window you didn't launch on the display** (one of the user's own apps reopening where it
   last was): the daemon returns it to the user's screen within seconds; `backstage recover`
   does it now. Never `launch` or drive it: it's the user's.

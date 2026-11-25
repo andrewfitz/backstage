@@ -140,6 +140,33 @@ DEVICES1=$("$WORK/csdevices")
 [[ $DEVICES1 -le $((DEVICES0 + 1)) ]] && pass "ColorSync's backstage displays: $DEVICES0 before, $DEVICES1 after" \
     || fail "ColorSync's backstage displays grew from $DEVICES0 to $DEVICES1"
 
+echo "== close-display"
+OUT=$(launch B green --display new)
+PB3=$(echo "$OUT" | jq -r .pid)
+[[ $(echo "$OUT" | jq -r .display) == 8 ]] && pass "B has display 8 again" || fail "B's launch: $OUT"
+OUT=$(as A close-display 8 2>&1)
+echo "$OUT" | jq -e '.ok == false and (.error | test("reserved for another session"))' > /dev/null \
+    && pass "A can't close B's display: $(echo "$OUT" | jq -r .error)" || fail "A closing 8: $OUT"
+OUT=$(as A close-display 7 2>&1)
+echo "$OUT" | jq -e '.ok == false and (.error | test("always stays"))' > /dev/null && pass "the first display can't be closed" || fail "closing 7: $OUT"
+OUT=$(as A close-display 6 2>&1)
+echo "$OUT" | jq -e '.ok == false and (.error | test("isn.t running"))' > /dev/null && pass "a display that isn't running: refused" || fail "closing 6: $OUT"
+OUT=$(as B close-display 8)
+echo "$OUT" | jq -e --argjson p "$PB3" '.ok and .closed and .moved == [$p] and .movedTo == 7' > /dev/null \
+    && pass "B closed its display 8; its app moved to display 7" || fail "B closing 8: $OUT"
+[[ $(displays) == '[7]' ]] && pass "display 8 is gone at once" || fail "displays left: $(displays)"
+"$BS" list --all | jq -e --argjson p "$PB3" '.apps[] | select(.pid == $p) | .display == 7' > /dev/null \
+    && pass "B's app still runs, on display 7" || fail "B's app after close: $("$BS" list --all | jq -c .apps)"
+as B windows --pid "$PB3" | jq -e '(.windows | length) > 0 and all(.windows[]; .frame.x >= 0 and .frame.y >= 0 and .frame.x < 900 and .frame.y < 600)' > /dev/null \
+    && pass "and its window is on display 7" || fail "B's window after close: $(as B windows --pid "$PB3" | jq -c .windows)"
+OUT=$(launch C blue --display new)
+[[ $(echo "$OUT" | jq -r .display) == 8 ]] || fail "C's launch: $OUT"
+OUT=$(as A close-display 8 --force)
+echo "$OUT" | jq -e '.ok and (.moved | length) == 1' > /dev/null && pass "--force closes another session's display (as the menu's ⓧ does)" || fail "--force: $OUT"
+[[ $(displays) == '[7]' ]] || fail "displays after --force: $(displays)"
+R=$("$BS" __menu-render --displays 3 --page 0)
+echo "$R" | jq -e '[.previews[].closable] == [false, true]' > /dev/null && pass "menu: ⓧ on extra displays only" || fail "menu closable: $R"
+
 echo "== bad values"
 OUT=$(launch A blue --display 5 2>&1)
 echo "$OUT" | jq -e '.ok == false and (.error | test("isn.t one this daemon runs"))' > /dev/null && pass "a display this daemon can't run is refused" || fail "display 5: $OUT"

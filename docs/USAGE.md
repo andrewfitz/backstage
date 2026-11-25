@@ -657,6 +657,15 @@ reserved for your session). An app the user sent backstage can be moved too, wit
 input follow it to the new display. Returns `from`, `display`, `moved` (windows placed) and
 `windows`. The user moves apps from the menu (each app's **Move to ▸**).
 
+### `close-display N [--force]`
+Removes one of the daemon's extra displays now, instead of waiting for it to empty and time out.
+Its apps move to the first display first (still running, windows placed there, coordinates
+following them), then the display goes. The first display always stays. Refused when another
+session reserved the display or has apps on it, and while a launch is putting an app there;
+`--force` closes it anyway. Returns `display`, `closed`, `moved` (the PIDs that moved) and
+`movedTo`. The user closes one with the ⓧ on its picture in the menu (there for every display
+but the first).
+
 ### `recover [--dry-run]`
 Returns windows of apps backstage doesn't run that ended up on a hidden display to the user's
 main screen. It's usually an app reopening a window where it last was: backstage's displays keep

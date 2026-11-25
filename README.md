@@ -161,7 +161,8 @@ a still waveform instead. The icon's box never changes size. The menu shows:
 
 - a **live picture** of the hidden agent display, refreshed every second while the menu is open.
   Point at an app's row and its windows are picked out in the picture. With several displays
-  (`launch --display new`), two pictures sit side by side, each labelled, with ‹ › to page through more
+  (`launch --display new`), two pictures sit side by side, each labelled, with ‹ › to page through more,
+  and an ⓧ on every display but the first closes it (its apps move to the first display and keep running)
 - **each app**, grouped by the agent session that launched it ("Claude — myproject": the agent,
   then the name given with `BACKSTAGE_SESSION` or the folder the agent works in), with how long
   it has been running, and a note if it has no windows or is playing sound (apps launched with
@@ -327,6 +328,7 @@ backstage logs                             # the app's stdout/stderr
 backstage window fill                      # window covers the whole agent display (or: window size 1280 800)
 backstage launch MyApp.app --display new   # a hidden display of your own (clean recordings, full screen)
 backstage move --display 1                 # move your app to another display
+backstage close-display 2                  # remove display 2 (its apps move to display 1)
 backstage recover                          # bring stray windows back to the user's screen
 backstage screenshot --full --display 2    # one whole display, your session's windows only
 backstage quit

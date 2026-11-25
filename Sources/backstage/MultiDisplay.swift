@@ -15,7 +15,22 @@ func requestDisplay(_ want: String, info: DaemonInfo, session: Session) throws -
         throw CLIError("the running backstage daemon (pid \(info.pid)) predates --display; `backstage stop --all` replaces it")
     }
     if let n = Int(want), n == info.primarySlot { return n }
-    let request = DisplayRequest(id: UUID().uuidString, session: session.id, want: want, at: Date().timeIntervalSince1970)
+    let reply = try exchangeDisplayRequest(DisplayRequest(id: UUID().uuidString, session: session.id, want: want,
+                                                          at: Date().timeIntervalSince1970))
+    guard reply.ok, let slot = reply.slot else { throw CLIError(reply.error ?? "display request refused") }
+    // Wait until daemon.json lists it, so the caller can place windows on it.
+    guard waitFor(timeout: 5, { () -> Bool? in
+        guard let current = liveDaemon(), current.pid == info.pid, current.processStart == info.processStart,
+              current.stopping != true, current.entry(slot) != nil else { return nil }
+        return true
+    }) != nil else {
+        throw CLIError("display \(slot) didn't appear in the daemon's state")
+    }
+    return slot
+}
+
+/// Hand the daemon a display request (requests/<uuid>.json) and wait for its answer.
+private func exchangeDisplayRequest(_ request: DisplayRequest) throws -> DisplayReply {
     try Paths.ensureDirectory(Paths.requests)
     let file = Paths.requests.appendingPathComponent("\(request.id).json")
     let replyFile = Paths.requests.appendingPathComponent("\(request.id).reply")
@@ -28,16 +43,35 @@ func requestDisplay(_ want: String, info: DaemonInfo, session: Session) throws -
     guard let reply = waitFor(timeout: 15, interval: 0.05, { readJSON(replyFile, DisplayReply.self) }) else {
         throw CLIError("the backstage daemon didn't answer the display request (see \(Paths.log.path))")
     }
-    guard reply.ok, let slot = reply.slot else { throw CLIError(reply.error ?? "display request refused") }
-    // Wait until daemon.json lists it, so the caller can place windows on it.
-    guard waitFor(timeout: 5, { () -> Bool? in
-        guard let current = liveDaemon(), current.pid == info.pid, current.processStart == info.processStart,
-              current.stopping != true, current.entry(slot) != nil else { return nil }
-        return true
-    }) != nil else {
-        throw CLIError("display \(slot) didn't appear in the daemon's state")
+    return reply
+}
+
+/// `close-display N [--force]`: remove one of the daemon's extra displays. Its apps move to the
+/// primary display first and keep running. The primary display always stays. Refused when
+/// another session reserved the display or has apps on it, unless --force.
+func cmdCloseDisplay(_ args: Args) throws -> [String: Any] {
+    guard let raw = args.pos(0), let n = Int(raw), displaySlots.contains(n) else {
+        throw CLIError("usage: backstage close-display N [--force]  (N: a display number from `backstage status`)")
     }
-    return slot
+    let session = try Session.current()
+    let lifecycle = try StateLock("lifecycle.lock", shared: true)
+    defer { lifecycle.release() }
+    let info = try requireDaemon()
+    guard info.displays != nil else {
+        throw CLIError("the running backstage daemon (pid \(info.pid)) predates several displays; `backstage stop --all` replaces it")
+    }
+    if n == info.primarySlot { throw CLIError("display \(n) is this daemon's first display; it always stays") }
+    let reply = try exchangeDisplayRequest(DisplayRequest(id: UUID().uuidString, session: session.id, want: "close:\(n)",
+                                                          at: Date().timeIntervalSince1970, force: args.has("force") ? true : nil))
+    guard reply.ok else {
+        // A daemon from before close-display reads "close:N" as an invalid display number.
+        if reply.error?.contains("takes a display number") == true {
+            throw CLIError("the running backstage daemon predates close-display; `backstage stop --all && backstage start` replaces it")
+        }
+        throw CLIError(reply.error ?? "close-display refused")
+    }
+    _ = waitFor(timeout: 5) { liveDaemon()?.entry(n) == nil ? true : nil }
+    return ["ok": true, "display": n, "closed": true, "moved": reply.moved ?? [], "movedTo": info.primarySlot]
 }
 
 /// The display a launch goes on: --display N|new, else where this session already has apps

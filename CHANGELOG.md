@@ -1,5 +1,12 @@
 # Changelog
 
+## 1.3.2
+
+- **Close a display:** every display but the first has an ⓧ on its picture in the menu, and
+  `backstage close-display N [--force]` does the same from a terminal. Its apps move to the
+  first display and keep running; the first display always stays. An agent can't close another
+  session's display without `--force`.
+
 ## 1.3.1
 
 - **Lost windows come back.** Backstage's displays keep fixed identities, so macOS remembers them

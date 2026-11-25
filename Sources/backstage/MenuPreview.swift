@@ -127,7 +127,8 @@ final class MenuHeroView: NSView {
         override func layout() {
             super.layout()
             guard let parent = superview else { return }
-            let w = min(ceil(field.frame.width) + 10, max(0, parent.bounds.width - 12))
+            // Leaves room for an extra display's ⓧ at the top right.
+            let w = min(ceil(field.frame.width) + 10, max(0, parent.bounds.width - 36))
             frame = NSRect(x: 6, y: 6, width: w, height: 18)
             field.frame = NSRect(x: 5, y: ((18 - field.frame.height) / 2).rounded(.down), width: max(0, w - 10), height: field.frame.height)
         }
@@ -238,6 +239,15 @@ final class DisplayPreviewView: NSView {
     private let placeholder = NSImageView()
     private let messageLabel = NSTextField(labelWithString: "")
     private let nameChip = Chip()
+    private let closeButton = NSButton()
+    /// An extra display's ⓧ (top right): set to show it, nil to hide it.
+    var onClose: (() -> Void)? {
+        didSet { closeButton.isHidden = onClose == nil }
+    }
+    var closeToolTip: String? {
+        get { closeButton.toolTip }
+        set { closeButton.toolTip = newValue; closeButton.setAccessibilityLabel(newValue.map { _ in "Close display" }) }
+    }
     private var pointer: CGPoint?
     private var hovered: Region?
 
@@ -289,6 +299,16 @@ final class DisplayPreviewView: NSView {
         addSubview(messageLabel)
         nameChip.isHidden = true
         addSubview(nameChip)
+        // White ⓧ on the same dark disc as the labels: it sits on the picture in both appearances.
+        closeButton.isBordered = false
+        closeButton.imagePosition = .imageOnly
+        closeButton.image = NSImage(systemSymbolName: "xmark.circle.fill", accessibilityDescription: "Close display")
+        closeButton.symbolConfiguration = NSImage.SymbolConfiguration(pointSize: 15, weight: .medium)
+            .applying(NSImage.SymbolConfiguration(paletteColors: [.white, NSColor.black.withAlphaComponent(0.55)]))
+        closeButton.target = self
+        closeButton.action = #selector(closeClicked)
+        closeButton.isHidden = true
+        addSubview(closeButton)
 
         addTrackingArea(NSTrackingArea(rect: .zero, options: [.mouseEnteredAndExited, .mouseMoved, .activeAlways, .inVisibleRect],
                                        owner: self, userInfo: nil))
@@ -345,6 +365,7 @@ final class DisplayPreviewView: NSView {
                                    width: icon.width, height: icon.height)
         let textY = hasImage ? ((bounds.height - 15) / 2).rounded() : placeholder.frame.maxY + 8
         messageLabel.frame = NSRect(x: 12, y: textY, width: max(0, bounds.width - 24), height: 15)
+        closeButton.frame = NSRect(x: bounds.maxX - 6 - 18, y: 6, width: 18, height: 18)
         layoutNameChip()
         updateOverlay()
     }
@@ -456,6 +477,15 @@ final class DisplayPreviewView: NSView {
     override func mouseEntered(with event: NSEvent) { pointerMoved(event) }
     override func mouseMoved(with event: NSEvent) { pointerMoved(event) }
     override func mouseExited(with event: NSEvent) { pointerMoved(nil) }
+
+    // After the click's event handling: closing the display rebuilds the menu, this view with it.
+    @objc private func closeClicked() {
+        guard let onClose else { return }
+        DispatchQueue.main.async(execute: onClose)
+    }
+
+    /// TEST: whether the ⓧ shows (`__menu-render`).
+    var closable: Bool { !closeButton.isHidden }
 
     /// The menu closed: forget where the pointer was.
     func resetPointer() { pointerMoved(nil) }

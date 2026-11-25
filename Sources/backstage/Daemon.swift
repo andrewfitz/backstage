@@ -488,6 +488,13 @@ final class Daemon {
     }
 
     func answer(_ request: DisplayRequest, wall: Double) -> DisplayReply {
+        if request.want.hasPrefix("close:") {
+            do {
+                guard let n = Int(request.want.dropFirst("close:".count)) else { throw CLIError("close-display needs a display number") }
+                let moved = try closeDisplay(n, session: request.session, force: request.force == true)
+                return DisplayReply(ok: true, slot: n, error: nil, moved: moved)
+            } catch { return DisplayReply(ok: false, slot: nil, error: "\(error)") }
+        }
         do { return DisplayReply(ok: true, slot: try grantDisplay(request.want, session: request.session, override: false), error: nil) }
         catch { return DisplayReply(ok: false, slot: nil, error: "\(error)") }
     }
@@ -524,6 +531,72 @@ final class Daemon {
         let slot = try makeExtraDisplay(.exactly(n)).slot
         try? writeInfo()
         return slot
+    }
+
+    /// Close an extra display: its apps move to the primary display first (still running, with
+    /// their windows placed there), then it goes. The primary always stays. Without `force`,
+    /// another session's reservation or apps refuse it (the menu passes force: the user decides).
+    /// Returns the PIDs that moved.
+    func closeDisplay(_ slot: Int, session: String, force: Bool) throws -> [Int32] {
+        guard slot != display.slot else { throw CLIError("display \(slot) is this daemon's first display; it always stays") }
+        guard extras[slot] != nil else {
+            throw CLIError("display \(slot) isn't running (this daemon runs \(allDisplays.map { String($0.slot) }.joined(separator: ", ")))")
+        }
+        // A launch that chose this display is still writing its record or placing its window.
+        guard !Launching.records().contains(where: { $0.display == slot }) else {
+            throw CLIError("a launch is putting an app on display \(slot); try again in a moment")
+        }
+        let apps = try AppStore.read().filter { $0.display == slot && $0.matchesProcess }
+        if !force {
+            if let r = reservations[slot], r.until > Date().timeIntervalSince1970, !Session.sameID(r.session, session) {
+                throw CLIError("display \(slot) is reserved for another session (\(r.session)); --force closes it anyway")
+            }
+            let others = apps.filter { !Session.sameID($0.owner, session) }
+            if !others.isEmpty {
+                throw CLIError("display \(slot) has other sessions' apps (\(others.map { "\($0.name) pid \($0.pid)" }.joined(separator: ", "))); "
+                    + "--force moves them to display \(display.slot) too")
+            }
+        }
+        // The per-app lock serializes this with an agent's input command or move on the app.
+        var locks: [StateLock] = []
+        defer { locks.forEach { $0.release() } }
+        for app in apps {
+            guard let lock = try? Locks.app(app, nonblocking: true) else {
+                throw CLIError("\(app.name) (pid \(app.pid)) is busy (an agent is using it); try again")
+            }
+            locks.append(lock)
+        }
+        let pids = Set(apps.map { $0.pid })
+        try AppStore.update { list in
+            for i in list.indices where list[i].display == slot && pids.contains(list[i].pid) { list[i].display = nil }
+        }
+        reloadManaged(now: ProcessInfo.processInfo.systemUptime)
+        // Windows first, display after: windows left on a display that goes are moved by macOS,
+        // possibly onto the user's screen.
+        var placed: [CGRect] = []
+        for app in apps {
+            for w in axApp(app.pid).windows where (w.attr(kAXMinimizedAttribute) as? Bool) != true {
+                placed.append(placeBeside(w, display: display.bounds, avoiding: placed))
+            }
+        }
+        extras[slot] = nil
+        extraCreated[slot] = nil
+        reservations[slot] = nil
+        log("display \(slot) closed by \(Session.isUser(session) ? "the user" : "session \(session)")"
+            + (apps.isEmpty ? "" : "; moved \(apps.count) app(s) to display \(display.slot)"))
+        refreshScreens()
+        try? writeInfo()
+        return apps.map { $0.pid }
+    }
+
+    /// The menu's ⓧ on a display's picture.
+    func closeDisplayFromMenu(_ slot: Int) {
+        do {
+            _ = try closeDisplay(slot, session: Session.user, force: true)
+        } catch {
+            log("menu close display \(slot) failed: \(error)")
+            statusMenu?.sendCue(text: "Can't close display \(slot): \(error)", success: false)
+        }
     }
 
     /// Where the user's own sent apps live: the display of the most recent one, else the primary.
