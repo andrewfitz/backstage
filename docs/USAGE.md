@@ -608,8 +608,10 @@ waiting up to 5 s (a display that just stopped can linger a moment).
 
 - `launch --display new` creates a display and **reserves** it for the caller's session for
   30 minutes: other sessions can't launch on it, `move` onto it, or get it from Send Front Window
-  Backstage. The display itself goes away once no app or pending launch is on it (after a 30 s
-  grace for a launch that's about to land there).
+  Backstage. The display itself is removed 30 minutes after the last app or pending launch left
+  it (`BACKSTAGE_EXTRA_DISPLAY_GRACE`): every display that comes or goes can briefly blip the
+  user's monitor, so an empty one is kept for the next send, move or launch. An empty display
+  costs memory (its framebuffer, roughly 33–100 MB at 3840×2160) but no CPU or GPU.
 - `launch --display N` uses display N, creating it if this daemon may run it (2–6 for the
   default home), refused if another session reserved it.
 - Without `--display`, a launch goes where the caller's session already has apps, else to the
@@ -645,7 +647,7 @@ Creating or removing one is a normal display reconfiguration (`CGDisplayRegister
 fires, and ColorSync registers the display). Backstage keeps churn low: a daemon's primary display
 lives as long as the daemon (which stays up 30 minutes after its last app, or always with Keep in
 Menu Bar), and an extra display (`launch --display new`) is removed only after it has been empty for
-30 seconds. Its size is the main display's in points at 2x; `BACKSTAGE_WIDTH`, `BACKSTAGE_HEIGHT`
+30 minutes. Its size is the main display's in points at 2x; `BACKSTAGE_WIDTH`, `BACKSTAGE_HEIGHT`
 and `BACKSTAGE_SCALE=1` make it smaller.
 
 ### `move --display N|new [--pid P]`
@@ -712,7 +714,7 @@ variables only reorder the advice: nothing extra is allowed.
 | `BACKSTAGE_DISPLAY` | 1 for the default home, else the lowest free of 2–6 | Which of the eight fixed displays this home's daemon uses (see [Displays](#displays)) |
 | `BACKSTAGE_EXTRA_DISPLAYS` | `2,3,4,5,6` | Which slots this daemon may add as extra displays (set before the daemon starts; tests use `8`) |
 | `BACKSTAGE_RESERVATION_SECONDS` | 1800 | How long `launch --display new` reserves a display (set before the daemon starts; at most a day) |
-| `BACKSTAGE_EXTRA_DISPLAY_GRACE` | 30 | Seconds an empty extra display waits before it's removed (set before the daemon starts) |
+| `BACKSTAGE_EXTRA_DISPLAY_GRACE` | 1800 | Seconds an empty extra display waits before it's removed (set before the daemon starts) |
 | `BACKSTAGE_HOME` | `~/.backstage` | State, logs, screenshots. Each home has its own daemon and agent display; daemons of different homes run side by side, their displays chained diagonally off the corner, each touching the next only at a corner point |
 | `BACKSTAGE_SESSION` | derived | The session this command belongs to (see Sessions); `legacy` and `user` are reserved |
 | `BACKSTAGE_WIDTH` / `BACKSTAGE_HEIGHT` | main display's size | Agent display size in points (set before the daemon starts) |

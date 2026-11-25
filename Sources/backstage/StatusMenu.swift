@@ -820,7 +820,7 @@ final class StatusMenu: NSObject, NSMenuDelegate {
         new.target = self
         new.representedObject = payload("new")
         new.isEnabled = d.extraSlots.contains { d.extras[$0] == nil }
-        new.toolTip = new.isEnabled ? "A fresh hidden display, kept for you; it goes away when its apps quit"
+        new.toolTip = new.isEnabled ? "A fresh hidden display, kept for you; it goes away 30 minutes after its last app leaves"
             : "Every display backstage may add is in use"
         items.append(new)
         return items

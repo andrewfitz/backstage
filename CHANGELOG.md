@@ -9,7 +9,7 @@
   own tests (`BACKSTAGE_DISPLAY`). `doctor` reports leftovers; `sudo backstage cleanup-displays`
   removes them once.
 - **Several displays per daemon:** `launch --display new` gives a session a display of its own
-  (reserved for 30 minutes, removed when its apps quit); `launch --display N`; `move --display`;
+  (reserved for 30 minutes, removed 30 minutes after its last app leaves, since a display coming or going can blip the user's monitor); `launch --display N`; `move --display`;
   launches follow their session's display; `"crowded": true` when a window found no free spot.
   Coordinates, screenshots and input are relative to the app's own display.
 - **Menu:** with several displays, two pictures stacked with labels, and ‹ › to page. Each

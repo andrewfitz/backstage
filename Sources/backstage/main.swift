@@ -29,7 +29,7 @@ LIFECYCLE
                                     --audio: measure its sound (screen sharing can hear it);
                                     --inaudible: fail unless it can be made inaudible
                                     --display new: a display of your own (reserved for your session
-                                    for 30 min; it goes away when its apps quit); --display N: that
+                                    for 30 min; removed 30 min after its last app); --display N: that
                                     one. Without it: your session's display, else display 1. A result
                                     with "crowded": true means the window found no free spot
   list [--all]                      your session's apps + their windows (--all: every session)

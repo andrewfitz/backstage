@@ -113,7 +113,7 @@ guard, audio and the menu stay in one process. Agents choose; nothing overflows 
   takes the lowest free display and **reserves** it for the caller's session.
 - A **reservation expires** 30 minutes after it was made (built simpler than first planned: no
   separate idle rule, since tracking each session's last command would mean writing state on
-  every command). Expiry only ends exclusivity; the display goes away once no app or pending
+  every command). Expiry only ends exclusivity; the display is removed 30 minutes after no app or pending
   launch is on it, after a grace period that each grant renews. A reserved display refuses other sessions' numbered launches, `move`s and
   Send Front Window Backstage.
 - Without `--display`, a launch goes where the caller's session already has apps, else display 1.

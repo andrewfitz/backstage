@@ -166,7 +166,10 @@ final class Daemon {
     /// How long a reservation lasts, and how long an empty extra display waits before it goes
     /// (a launch may be about to put its app there). Shortened by tests.
     let reservationSeconds = boundedSeconds("BACKSTAGE_RESERVATION_SECONDS", default: 1800)
-    let extraGraceSeconds = boundedSeconds("BACKSTAGE_EXTRA_DISPLAY_GRACE", default: 30)
+    // 30 minutes: every display that comes or goes can blip the user's real monitor (a macOS
+    // glitch), so an empty one is kept for a while for the next send, move or launch. An empty
+    // display costs memory (its framebuffer) but no CPU or GPU.
+    let extraGraceSeconds = boundedSeconds("BACKSTAGE_EXTRA_DISPLAY_GRACE", default: 1800)
     var creatingDisplay = false
     var nextExtrasCheck = 0.0
     var nextRemovalCheck = 0.0

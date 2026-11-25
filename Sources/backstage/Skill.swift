@@ -80,7 +80,7 @@ backstage quit                          # always clean up; `backstage stop` quit
 - **Acting:** `press`/`set`/`menu` are the most reliable. Use coordinate `click`/`drag`/`scroll`
   for custom-drawn views. `hover` is best-effort: tooltips won't appear.
 - **A display of your own:** `launch --display new` puts the app on a fresh hidden display
-  reserved for your session (for 30 minutes; it goes away when its apps quit). Use it for a
+  reserved for your session (for 30 minutes; it's removed 30 minutes after its last app leaves). Use it for a
   clean full-display screenshot or recording, a full-screen app, testing an app's multi-monitor
   behaviour, or when a launch result says `"crowded": true` (no free spot: windows overlap).
   Your later launches follow you there; `move --display N` moves an app (`list` shows each
