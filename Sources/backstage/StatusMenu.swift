@@ -813,6 +813,11 @@ final class StatusMenu: NSObject, NSMenuDelegate {
 
     private func closeDisplay(_ slot: Int) {
         daemon?.closeDisplayFromMenu(slot)
+    }
+
+    /// A display went (closed, or emptied and timed out): redraw an open menu's pictures.
+    func displaysChanged() {
+        guard refreshTimer != nil else { return }
         page = 0
         rebuild()
     }

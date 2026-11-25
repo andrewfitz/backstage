@@ -70,7 +70,7 @@ func cmdCloseDisplay(_ args: Args) throws -> [String: Any] {
         }
         throw CLIError(reply.error ?? "close-display refused")
     }
-    _ = waitFor(timeout: 5) { liveDaemon()?.entry(n) == nil ? true : nil }
+    _ = waitFor(timeout: 7) { liveDaemon()?.entry(n) == nil ? true : nil }
     return ["ok": true, "display": n, "closed": true, "moved": reply.moved ?? [], "movedTo": info.primarySlot]
 }
 

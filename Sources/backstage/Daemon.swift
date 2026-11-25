@@ -437,6 +437,7 @@ final class Daemon {
                 break
             }
         }
+        finishClosing(now: now)
         if !extras.isEmpty, now >= nextRemovalCheck {
             nextRemovalCheck = now + 1
             let pending = Launching.records()
@@ -451,6 +452,7 @@ final class Daemon {
                     extraCreated[slot] = nil
                     reservations[slot] = nil
                     log("display \(slot) removed: no apps left on it")
+                    statusMenu?.displaysChanged()
                     changed = true
                 }
             }
@@ -516,6 +518,7 @@ final class Daemon {
         guard let n = Int(want), displaySlots.contains(n) else { throw CLIError("--display takes a display number (1-8) or new") }
         if n == display.slot { return n }
         if extras[n] != nil {
+            if closing[n] != nil { throw CLIError("display \(n) is closing") }
             if !override, let r = reservations[n], r.until > wall, !Session.sameID(r.session, session) {
                 let until = DateFormatter.localizedString(from: Date(timeIntervalSince1970: r.until), dateStyle: .none, timeStyle: .short)
                 throw CLIError("display \(n) is reserved for another session until \(until)")
@@ -539,6 +542,7 @@ final class Daemon {
     /// Returns the PIDs that moved.
     func closeDisplay(_ slot: Int, session: String, force: Bool) throws -> [Int32] {
         guard slot != display.slot else { throw CLIError("display \(slot) is this daemon's first display; it always stays") }
+        if closing[slot] != nil { return [] }
         guard extras[slot] != nil else {
             throw CLIError("display \(slot) isn't running (this daemon runs \(allDisplays.map { String($0.slot) }.joined(separator: ", ")))")
         }
@@ -579,14 +583,40 @@ final class Daemon {
                 placed.append(placeBeside(w, display: display.bounds, avoiding: placed))
             }
         }
-        extras[slot] = nil
-        extraCreated[slot] = nil
         reservations[slot] = nil
-        log("display \(slot) closed by \(Session.isUser(session) ? "the user" : "session \(session)")"
+        closing[slot] = ProcessInfo.processInfo.systemUptime + 5
+        log("display \(slot) closing (by \(Session.isUser(session) ? "the user" : "session \(session)"))"
             + (apps.isEmpty ? "" : "; moved \(apps.count) app(s) to display \(display.slot)"))
-        refreshScreens()
-        try? writeInfo()
+        finishClosing(now: ProcessInfo.processInfo.systemUptime)
         return apps.map { $0.pid }
+    }
+
+    /// Displays being closed, until when at most (uptime). Each goes once no managed window is
+    /// left on it: a window still there when it goes would be moved by macOS, possibly onto the
+    /// user's screen. The window guard moves stragglers (a window AX didn't list yet) meanwhile.
+    var closing: [Int: Double] = [:]
+    func finishClosing(now: Double) {
+        guard !closing.isEmpty else { return }
+        let windows = onscreenWindows()
+        for (slot, deadline) in closing {
+            guard let d = extras[slot] else { closing[slot] = nil; continue }
+            let b = d.bounds
+            let left = windows.contains { w in
+                guard let pid = w[kCGWindowOwnerPID as String] as? pid_t, managed.contains(pid),
+                      (w[kCGWindowLayer as String] as? Int) == 0 else { return false }
+                let f = cgBounds(w)
+                return b.contains(CGPoint(x: f.midX, y: f.midY))
+            }
+            if left && now < deadline { continue }
+            closing[slot] = nil
+            extras[slot] = nil
+            extraCreated[slot] = nil
+            reservations[slot] = nil
+            log("display \(slot) closed" + (left ? " (a managed window was still on it after 5 s)" : ""))
+            refreshScreens()
+            try? writeInfo()
+            statusMenu?.displaysChanged()
+        }
     }
 
     /// The menu's ⓧ on a display's picture.
