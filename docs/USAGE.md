@@ -606,6 +606,22 @@ waiting up to 5 s (a display that just stopped can linger a moment).
 - The menu bar menu shows up to two displays' pictures stacked, labelled, with ‹ › to page
   through more.
 
+### For display and color tools
+
+Backstage's displays are virtual displays with stable identifiers, so tools that manage
+calibration, gamma or color (Redlight, f.lux, Lunar, BetterDisplay…) can recognise and skip them:
+
+- **Name:** always contains `Backstage` (today exactly `Backstage (agent display)`).
+- **Vendor / model:** `0xB57A` / `0x0001` (`CGDisplayVendorNumber` / `CGDisplayModelNumber`).
+- **Serials:** `0x42530001`–`0x42530008` (displays 1–8).
+
+Creating or removing one is a normal display reconfiguration (`CGDisplayRegisterReconfigurationCallback`
+fires, and ColorSync registers the display). Backstage keeps churn low: a daemon's primary display
+lives as long as the daemon (which stays up 30 minutes after its last app, or always with Keep in
+Menu Bar), and an extra display (`launch --display new`) is removed only after it has been empty for
+30 seconds. Its size is the main display's in points at 2x; `BACKSTAGE_WIDTH`, `BACKSTAGE_HEIGHT`
+and `BACKSTAGE_SCALE=1` make it smaller.
+
 ### `cleanup-displays`
 `sudo backstage cleanup-displays` removes ColorSync's records of backstage displays that aren't
 attached, left by versions that gave every home its own display identity. ColorSync only honours
