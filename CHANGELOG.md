@@ -12,11 +12,18 @@
   (reserved for 30 minutes, removed 30 minutes after its last app leaves, since a display coming or going can blip the user's monitor); `launch --display N`; `move --display`;
   launches follow their session's display; `"crowded": true` when a window found no free spot.
   Coordinates, screenshots and input are relative to the app's own display.
-- **Menu:** with several displays, two pictures stacked with labels, and ‹ › to page. Each
+- **Menu:** with several displays, two pictures side by side with labels, and ‹ › to page. Each
   app's **Move to ▸** puts it on another display (or a new one), and **Send Front Window To ▸**
   sends your app to the display you pick; a display you create is kept for you, and later sends
   follow your apps there.
-- A daemon that fails to start now says why (it used to say only "see daemon.log").
+- The audio meter in the menu bar has four bars, exactly as wide as the icon.
+- **Fixes:** a daemon started under heavy load could find no Core Audio process object yet,
+  report muting unavailable and refuse every launch (it now waits up to 3 s); `stop` gave up
+  after 8 s while the daemon was finishing a launch's shutdown (now 30 s, and it says why); a
+  daemon that fails to start now says why (it used to say only "see daemon.log"); a bug-fix pass
+  across the daemon, CLI, input, capture and audio.
+- **For display and color tools:** backstage's displays have stable identifiers (name contains
+  "Backstage", vendor `0xB57A`, model `0x0001`); see docs/USAGE.md.
 - Protocol 3: replace a running older daemon with `backstage stop --all`.
 
 ## 1.2.2
