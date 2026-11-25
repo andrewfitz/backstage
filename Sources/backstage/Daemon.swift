@@ -1310,8 +1310,8 @@ private func stopDaemonIfIdle(session: String) throws -> String {
         guard kill(d.pid, SIGTERM) == 0 || errno == ESRCH else { throw CLIError("failed to signal daemon") }
         daemon = d
     }
-    guard waitFor(timeout: 8, { daemon.matchesProcess ? nil : true }) != nil else {
-        throw CLIError("daemon did not stop within 8 seconds; see \(Paths.log.path)")
+    guard waitFor(timeout: 30, { daemon.matchesProcess ? nil : true }) != nil else {
+        throw CLIError("daemon did not stop within 30 seconds; see \(Paths.log.path)")
     }
     return "stopped"
 }
@@ -1343,8 +1343,13 @@ func stopAll() throws -> [String: Any] {
         }
     }
     if let daemon {
-        guard waitFor(timeout: 8, { daemon.matchesProcess ? nil : true }) != nil else {
-            throw CLIError("daemon did not stop within 8 seconds; see \(Paths.log.path)")
+        // The daemon puts off its shutdown while a launch holds lifecycle.lock (until the launch
+        // registers its app), then quits every app (up to 5 s): give it the time.
+        guard waitFor(timeout: 30, { daemon.matchesProcess ? nil : true }) != nil else {
+            let deferred = readJSON(Paths.daemon, DaemonInfo.self)?.stopping == true
+            throw CLIError(deferred
+                ? "the daemon is still shutting down after 30 s (it waits for a launch in progress, then quits every app); it will exit by itself, or run `backstage stop --all` again"
+                : "daemon did not stop within 30 seconds; see \(Paths.log.path)")
         }
     }
     Locks.pruneAppLocks()
