@@ -657,6 +657,19 @@ reserved for your session). An app the user sent backstage can be moved too, wit
 input follow it to the new display. Returns `from`, `display`, `moved` (windows placed) and
 `windows`. The user moves apps from the menu (each app's **Move to ▸**).
 
+### `recover [--dry-run]`
+Returns windows of apps backstage doesn't run that ended up on a hidden display to the user's
+main screen. It's usually an app reopening a window where it last was: backstage's displays keep
+fixed identities, so macOS remembers them like any monitor, and an app once sent backstage can
+come back there after the user relaunches it. The daemon does this by itself once a window has
+sat on one of its displays for 3 s (`BACKSTAGE_STRAY_GRACE`), only moving it, never activating
+it; an app a `backstage launch` opened (an agent's app, even one handed over with `show`) is left
+to an explicit `recover`, so an agent's app never lands on the user's screen by itself. `recover`
+does it now, for every display of this daemon (`BACKSTAGE_HOME`). Managed apps, their helpers
+(child processes, XPC services) and apps a launch is still opening are never touched. Returns `recovered` (and `failed`, if any window couldn't be moved); `--dry-run` lists
+them as `stray` without moving anything. The menu's **Recover Lost Windows** does the same and
+brings the app forward.
+
 ### `cleanup-displays`
 `sudo backstage cleanup-displays` removes ColorSync's records of backstage displays that aren't
 attached, left by versions that gave every home its own display identity. ColorSync only honours
@@ -715,6 +728,7 @@ variables only reorder the advice: nothing extra is allowed.
 | `BACKSTAGE_EXTRA_DISPLAYS` | `2,3,4,5,6` | Which slots this daemon may add as extra displays (set before the daemon starts; tests use `8`) |
 | `BACKSTAGE_RESERVATION_SECONDS` | 1800 | How long `launch --display new` reserves a display (set before the daemon starts; at most a day) |
 | `BACKSTAGE_EXTRA_DISPLAY_GRACE` | 1800 | Seconds an empty extra display waits before it's removed (set before the daemon starts) |
+| `BACKSTAGE_STRAY_GRACE` | 3 | Seconds an unmanaged app's window may sit on a backstage display before the daemon returns it to the user's screen (see [`recover`](#recover---dry-run)) |
 | `BACKSTAGE_HOME` | `~/.backstage` | State, logs, screenshots. Each home has its own daemon and agent display; daemons of different homes run side by side, their displays chained diagonally off the corner, each touching the next only at a corner point |
 | `BACKSTAGE_SESSION` | derived | The session this command belongs to (see Sessions); `legacy` and `user` are reserved |
 | `BACKSTAGE_WIDTH` / `BACKSTAGE_HEIGHT` | main display's size | Agent display size in points (set before the daemon starts) |

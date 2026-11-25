@@ -163,7 +163,10 @@ struct ManagedApp: Codable, Equatable {
         if let app = NSRunningApplication(processIdentifier: pid),
            app.processIdentifier == pid, !app.isTerminated {
             let accepted = force ? app.forceTerminate() : app.terminate()
-            if accepted || !force { return }
+            if !force { return }
+            // forceTerminate can report success and leave the process running (seen with
+            // xctest): a forced quit always ends with SIGKILL, so `stop` never stalls on it.
+            if accepted, waitFor(timeout: 0.5, { self.matchesProcess ? nil : true }) != nil { return }
         }
         guard matchesProcess else { return }
         if kill(pid, force ? SIGKILL : SIGTERM) != 0, errno != ESRCH {

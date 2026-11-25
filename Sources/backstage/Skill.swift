@@ -88,6 +88,9 @@ backstage quit                          # always clean up; `backstage stop` quit
   span several. Coordinates are always relative to the app's own display. Creating a display
   can briefly flicker the user's monitor, so don't do it routinely: the shared display 1 is
   the default for a reason.
+- **A window you didn't launch on the display** (one of the user's own apps reopening where it
+  last was): the daemon returns it to the user's screen within seconds; `backstage recover`
+  does it now. Never `launch` or drive it: it's the user's.
 - **Several apps:** commands target your most recent launch. Pass `--pid P` (from
   `launch`/`list`) to be explicit.
 - **Other agents share hidden display 1.** Each agent session only sees and drives the

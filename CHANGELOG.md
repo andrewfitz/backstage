@@ -1,5 +1,20 @@
 # Changelog
 
+## 1.3.1
+
+- **Lost windows come back.** Backstage's displays keep fixed identities, so macOS remembers them
+  like any monitor, and an app once sent backstage could reopen its window there after being
+  relaunched, out of reach. The daemon now returns windows of apps it doesn't run to your main
+  screen once they've sat on a hidden display for 3 seconds (moving them only, never taking
+  focus). Apps a `backstage launch` opened are left to an explicit recovery, so an agent's app
+  never lands on your screen by itself. **Recover Lost Windows** in the menu and
+  `backstage recover [--dry-run]` do it on demand, for that daemon's displays. Managed apps, their
+  helpers, and apps a launch is still opening are never touched.
+- **Menu:** Keep in Menu Bar shows its checkmark at the end of the row, so the menu no longer
+  indents every row for a checkmark column.
+- **Fix:** a forced quit that macOS accepted without ending the app (seen with `xctest`) left
+  `stop --all` waiting 30 s and the daemon running; a forced quit now always ends with SIGKILL.
+
 ## 1.3.0
 
 - **Fix: ColorSync CPU.** Every `BACKSTAGE_HOME` got its own display identity, and test suites

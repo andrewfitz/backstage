@@ -67,7 +67,7 @@ struct Args {
 
     init(_ raw: [String], command: String) throws {
         let flags: Set<String> = ["help", "json", "force", "double", "right", "raw", "gone", "full", "claude", "codex", "grok", "hooks", "all", "sound", "dock",
-                                "audio", "inaudible"]
+                                "audio", "inaudible", "dry-run"]
         let values: Set<String> = ["pid", "app", "env", "timeout", "lines", "scale", "o", "out",
                                    "window", "depth", "role", "text", "ref", "steps", "dx", "dy", "since", "min-db", "seconds",
                                    "focus-to", "bundle-id", "name", "path", "display", "displays", "page", "appearance"]
@@ -194,6 +194,7 @@ struct Args {
                 throw CLIError("--display takes a display number (1-8) or new")
             }
         case "cleanup-displays": allowed = []; arity = 0...0
+        case "recover": allowed = ["dry-run"]; arity = 0...0
         case "settings": allowed = []; arity = 0...2
         case "__send-backstage": allowed = ["pid", "focus-to", "display"]; arity = 0...0
         case "__send-refusal": allowed = ["bundle-id", "name", "path"]; arity = 0...0

@@ -49,6 +49,9 @@ LIFECYCLE
                                     default chooses ctrl+opt+cmd+b. A custom shortcut needs two or
                                     more modifiers incl. cmd or ctrl, plus a letter, digit or F-key
   logs [--pid P] [--lines N]        tail the app's stdout/stderr
+  recover [--dry-run]               return windows of apps backstage doesn't run that ended up on a
+                                    hidden display to the user's screen (the daemon does this by
+                                    itself after 3 s; also in the menu: Recover Lost Windows)
   cleanup-displays                  (sudo) remove leftover backstage displays from ColorSync
   version                           print the version (also `status`'s "version")
 
@@ -703,6 +706,7 @@ func run() throws {
     case "cleanup-displays": emit(try cmdCleanupDisplays())
     case "__menu-render": emit(try runMenuRender(args))
     case "move": emit(try cmdMove(args))
+    case "recover": emit(try cmdRecover(args))
     case "audio": emit(try cmdAudio(args))
     case "launch", "open": emit(try launch(args))
     case "list", "ps": emit(try cmdList(args))

@@ -505,6 +505,11 @@ final class StatusMenu: NSObject, NSMenuDelegate {
         menu.addItem(.separator())
         menu.addItem(sendItem())
         menu.addItem(sendToItem())
+        let recover = NSMenuItem(title: "Recover Lost Windows", action: #selector(recoverWindows), keyEquivalent: "")
+        recover.target = self
+        recover.toolTip = "Brings windows of apps backstage isn't running back to your screen when they've ended up on a hidden display "
+            + "(an app reopening where it last was). Backstage returns them by itself after a few seconds; this does it now."
+        menu.addItem(recover)
         let folder = NSMenuItem(title: "Open Screenshots & Logs Folder", action: #selector(openFolder), keyEquivalent: "")
         folder.target = self
         menu.addItem(folder)
@@ -521,7 +526,11 @@ final class StatusMenu: NSObject, NSMenuDelegate {
         menu.addItem(.separator())
         let keepItem = NSMenuItem(title: "Keep in Menu Bar", action: #selector(toggleKeep), keyEquivalent: "")
         keepItem.target = self
-        keepItem.state = daemon?.settings.keep == true ? .on : .off
+        // A trailing checkmark, not the item's state: a state image makes the menu reserve a
+        // checkmark column, which indents every row and unbalances the menu.
+        let kept = daemon?.settings.keep == true
+        if kept { keepItem.badge = NSMenuItemBadge(string: "✓") }
+        keepItem.setAccessibilityValue(kept ? "on" : "off")
         keepItem.toolTip = "Keeps Backstage here with no apps running, so Send Front Window Backstage and its shortcut are always at hand. "
             + "After a restart, `backstage start` brings it back."
         menu.addItem(keepItem)
@@ -790,6 +799,10 @@ final class StatusMenu: NSObject, NSMenuDelegate {
         }
         send.toolTip = tip
         return send
+    }
+
+    @objc private func recoverWindows() {
+        daemon?.recoverFromMenu()
     }
 
     @objc private func sendFront() {

@@ -161,7 +161,7 @@ a still waveform instead. The icon's box never changes size. The menu shows:
 
 - a **live picture** of the hidden agent display, refreshed every second while the menu is open.
   Point at an app's row and its windows are picked out in the picture. With several displays
-  (`launch --display new`), two pictures are stacked, each labelled, with ‹ › to page through more
+  (`launch --display new`), two pictures sit side by side, each labelled, with ‹ › to page through more
 - **each app**, grouped by the agent session that launched it ("Claude — myproject": the agent,
   then the name given with `BACKSTAGE_SESSION` or the folder the agent works in), with how long
   it has been running, and a note if it has no windows or is playing sound (apps launched with
@@ -170,7 +170,10 @@ a still waveform instead. The icon's box never changes size. The menu shows:
   bundle ID and process ID
 - **Send Front Window Backstage** (⌃⌥⌘B), described below; **Send Front Window To ▸**, the same
   onto a display you pick (say, a display of your own while agents work on display 1: later sends
-  follow it there); and **Open Screenshots & Logs Folder**
+  follow it there); **Recover Lost Windows**, which brings back windows of your own apps that
+  ended up on a hidden display (an app reopening where it was while backstage; the daemon also
+  does this by itself after 3 s, and `backstage recover` from a terminal); and **Open
+  Screenshots & Logs Folder**
 - **Quit All Agent Apps**: every app running here, including ones you sent backstage
 - **Keep in Menu Bar**, described below
 - a quiet footer with the version and a link to this repository
@@ -324,6 +327,7 @@ backstage logs                             # the app's stdout/stderr
 backstage window fill                      # window covers the whole agent display (or: window size 1280 800)
 backstage launch MyApp.app --display new   # a hidden display of your own (clean recordings, full screen)
 backstage move --display 1                 # move your app to another display
+backstage recover                          # bring stray windows back to the user's screen
 backstage screenshot --full --display 2    # one whole display, your session's windows only
 backstage quit
 ```

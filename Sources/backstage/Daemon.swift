@@ -923,6 +923,10 @@ final class Daemon {
             nextDockCheck = now + 1
             guardDock(own: own.map { $0.bounds }, windows: windows, geometry: geometry)
         }
+        if now >= nextStrayCheck {
+            nextStrayCheck = now + 1
+            guardStrays(now: now, own: own, windows: windows)
+        }
         if now >= nextGuardLog { nextGuardLog = now + 1; inputGuard.logActivity(log) }
         if now >= nextSettingsCheck {
             nextSettingsCheck = now + 0.5
@@ -947,6 +951,57 @@ final class Daemon {
         if managed.isEmpty && !launchesPending && pendingShutdown == nil && !registryUnreadable && now - idleSince > idleTimeout {
             shutdown(reason: "idle for \(Int(idleTimeout))s with no managed apps")
         }
+    }
+
+    // MARK: stray windows (StrayWindows.swift)
+    var nextStrayCheck = 0.0
+    /// When each stray window was first seen; and failed moves (retried with backoff, 5 tries).
+    var straySince: [CGWindowID: Double] = [:]
+    var strayFailures: [CGWindowID: (count: Int, retryAt: Double)] = [:]
+    /// How long an unmanaged app's window may sit on a backstage display before it's returned:
+    /// long enough for a send or a hand-over to finish with it.
+    let strayGrace = boundedSeconds("BACKSTAGE_STRAY_GRACE", default: 3)
+
+    /// Once a second: return regular apps' windows that have sat on this daemon's displays for
+    /// `strayGrace` to the user's screen. Moves, never activates. Apps a `backstage launch`
+    /// opened are left to an explicit `recover`: an agent's app never lands on the user's screen
+    /// by itself.
+    func guardStrays(now: Double, own: [(slot: Int, bounds: CGRect)], windows: [[String: Any]]?) {
+        // backstage's own test daemons (displays 7-8) never move a window to the user's screen by
+        // themselves; tests/strays.sh turns it on with a test display as the target.
+        guard display.slot <= sharedDisplaySlots.upperBound || strayTestTargetSlot != nil else { return }
+        guard !sendInFlight, !creatingDisplay, !registryUnreadable, pendingShutdown == nil else { straySince = [:]; return }
+        let pending = launchesPending ? Set(Launching.records().map { $0.id }) : []
+        let strays = findStrayWindows(displays: own.filter { $0.slot != strayTestTargetSlot }.map { ($0.slot, $0.bounds) },
+                                      managed: managed, pendingLaunches: pending, windows: windows)
+            .filter { $0.policy == .regular && !$0.launched }
+        var seen: [CGWindowID: Double] = [:]
+        var due: [StrayWindow] = []
+        for s in strays {
+            let since = straySince[s.windowID] ?? now
+            seen[s.windowID] = since
+            if let f = strayFailures[s.windowID], f.count >= 5 || now < f.retryAt { continue }
+            if now - since >= strayGrace { due.append(s) }
+        }
+        straySince = seen
+        strayFailures = strayFailures.filter { seen[$0.key] != nil }
+        guard !due.isEmpty else { return }
+        let moved = Set(returnStrayWindows(due, axTimeout: 0.1, log: log).map { $0.windowID })
+        for s in due {
+            if moved.contains(s.windowID) { straySince[s.windowID] = nil; strayFailures[s.windowID] = nil; continue }
+            let count = (strayFailures[s.windowID]?.count ?? 0) + 1
+            strayFailures[s.windowID] = (count, now + pow(2, Double(count)))
+            if count == 5 { log("stray window \(s.label): giving up after 5 tries (`backstage recover` tries again)") }
+        }
+    }
+
+    /// The menu's Recover Lost Windows: every stray on this daemon's displays, now.
+    func recoverFromMenu() {
+        let strays = recoverableStrays(managed: managed, displays: allDisplays.map { ($0.slot, $0.bounds) })
+        if strays.isEmpty { log("recover (menu): no stray windows"); return }
+        let moved = returnStrayWindows(strays, activate: true, log: log)
+        for s in moved { strayFailures[s.windowID] = nil }
+        log("recover (menu): returned \(moved.count) of \(strays.count) stray window(s)")
     }
 
     /// The reconfiguration callback isn't delivered without an NSApplication (BACKSTAGE_MENUBAR=off),
