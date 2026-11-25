@@ -14,10 +14,12 @@ screenshots have its shape (a 4K monitor at the usual 2x is 1920×1080 points), 
 Retina display, drawn at 2x (3840×2160 pixels for that size), so apps render as they would on
 a Retina screen. The size is read when the daemon starts; changing your displays later doesn't
 resize a running agent display. `BACKSTAGE_WIDTH`/`BACKSTAGE_HEIGHT` set another size, and
-`BACKSTAGE_SCALE=1` gives a 1x display.
+`BACKSTAGE_SCALE=1` gives a 1x display. Normally there's one, display 1, shared by every agent;
+an agent can add a display of its own (`launch --display new`), and the user can too, from the
+menu. See [Displays](#displays).
 
 **Coordinates.** All points are agent-display points, with `(0,0)` at the top-left of the
-agent display. A default `screenshot` is cropped starting at `(0,0)`, so a pixel `(x,y)` in
+agent display the app is on. A default `screenshot` is cropped starting at `(0,0)`, so a pixel `(x,y)` in
 the image is exactly the point to pass to `click x y`. If you captured with `--scale S`,
 pass the same `--scale S` to `click`/`drag`/`scroll`/`hover`, or divide by S yourself.
 Sizes are in points too, whatever the display's scale: a default screenshot is downsampled to
@@ -110,6 +112,11 @@ regular app at startup gets one anyway: `"visible (app made itself a regular app
 still runs hidden on the agent display; only the tile shows). `--dock` launches it with a Dock
 tile on purpose: `"visible (--dock)"`. Qt apps are kept out of the Dock with
 `QT_MAC_DISABLE_FOREGROUND_APPLICATION_TRANSFORM=1`, which `launch` adds to their environment.
+`--display new` puts the app on a fresh display reserved for your session, `--display N` on that
+display, and without it the app goes where your session already has apps, else display 1 (see
+[Several displays per daemon](#several-displays-per-daemon)). The result says which (`display`), and
+`"crowded": true` (with a `warning`) when its window found no free spot and overlaps others.
+
 `--timeout` (default 15 s) is how long to wait for the first window. A windowless app still
 launches; you get a `warning`, and any window it opens later is still pulled onto the agent
 display.
@@ -179,7 +186,8 @@ Your session's apps with their windows. `--all` lists every session's apps; each
 listed under `audioFailures` for 10 minutes. `pendingLaunches` lists launches that failed
 because their process hadn't appeared yet (see `launch`): `launch` (its id), `path`, `log`,
 `startedAt`, and `until` (when the daemon stops waiting for it). If the app starts, the daemon
-registers it to the session and it moves to `apps`.
+registers it to the session and it moves to `apps`. Each app's `display` says which display it's
+on, and its windows' frames are relative to that display.
 
 ### `quit [--force]`
 Quits the app. If it refuses, for example because of a "Save changes?" sheet, you get
@@ -237,6 +245,10 @@ While the daemon runs, `daemon` describes the agent display:
 `size` is in points, and `sizeSource` says where it came from: `main display`, or `env` when
 `BACKSTAGE_WIDTH`/`BACKSTAGE_HEIGHT` set it. `pixels` is the backing store. `screencaptureDisplay` and `ffmpegScreen`
 identify the display to standard recording tools; see [Recording](#recording-the-agent-display).
+`display` is its slot (1–8, see [Displays](#displays)). With more than one display (or a
+reservation), `displays` lists each: `display`, `displayID`, `primary`, `globalOrigin`, `apps`,
+`reservedBy`/`reservedUntil`, and its own `screencaptureDisplay`/`ffmpegScreen`. `doctor` adds
+`leftoverDisplays` (see [`cleanup-displays`](#cleanup-displays)).
 
 ### `start` / `stop` / `stop --all`
 `start` starts the daemon. `stop` quits **your session's** apps (forcing them after 3 s).
@@ -535,6 +547,10 @@ screencapture -x -v -V 10 -D "$n" run.mov      # 10 s of video (H.264 .mov), no 
 screencapture -x -D "$n" still.png             # one still at native resolution
 ```
 
+- **Several displays:** `.daemon.screencaptureDisplay` is the primary's. For another, use its
+  entry: `backstage status | jq '.daemon.displays[] | select(.display == 2) | .screencaptureDisplay'`
+  (and `ffmpegScreen`). Recording a display of your own (`launch --display new`) leaves other
+  sessions' windows out.
 - `-D` counts the active displays from 1 in the system's order, which changes when displays
   are added or removed (another monitor, a restarted daemon). Read `screencaptureDisplay`
   right before recording.
@@ -632,6 +648,13 @@ Menu Bar), and an extra display (`launch --display new`) is removed only after i
 30 seconds. Its size is the main display's in points at 2x; `BACKSTAGE_WIDTH`, `BACKSTAGE_HEIGHT`
 and `BACKSTAGE_SCALE=1` make it smaller.
 
+### `move --display N|new [--pid P]`
+Moves one of your apps, with its windows, to another of the daemon's displays (`new`: a fresh one,
+reserved for your session). An app the user sent backstage can be moved too, with an explicit
+`--pid`. Refused onto a display another session (or the user) reserved. Its coordinates, crops and
+input follow it to the new display. Returns `from`, `display`, `moved` (windows placed) and
+`windows`. The user moves apps from the menu (each app's **Move to ▸**).
+
 ### `cleanup-displays`
 `sudo backstage cleanup-displays` removes ColorSync's records of backstage displays that aren't
 attached, left by versions that gave every home its own display identity. ColorSync only honours
@@ -687,6 +710,9 @@ variables only reorder the advice: nothing extra is allowed.
 | Variable | Default | Effect |
 |---|---|---|
 | `BACKSTAGE_DISPLAY` | 1 for the default home, else the lowest free of 2–6 | Which of the eight fixed displays this home's daemon uses (see [Displays](#displays)) |
+| `BACKSTAGE_EXTRA_DISPLAYS` | `2,3,4,5,6` | Which slots this daemon may add as extra displays (set before the daemon starts; tests use `8`) |
+| `BACKSTAGE_RESERVATION_SECONDS` | 1800 | How long `launch --display new` reserves a display (set before the daemon starts; at most a day) |
+| `BACKSTAGE_EXTRA_DISPLAY_GRACE` | 30 | Seconds an empty extra display waits before it's removed (set before the daemon starts) |
 | `BACKSTAGE_HOME` | `~/.backstage` | State, logs, screenshots. Each home has its own daemon and agent display; daemons of different homes run side by side, their displays chained diagonally off the corner, each touching the next only at a corner point |
 | `BACKSTAGE_SESSION` | derived | The session this command belongs to (see Sessions); `legacy` and `user` are reserved |
 | `BACKSTAGE_WIDTH` / `BACKSTAGE_HEIGHT` | main display's size | Agent display size in points (set before the daemon starts) |
@@ -695,8 +721,12 @@ variables only reorder the advice: nothing extra is allowed.
 | `BACKSTAGE_MENUBAR` | on | `off` hides the menu bar indicator, and with it the hotkey and Keep in Menu Bar (set before the daemon starts) |
 | `BACKSTAGE_TEST_HOOKS` | — | Tests only: `1` allows `backstage __send-backstage --pid P`, the Send Front Window Backstage path the menu and hotkey run |
 | `BACKSTAGE_TEST_REFUSE` | — | Tests only: one more bundle-ID prefix Send Front Window Backstage refuses |
-| `BACKSTAGE_TEST_SEND_REQUESTS` | — | Tests only (set before the daemon starts): `1` makes the daemon send a pid written to `$BACKSTAGE_HOME/send-request` through its hotkey path, in place of the frontmost app |
+| `BACKSTAGE_TEST_SEND_REQUESTS` | — | Tests only (set before the daemon starts): `1` makes the daemon send a pid written to `$BACKSTAGE_HOME/send-request` (`PID`, or `PID DISPLAY` for Send Front Window To) through its hotkey path, in place of the frontmost app, and move a managed app as the menu's Move to does for `PID DISPLAY` in `move-request` (result in `move-result`) |
+| `BACKSTAGE_TEST_LS` | — | Tests only: `no-callback`, `no-find` (comma-separated) simulate a LaunchServices that never answers or a process `launch` can't find |
+| `BACKSTAGE_FAKE_AUDIO` / `BACKSTAGE_REDUCE_MOTION` | — | Tests only (set before the daemon starts): a synthetic level for the menu bar meter; force Reduce Motion on (`1`) or off (`0`) |
 | `BACKSTAGE_HOOK` | on | `off` disables the hook |
 | `BACKSTAGE_SHOW` | — | `1` as a command prefix lets that command past the hook |
 | `BACKSTAGE_TEST_AUDIO` | — | Tests only (set before the daemon starts): `mute-fail`, `tap-fail` or `no-capture` simulate those failures |
 | `BACKSTAGE_INAUDIBLE_DYLIB` | next to the binary, else `../lib/backstage/` | Path of `libbackstage-inaudible.dylib` for `launch`; empty means none (tests: the fallback to muted) |
+
+`BACKSTAGE_LAUNCH_ID`, `BACKSTAGE_INAUDIBLE_ACK` and `BACKSTAGE_CAPTURE_RETRY` are internal (set by backstage for the processes it starts); `launch` refuses the first two in `--env`.

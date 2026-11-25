@@ -322,11 +322,14 @@ backstage wait --sound --since 81234.5     # did it play (since `time`)? --gone:
 backstage audio record --seconds 5         # -> {"path": ".../audio-….wav", ...}: the last 5 s it played
 backstage logs                             # the app's stdout/stderr
 backstage window fill                      # window covers the whole agent display (or: window size 1280 800)
+backstage launch MyApp.app --display new   # a hidden display of your own (clean recordings, full screen)
+backstage move --display 1                 # move your app to another display
+backstage screenshot --full --display 2    # one whole display, your session's windows only
 backstage quit
 ```
 
 - Commands return JSON. Plain `tree` prints indented text, `logs` streams the requested lines, and `help` prints usage. Use `tree --json` for structured output.
-- Coordinates are agent-display points, with (0,0) at the top-left of the virtual display. A
+- Coordinates are agent-display points, with (0,0) at the top-left of the app's virtual display. A
   default `screenshot` is cropped starting at (0,0), so a pixel in the image is the same as
   the point you click. `--scale 0.5` gives smaller images; divide the pixel by the scale before clicking.
 - The agent display has your main display's size in points and is Retina (2x), so apps render as on a Retina screen. A default screenshot

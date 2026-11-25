@@ -36,7 +36,8 @@ LIFECYCLE
   quit [--pid P] [--force]          quit a managed app
   move --display N|new [--pid P]    move an app to another display (coordinates follow it)
   status | doctor                   daemon/display/permission status, and the display's
-                                    `screencapture -D` index (to record it with standard tools);
+                                    `screencapture -D` index (to record it with standard tools;
+                                    with several displays, each one's under daemon.displays);
                                     doctor also runs the audio self-test (inaudible, muted probe)
   start                             start the daemon
   stop                              quit your session's apps (and the daemon, if no apps are left)

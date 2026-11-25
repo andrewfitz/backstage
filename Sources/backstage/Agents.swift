@@ -96,7 +96,7 @@ func desktopComputerUseHost(_ env: [String: String] = ProcessInfo.processInfo.en
 }
 
 func hookDenyMessage(_ why: String, _ command: String, env: [String: String] = ProcessInfo.processInfo.environment) -> String {
-    let own = "• Checking your own work (build/test/verify/debug/screenshot/explore)? Run it hidden: `backstage launch <app|bundle-id|path>`, then screenshot/tree/click (see the backstage skill or `backstage help`)."
+    let own = "• Checking your own work (build/test/verify/debug/screenshot/explore)? Run it hidden: `backstage launch <app|bundle-id|path>` (`--display new` for a hidden display of your own), then screenshot/tree/click (see the backstage skill or `backstage help`)."
     let user = "• Did the user explicitly ask to see it on their screen? Use `backstage show <app|file|url>`, or `backstage show --pid P` to hand over an app you launched hidden."
     let computerUse = "• Going to drive it with computer-use tools that work on the user's screen (screenshots of their display, the real mouse and keyboard)? "
         + "They can't see backstage's hidden display: put the app on the user's screen with `backstage show <app>` (`backstage show --pid P` if you launched it hidden), "

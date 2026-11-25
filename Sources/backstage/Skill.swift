@@ -73,17 +73,24 @@ backstage quit                          # always clean up; `backstage stop` quit
 - **Recording:** to record 10 s of the agent display, run
   `screencapture -x -v -V 10 -D "$(backstage status | jq .daemon.screencaptureDisplay)" out.mov`
   (`-x` keeps it silent). It captures the whole agent display, including other sessions'
-  windows. Never record or capture the user's own screens.
+  windows, so for a clean recording launch on a display of your own (below) and take its index
+  from `backstage status | jq '.daemon.displays[] | select(.display == N) | .screencaptureDisplay'`.
+  Read the index right before recording: it changes when displays come and go. Never record or
+  capture the user's own screens.
 - **Acting:** `press`/`set`/`menu` are the most reliable. Use coordinate `click`/`drag`/`scroll`
   for custom-drawn views. `hover` is best-effort: tooltips won't appear.
 - **A display of your own:** `launch --display new` puts the app on a fresh hidden display
   reserved for your session (for 30 minutes; it goes away when its apps quit). Use it for a
-  clean full-display screenshot or recording, a full-screen app, or when a launch result says
-  `"crowded": true` (no free spot: windows overlap). Your later launches follow you there;
-  `move --display N` moves an app. Coordinates are always relative to the app's own display.
+  clean full-display screenshot or recording, a full-screen app, testing an app's multi-monitor
+  behaviour, or when a launch result says `"crowded": true` (no free spot: windows overlap).
+  Your later launches follow you there; `move --display N` moves an app (`list` shows each
+  app's `display`), and `screenshot --full --display N` captures one display when your apps
+  span several. Coordinates are always relative to the app's own display. Creating a display
+  can briefly flicker the user's monitor, so don't do it routinely: the shared display 1 is
+  the default for a reason.
 - **Several apps:** commands target your most recent launch. Pass `--pid P` (from
   `launch`/`list`) to be explicit.
-- **Other agents share the hidden display.** Each agent session only sees and drives the
+- **Other agents share hidden display 1.** Each agent session only sees and drives the
   apps it launched (its own `list`, default target, logs and screenshots). Another
   session's PID or ref is an error, and `backstage stop` only quits your own apps. Never use
   `stop --all` unless the user asks: it quits every agent's apps.
