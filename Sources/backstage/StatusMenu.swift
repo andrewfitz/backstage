@@ -371,6 +371,8 @@ final class StatusMenu: NSObject, NSMenuDelegate {
             hero = view
             heroItem = item
             heroShape = shape
+            // Two pictures side by side make the menu a little wider; one keeps it as it was.
+            menu.minimumWidth = max(MenuHeroView.width(previewWidth: Self.thumbWidth), view.frame.width)
         }
         if let heroItem { menu.addItem(heroItem) }
         showPage(displays: displays, sources: sources)

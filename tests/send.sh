@@ -200,10 +200,10 @@ for _ in $(seq 1 50); do [[ -f "$BACKSTAGE_HOME/move-result" ]] && break; sleep 
 [[ $(cat "$BACKSTAGE_HOME/move-result" 2>/dev/null) == ok && $(on_display "$PID") == 8 ]] && in_bounds "$PID" \
     && pass "Move to > Display 8 moved the first sent app there" || fail "menu move: $(cat "$BACKSTAGE_HOME/move-result" 2>/dev/null), display $(on_display "$PID")"
 rm -f "$BACKSTAGE_HOME/move-result"
-OUT=$(BACKSTAGE_SESSION=send-other "$BS" move --pid "$PID" --display 7 2>&1)
+OUT=$(BACKSTAGE_SESSION=send-other "$BS" move --pid "$PID" --display 7 2>&1 || true)
 [[ $(echo "$OUT" | jq -r .display) == 7 && $(on_display "$PID") == 7 ]] && in_bounds "$PID" \
     && pass "an agent moved a sent app back to display 7 with move --pid" || fail "agent move: $OUT"
-OUT8=$(BACKSTAGE_SESSION=send-other "$BS" move --pid "$PID" --display 8 2>&1)
+OUT8=$(BACKSTAGE_SESSION=send-other "$BS" move --pid "$PID" --display 8 2>&1 || true)
 echo "$OUT8" | jq -e '.ok == false and (.error | test("reserved"))' > /dev/null \
     && pass "but can't move it onto the user's own display 8: $(echo "$OUT8" | jq -r .error)" || fail "agent onto the user's display: $OUT8"
 "$WORK/sendhelper" terminate "$PID2" "$WORK/$NAME2.app" && PID2= || fail "quit second fixture"

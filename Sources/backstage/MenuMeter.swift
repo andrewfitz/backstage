@@ -3,8 +3,8 @@ import AppKit
 import QuartzCore
 
 /// The menu bar meter: while any managed app is making sound, the status item's icon is
-/// replaced by five rounded bars in the icon's own box, so the item never changes width. The
-/// bars are the last five peak readings of the loudest playing app, newest on the right, on a
+/// replaced by four rounded bars in the icon's own box, so the item never changes width. The
+/// bars are the last four peak readings of the loudest playing app, newest on the right, on a
 /// -60...0 dBFS scale. A 12 fps timer runs only while the meter shows; otherwise a 20 Hz poll
 /// watches for sound while metered apps are running. 1 s after the sound stops the icon fades
 /// back. With Reduce Motion, a static `waveform` symbol shows instead and nothing animates.
@@ -12,10 +12,10 @@ import QuartzCore
 /// Cost: changing the button's image makes AppKit redraw it and re-snapshot it for the status
 /// item's copy on every other display's menu bar (agent displays included), about 6% CPU at
 /// 12 fps. So the bars are Core Animation layers in a layer-hosting view over a blank image of
-/// the icon's size: a frame only moves five layers, and nothing is redrawn or re-snapshotted.
+/// the icon's size: a frame only moves four layers, and nothing is redrawn or re-snapshotted.
 /// The copies on other displays are refreshed once a second instead.
 final class AudioMeter {
-    static let barCount = 5
+    static let barCount = 4
     static let floorDb: Float = -60
     static let frameInterval = 1.0 / 12
     static let pollInterval = 0.05
@@ -26,6 +26,9 @@ final class AudioMeter {
     private weak var button: NSStatusBarButton?
     /// The idle icon; its size is the box the meter occupies.
     private let icon: NSImage
+    /// The part of the icon's box the glyph actually covers (symbols have padding): the bars
+    /// span exactly this, so the meter is no wider than the two rectangles it replaces.
+    private let ink: NSRect
     /// Holds the icon's place in the button (same size, so the same width) while bars show.
     private let blank: NSImage
     private lazy var waveform = Self.waveformImage(box: icon.size)
@@ -54,6 +57,7 @@ final class AudioMeter {
     init(button: NSStatusBarButton, icon: NSImage, source: @escaping () -> AudioLevelSource?, log: @escaping (String) -> Void) {
         self.button = button
         self.icon = icon
+        self.ink = Self.inkRect(of: icon)
         self.source = source
         self.log = log
         let blank = NSImage(size: icon.size, flipped: false) { _ in true }
@@ -263,17 +267,19 @@ final class AudioMeter {
         let scale = view.window?.backingScaleFactor ?? 2
         func px(_ v: CGFloat) -> CGFloat { (v * scale).rounded() / scale }
         let rect = view.bounds
-        let usable = min(rect.width, rect.height * 1.2)
-        let barW = px(usable / 8.2)            // 5 bars and 4 gaps of 0.8 bar
+        let n = CGFloat(Self.barCount)
+        let span = ink.isEmpty ? rect.width : ink.width
+        let barW = px(span / (n + (n - 1) * 0.8))    // 4 bars and 3 gaps of 0.8 bar across the glyph
         let gap = px(barW * 0.8)
-        let total = barW * 5 + gap * 4
-        let maxH = rect.height * 0.8
-        var x = px(rect.midX - total / 2)
+        let total = barW * n + gap * (n - 1)
+        let maxH = (ink.isEmpty ? rect.height * 0.8 : ink.height)
+        let midX = ink.isEmpty ? rect.midX : ink.midX
+        var x = px(midX - total / 2)
         var changed = false
         for (bar, reading) in zip(bars, readings) {
             let fraction = CGFloat(Self.fraction(reading))
             let h = px(barW + fraction * (maxH - barW))
-            let frame = CGRect(x: x, y: px(rect.midY - h / 2), width: barW, height: h)
+            let frame = CGRect(x: x, y: px((ink.isEmpty ? rect.midY : ink.midY) - h / 2), width: barW, height: h)
             x += barW + gap
             guard frame != bar.frame else { continue }
             if !changed {
@@ -285,6 +291,28 @@ final class AudioMeter {
             bar.frame = frame
         }
         if changed { CATransaction.commit() }
+    }
+
+    /// The bounding box of the icon's opaque pixels, in its own coordinates (bottom-left
+    /// origin, like the bars' view). Empty if it can't be measured.
+    static func inkRect(of image: NSImage) -> NSRect {
+        let scale: CGFloat = 4
+        let w = Int(image.size.width * scale), h = Int(image.size.height * scale)
+        guard w > 0, h > 0, let rep = NSBitmapImageRep(bitmapDataPlanes: nil, pixelsWide: w, pixelsHigh: h, bitsPerSample: 8,
+                                                         samplesPerPixel: 4, hasAlpha: true, isPlanar: false,
+                                                         colorSpaceName: .deviceRGB, bytesPerRow: 0, bitsPerPixel: 0) else { return .zero }
+        NSGraphicsContext.saveGraphicsState()
+        NSGraphicsContext.current = NSGraphicsContext(bitmapImageRep: rep)
+        image.draw(in: NSRect(x: 0, y: 0, width: w, height: h))
+        NSGraphicsContext.restoreGraphicsState()
+        var minX = w, maxX = -1, minY = h, maxY = -1
+        for y in 0..<h { for x in 0..<w where (rep.colorAt(x: x, y: y)?.alphaComponent ?? 0) > 0.2 {
+            minX = min(minX, x); maxX = max(maxX, x); minY = min(minY, y); maxY = max(maxY, y)
+        } }
+        guard maxX >= minX, maxY >= minY else { return .zero }
+        // colorAt's y runs top-down; flip to the view's bottom-left origin.
+        return NSRect(x: CGFloat(minX) / scale, y: CGFloat(h - 1 - maxY) / scale,
+                      width: CGFloat(maxX - minX + 1) / scale, height: CGFloat(maxY - minY + 1) / scale)
     }
 
     // MARK: timers

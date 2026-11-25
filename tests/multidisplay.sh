@@ -13,7 +13,7 @@ fi
 BS="$BACKSTAGE_BIN"
 WORK="$(mktemp -d /tmp/backstage-multidisplay.XXXX)" || exit 1
 export BACKSTAGE_HOME="$WORK/state" BACKSTAGE_DISPLAY=7 BACKSTAGE_EXTRA_DISPLAYS=8
-export BACKSTAGE_RESERVATION_SECONDS=10 BACKSTAGE_EXTRA_DISPLAY_GRACE=3 BACKSTAGE_WIDTH=900 BACKSTAGE_HEIGHT=600
+export BACKSTAGE_RESERVATION_SECONDS=40 BACKSTAGE_EXTRA_DISPLAY_GRACE=3 BACKSTAGE_WIDTH=900 BACKSTAGE_HEIGHT=600
 mkdir -p "$BACKSTAGE_HOME"
 WATCH=
 FAIL=0
@@ -60,8 +60,8 @@ echo "== menu layouts (synthetic: no displays created)"
 R1=$("$BS" __menu-render --displays 1); R2=$("$BS" __menu-render --displays 2)
 R3=$("$BS" __menu-render --displays 3 --page 1); R6=$("$BS" __menu-render --displays 6 --page 2)
 echo "$R1" | jq -e '(.previews | length) == 1 and .pager == null' > /dev/null && pass "1 display: one picture, no pager" || fail "1: $R1"
-echo "$R2" | jq -e '(.previews | length) == 2 and .pager == null and all(.previews[]; .height <= 150 and (.hidden | not))' > /dev/null \
-    && pass "2 displays: two stacked pictures, no pager" || fail "2: $R2"
+echo "$R2" | jq -e '(.previews | length) == 2 and .pager == null and .width > 400 and all(.previews[]; .height <= 150 and .y == 6 and (.hidden | not))' > /dev/null \
+    && pass "2 displays: two pictures side by side, no pager" || fail "2: $R2"
 echo "$R3" | jq -e '.visible == [3] and .previews[1].hidden and .canBack and (.canForward | not) and .height == ('"$(echo "$R2" | jq .height)"' + 24)' > /dev/null \
     && pass "3 displays, page 2: display 3 alone, same height as page 1, back only" || fail "3: $R3"
 echo "$R6" | jq -e '.visible == [5, 6] and .first == 5 and .last == 6 and .canBack and (.canForward | not)' > /dev/null \
@@ -122,7 +122,11 @@ PC=$(echo "$OUT" | jq -r .pid)
 OUT=$(as C move --pid "$PC" --display 8 2>&1)
 echo "$OUT" | jq -e '.ok == false and (.error | test("reserved"))' > /dev/null && pass "C can't move onto it either" || fail "C move: $OUT"
 echo "   (waiting for the reservation to expire)"
-sleep 10
+UNTIL=$("$BS" status | jq -r '.daemon.displays[] | select(.display == 8) | .reservedUntil // empty')
+if [[ -n $UNTIL ]]; then
+    LEFT=$(python3 -c "import datetime,sys; t=datetime.datetime.fromisoformat(sys.argv[1].replace('Z','+00:00')); print(max(0, int((t - datetime.datetime.now(datetime.timezone.utc)).total_seconds()) + 2))" "$UNTIL")
+    sleep "$LEFT"
+fi
 OUT=$(as C move --pid "$PC" --display 8)
 [[ $(echo "$OUT" | jq -r .display) == 8 ]] && pass "after it expired, C moved its app to display 8" || fail "C move after expiry: $OUT"
 as C windows --pid "$PC" | jq -e '.windows[0].frame | .x >= 0 and .y >= 0 and .x < 900 and .y < 600' > /dev/null \

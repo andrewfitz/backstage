@@ -156,7 +156,7 @@ While apps are running backstage, an icon sits in the menu bar: a display behind
 the number of running apps beside it. It disappears when nothing is running (unless you turn on
 **Keep in Menu Bar**), and goes away entirely when the daemon exits. Its tooltip says who is using how many apps. While an app
 launched with `--audio` is making sound (muted, so you don't hear it), the icon turns into a
-small level meter, five bars of the loudest app's recent level; with Reduce Motion on, it shows
+small level meter, four bars of the loudest app's recent level, no wider than the icon; with Reduce Motion on, it shows
 a still waveform instead. The icon's box never changes size. The menu shows:
 
 - a **live picture** of the hidden agent display, refreshed every second while the menu is open.

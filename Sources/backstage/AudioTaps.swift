@@ -274,8 +274,15 @@ final class AudioTapManager: AudioTapControl, AudioLevelSource {
     /// permission and starts no IO. Proves the tap APIs work before any launch is accepted.
     private func muteSelfTest() -> String? {
         if testMode == "mute-fail" { return "mute self-test failed (BACKSTAGE_TEST_AUDIO=mute-fail)" }
-        let me = HAL.processObject(for: ownPid)
-        guard me != kAudioObjectUnknown else { return "Core Audio has no process object for the daemon" }
+        // A process gets its Core Audio object once coreaudiod has seen it, which can lag behind
+        // a fresh daemon's start under load: wait for it rather than refuse every launch.
+        var me = HAL.processObject(for: ownPid)
+        let deadline = ProcessInfo.processInfo.systemUptime + 3
+        while me == kAudioObjectUnknown && ProcessInfo.processInfo.systemUptime < deadline {
+            usleep(50_000)
+            me = HAL.processObject(for: ownPid)
+        }
+        guard me != kAudioObjectUnknown else { return "Core Audio has no process object for the daemon (waited 3 s)" }
         switch makeTap(objects: [me], name: "backstage-selftest") {
         case .failure(let why): return "mute self-test: \(why)"
         case .success(let made):

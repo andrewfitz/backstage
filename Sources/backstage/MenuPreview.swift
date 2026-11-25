@@ -2,9 +2,9 @@ import AppKit
 import QuartzCore
 
 /// The top of the menu: live pictures of the hidden displays. One display: one picture, as
-/// big as fits. Several: up to two stacked, each labelled, and with more than two a pager row
-/// (‹ 1–2 of 4 ›) under them (docs/MULTI_DISPLAY_PLAN.md). The view's size depends only on how
-/// many pictures it stacks, so paging never resizes the menu. Nothing here knows about the
+/// big as fits. Several: two side by side, each labelled (the menu gets a little wider), and with
+/// more than two a pager row (‹ 1–2 of 4 ›) under them (docs/MULTI_DISPLAY_PLAN.md). The view's
+/// size depends only on how many pictures it shows, so paging never resizes the menu. Nothing here knows about the
 /// daemon; StatusMenu feeds it.
 final class MenuHeroView: NSView {
     /// Where NSMenu starts item titles and images.
@@ -12,7 +12,8 @@ final class MenuHeroView: NSView {
     static let previewInset: CGFloat = 12
     /// A very tall display (BACKSTAGE_WIDTH/HEIGHT) gets a narrower, centred picture, not a taller menu.
     static let maxPreviewHeight: CGFloat = 240
-    /// Each of two stacked pictures is at most this tall, so the pair fits with the app list.
+    /// Each of two side-by-side pictures: this wide, and at most this tall.
+    static let pairedWidth: CGFloat = 216
     static let maxStackedHeight: CGFloat = 150
     static let stackGap: CGFloat = 8
     static let pagerHeight: CGFloat = 24
@@ -36,30 +37,32 @@ final class MenuHeroView: NSView {
     /// two labelled pictures; `paged`: with the pager row under them.
     init(previewWidth: CGFloat, aspect: CGFloat?, stacked: Bool = false, paged: Bool = false,
          onPage: ((Int) -> Void)? = nil) {
-        let width = Self.width(previewWidth: previewWidth)
+        let eachWidth = stacked ? Self.pairedWidth : previewWidth
+        let width = stacked ? Self.width(previewWidth: eachWidth * 2 + Self.stackGap) : Self.width(previewWidth: previewWidth)
         var previewSize = CGSize.zero
         var made: [DisplayPreviewView] = []
         if let aspect, aspect.isFinite, aspect > 0 {
             let cap = stacked ? Self.maxStackedHeight : Self.maxPreviewHeight
-            let height = max(1, min((previewWidth / aspect).rounded(), cap))
-            previewSize = CGSize(width: max(1, min(previewWidth, (height * aspect).rounded())), height: height)
+            let height = max(1, min((eachWidth / aspect).rounded(), cap))
+            previewSize = CGSize(width: max(1, min(eachWidth, (height * aspect).rounded())), height: height)
             made = (0..<(stacked ? 2 : 1)).map { _ in DisplayPreviewView(frame: NSRect(origin: .zero, size: previewSize)) }
         }
         previews = made
         // The picture leads the menu: the same inset above it as on its sides.
         let previewTop = Self.previewInset - 6
-        var y = previewTop
-        var frames: [CGFloat] = []
-        for _ in made { frames.append(y); y += previewSize.height + Self.stackGap }
-        var height: CGFloat = made.isEmpty ? 0 : y - Self.stackGap + 5
+        var height: CGFloat = made.isEmpty ? 0 : previewTop + previewSize.height + 5
         let pagerY = height
         if paged && !made.isEmpty { height += Self.pagerHeight }
         super.init(frame: NSRect(x: 0, y: 0, width: width, height: height))
         autoresizingMask = [.width]
-        for (preview, top) in zip(made, frames) {
-            preview.frame.origin = CGPoint(x: ((width - previewSize.width) / 2).rounded(), y: top)
+        // Side by side, centred as a group.
+        let rowWidth = previewSize.width * CGFloat(made.count) + Self.stackGap * CGFloat(max(0, made.count - 1))
+        var x = ((width - rowWidth) / 2).rounded()
+        for preview in made {
+            preview.frame.origin = CGPoint(x: x, y: previewTop)
             preview.autoresizingMask = [.minXMargin, .maxXMargin]   // stays centred if the menu gets wider
             addSubview(preview)
+            x += previewSize.width + Self.stackGap
             if stacked {
                 let label = Label()
                 label.isHidden = true
