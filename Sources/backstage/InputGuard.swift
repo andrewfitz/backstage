@@ -1,5 +1,6 @@
 import Foundation
 import CoreGraphics
+import Security
 import os
 
 /// Keeps the user's keyboard and mouse input and the agents' input apart.
@@ -17,7 +18,7 @@ import os
 ///    are handed to the user's frontmost app instead; everything else is dropped.
 ///  - Except an untagged event posted by a computer-use agent's per-app input helper (Claude
 ///    desktop's background `app_*` tools, Codex computer use): that's an agent driving the app it
-///    picked, so it passes (`computerUseInjectorSuffixes`).
+///    picked, so it passes (after verifying its code signature).
 ///  - Events headed for any app backstage doesn't manage are never touched.
 /// The tap runs on its own thread, so a busy daemon main loop (AX calls can take seconds) never
 /// delays the user's input. If macOS disables the tap (timeout), it is re-enabled at once.
@@ -37,48 +38,64 @@ extension CGEvent {
 }
 
 enum GuardVerdict: String { case pass, redirect, drop }
+enum ComputerUseOrigin { case unrelated, verifiedHelper, rejectedHelper }
 
-/// What the guard does with one event. Pure, so `backstage __guard-selftest` can check it.
-/// `fromComputerUse` (evaluated only for untagged events headed for a managed app) says the
-/// event was posted by a computer-use agent's per-app input helper (see `computerUseInjectorSuffixes`):
-/// that is an agent driving the app, not the user, so it passes.
+/// Classify one event. Source inspection runs lazily for untagged input headed to managed apps.
 func classifyInput(type: CGEventType, target: pid_t, tag: Int64, hidState: Bool, managed: Set<pid_t>,
-                   fromComputerUse: @autoclosure () -> Bool = false) -> GuardVerdict {
+                   fromManagedApp: Bool = false,
+                   computerUseOrigin: @autoclosure () -> ComputerUseOrigin = .unrelated) -> GuardVerdict {
     guard managed.contains(target) else { return .pass }
     if tag == InputTag.agent { return .pass }
-    if tag != InputTag.redirected && fromComputerUse() { return .pass }
-    let key = type == .keyDown || type == .keyUp || type == .flagsChanged
-    return key && hidState && tag != InputTag.redirected ? .redirect : .drop
-}
-
-/// Executables (path suffixes) that post a computer-use agent's input straight to one app's
-/// process, without bringing it forward: the Claude desktop app's background `app_*` tools
-/// (Claude.app/Contents/Helpers/app-cu-helper: CGEventPostToPid with an HID-state source and no
-/// tag, so before this its keys for a managed app were handed to the user's app) and Codex's
-/// computer use (Codex Computer Use.app's SkyComputerUseService, which works on apps in the
-/// background). Their events always target the app the agent picked, so letting them into a
-/// managed app can't carry the user's input there: the user's keyboard and mouse, and remote
-/// tools such as Parsec, post from other processes and are still redirected or dropped.
-/// Deliberately absent: Claude's full-screen tools (posted from Claude.app's own process to the
-/// HID system, so they follow the real cursor and keyboard focus like the user's input).
-/// Not a security boundary (any process can post backstage's own tag): it only tells the
-/// agents' input from the user's.
-let computerUseInjectorSuffixes = ["/Contents/Helpers/app-cu-helper", "/Contents/MacOS/SkyComputerUseService"]
-
-func isComputerUseInjectorPath(_ path: String) -> Bool {
-    computerUseInjectorSuffixes.contains { path.hasSuffix($0) }
-}
-
-/// The process that posted an event is a computer-use input helper. Read when the event reaches
-/// the tap, so a poster that has already exited isn't recognised: both helpers are long-lived
-/// (Claude keeps app-cu-helper running as a JSON-RPC child; Codex's is a service app).
-func isComputerUseInjector(_ pid: pid_t) -> Bool {
-    guard pid > 0 else { return false }
-    // PROC_PIDPATHINFO_MAXSIZE
-    return withUnsafeTemporaryAllocation(of: CChar.self, capacity: 4 * Int(MAXPATHLEN)) { buf in
-        guard let path = buf.baseAddress, proc_pidpath(pid, path, UInt32(buf.count)) > 0 else { return false }
-        return isComputerUseInjectorPath(String(cString: path))
+    if fromManagedApp || tag == InputTag.redirected { return .drop }
+    switch computerUseOrigin() {
+    case .verifiedHelper: return .pass
+    case .rejectedHelper: return .drop
+    case .unrelated: break
     }
+    let key = type == .keyDown || type == .keyUp || type == .flagsChanged
+    return key && hidState ? .redirect : .drop
+}
+
+private struct ComputerUseHelper {
+    let suffix: String
+    let requirement: SecRequirement?
+
+    init(suffix: String, identifier: String, team: String) {
+        self.suffix = suffix
+        let expression = """
+            identifier "\(identifier)" and anchor apple generic
+            and certificate 1[field.1.2.840.113635.100.6.2.6] exists
+            and certificate leaf[field.1.2.840.113635.100.6.1.13] exists
+            and certificate leaf[subject.OU] = "\(team)"
+            """
+        var requirement: SecRequirement?
+        let status = SecRequirementCreateWithString(expression as CFString, [], &requirement)
+        self.requirement = status == errSecSuccess ? requirement : nil
+    }
+}
+
+private let computerUseHelpers = [
+    ComputerUseHelper(suffix: "/Contents/Helpers/app-cu-helper", identifier: "app-cu-helper", team: "Q6L2SF6YDW"),
+    ComputerUseHelper(suffix: "/Contents/MacOS/SkyComputerUseService", identifier: "com.openai.sky.CUAService", team: "2DC432GLL2"),
+]
+
+/// Use the path to select a signing requirement, then validate the live process against it.
+/// Process birth alone cannot identify the running code across exec.
+func computerUseOrigin(_ pid: pid_t) -> ComputerUseOrigin {
+    guard pid > 0 else { return .unrelated }
+    let candidate = withUnsafeTemporaryAllocation(of: CChar.self, capacity: 4 * Int(MAXPATHLEN)) { buf -> ComputerUseHelper? in
+        guard let path = buf.baseAddress, proc_pidpath(pid, path, UInt32(buf.count)) > 0 else { return nil }
+        let executable = String(cString: path)
+        return computerUseHelpers.first { executable.hasSuffix($0.suffix) }
+    }
+    guard let candidate else { return .unrelated }
+    guard let requirement = candidate.requirement, let birth = processBirth(pid) else { return .rejectedHelper }
+    let attributes = [kSecGuestAttributePid as String: NSNumber(value: pid)] as CFDictionary
+    var code: SecCode?
+    guard SecCodeCopyGuestWithAttributes(nil, attributes, [], &code) == errSecSuccess, let code,
+          SecCodeCheckValidity(code, [], requirement) == errSecSuccess,
+          processBirth(pid) == birth else { return .rejectedHelper }
+    return .verifiedHelper
 }
 
 let guardedEventTypes: [CGEventType] = [
@@ -113,6 +130,7 @@ final class InputGuard {
     private var managed: Set<pid_t> = []
     private var births: [pid_t: UInt64] = [:]
     private var userPid: pid_t = 0
+    private var userBirth: UInt64?
     private var stats = Stats()
     private var runLoop: CFRunLoop?
     // Only the tap thread creates, uses, or removes these callback contexts.
@@ -121,6 +139,7 @@ final class InputGuard {
 
     /// Install the tap on a dedicated thread. False if macOS refused it (no Accessibility trust).
     func start() -> Bool {
+        _ = computerUseHelpers // Compile signing requirements before the first event callback.
         let ready = DispatchSemaphore(value: 0)
         let thread = Thread { [self] in
             let loop = CFRunLoopGetCurrent()!
@@ -167,8 +186,10 @@ final class InputGuard {
     }
 
     func updateUser(_ user: pid_t) {
+        let birth = processBirth(user)
         os_unfair_lock_lock(&lock)
         userPid = user
+        userBirth = birth
         os_unfair_lock_unlock(&lock)
     }
 
@@ -223,22 +244,24 @@ final class InputGuard {
             return Unmanaged.passUnretained(event)
         }
         let started = clock_gettime_nsec_np(CLOCK_UPTIME_RAW)
-        let target = tap.target ?? pid_t(truncatingIfNeeded: event.getIntegerValueField(.eventTargetUnixProcessID))
+        let target = tap.target ?? pid_t(exactly: event.getIntegerValueField(.eventTargetUnixProcessID)) ?? 0
+        let source = pid_t(exactly: event.getIntegerValueField(.eventSourceUnixProcessID)) ?? 0
         let tag = event.getIntegerValueField(.eventSourceUserData)
         let hid = event.getIntegerValueField(.eventSourceStateID) == Int64(CGEventSourceStateID.hidSystemState.rawValue)
         os_unfair_lock_lock(&lock)
-        let managedNow = managed, birth = births[target], user = userPid
+        let managedNow = managed, birth = births[target], user = userPid, userStart = userBirth
         os_unfair_lock_unlock(&lock)
         // A tap queued for removal must not act on events for a handed-off app or reused PID.
         if let pinned = tap.birth, pinned != birth || processBirth(target) != pinned {
             return Unmanaged.passUnretained(event)
         }
         // The poster's executable is looked up only for untagged events headed for a managed app.
-        var computerUse = false
+        var origin = ComputerUseOrigin.unrelated
         let verdict = classifyInput(type: type, target: target, tag: tag, hidState: hid, managed: managedNow,
-                                    fromComputerUse: { () -> Bool in
-                                        computerUse = isComputerUseInjector(pid_t(truncatingIfNeeded: event.getIntegerValueField(.eventSourceUnixProcessID)))
-                                        return computerUse
+                                    fromManagedApp: managedNow.contains(source),
+                                    computerUseOrigin: { () -> ComputerUseOrigin in
+                                        origin = computerUseOrigin(source)
+                                        return origin
                                     }())
         var result: Unmanaged<CGEvent>? = Unmanaged.passUnretained(event)
         var lost = false
@@ -249,7 +272,8 @@ final class InputGuard {
             result = nil
             // The keystroke was meant for the user's own app: give it to that app, tagged so the
             // guard knows it (it can never bounce back into a managed app).
-            if user > 0, let copy = event.copy() {
+            if let birth, tap.birth != nil || processBirth(target) == birth,
+               let userStart, !managedNow.contains(user), processBirth(user) == userStart, let copy = event.copy() {
                 copy.setIntegerValueField(.eventSourceUserData, value: InputTag.redirected)
                 copy.postToPid(user)
             } else {
@@ -263,7 +287,7 @@ final class InputGuard {
         stats.totalMicros += micros
         if micros > 1000 { stats.over1ms += 1 }
         // A drop or redirect ends delivery; a trusted pass may reach both taps.
-        let countedComputerUse = computerUse && (tap.target != nil || processTaps[target] == nil)
+        let countedComputerUse = origin == .verifiedHelper && (tap.target != nil || processTaps[target] == nil)
         if verdict != .pass || countedComputerUse { stats.lastTarget = target }
         if countedComputerUse { stats.computerUse += 1 }
         if verdict == .redirect { if lost { stats.lost += 1 } else { stats.redirected += 1 } }
@@ -282,7 +306,7 @@ private func inputGuardCallback(_ proxy: CGEventTapProxy, _ type: CGEventType, _
 }
 
 /// `backstage __guard-selftest`: run the classifier over constructed events (never posted).
-func guardSelfTest() -> [String: Any] {
+func guardSelfTest(rejectedHelperPID: pid_t? = nil) -> [String: Any] {
     let agentApp: pid_t = 4242, userApp: pid_t = 777
     let managed: Set<pid_t> = [agentApp]
     // (name, type, target, tag, HID state, posted by a computer-use helper, verdict)
@@ -306,14 +330,20 @@ func guardSelfTest() -> [String: Any] {
         ("redirected key never re-enters an agent app, whoever posted it", .keyDown, agentApp, InputTag.redirected, true, true, .drop),
     ]
     var failures: [String] = []
-    for (path, want) in [("/Applications/Claude.app/Contents/Helpers/app-cu-helper", true),
-                         ("/Users/u/.codex/computer-use/Codex Computer Use.app/Contents/MacOS/SkyComputerUseService", true),
-                         ("/Applications/Claude.app/Contents/MacOS/Claude", false),
-                         ("/Applications/Parsec.app/Contents/MacOS/parsecd", false),
-                         ("/usr/local/bin/app-cu-helper", false)] where isComputerUseInjectorPath(path) != want {
-        failures.append("computer-use helper path \(path): got \(!want), want \(want)")
+    if computerUseHelpers.contains(where: { $0.requirement == nil }) { failures.append("could not compile helper signing requirements") }
+    if computerUseOrigin(getpid()) != .unrelated || computerUseOrigin(0) != .unrelated {
+        failures.append("backstage itself or pid 0 taken for a computer-use helper")
     }
-    if isComputerUseInjector(getpid()) || isComputerUseInjector(0) { failures.append("backstage itself or pid 0 taken for a computer-use helper") }
+    if let rejectedHelperPID, computerUseOrigin(rejectedHelperPID) != .rejectedHelper {
+        failures.append("unsigned helper fixture was not rejected")
+    }
+    if classifyInput(type: .keyDown, target: agentApp, tag: 0, hidState: true, managed: managed,
+                     computerUseOrigin: .rejectedHelper) != .drop {
+        failures.append("rejected helper event was not dropped")
+    }
+    if classifyInput(type: .keyDown, target: agentApp, tag: 0, hidState: true, managed: managed, fromManagedApp: true) != .drop {
+        failures.append("synthetic key from managed app could be redirected")
+    }
     for (name, type, target, tag, hid, cu, want) in cases {
         // Read the fields back from a real CGEvent, as the tap does.
         let e = type == .scrollWheel ? CGEvent(scrollWheelEvent2Source: nil, units: .pixel, wheelCount: 1, wheel1: 1, wheel2: 0, wheel3: 0)
@@ -322,8 +352,8 @@ func guardSelfTest() -> [String: Any] {
         guard let e else { failures.append("\(name): could not build event"); continue }
         e.setIntegerValueField(.eventSourceUserData, value: tag)
         let got = classifyInput(type: type, target: target, tag: e.getIntegerValueField(.eventSourceUserData), hidState: hid, managed: managed,
-                                fromComputerUse: cu)
+                                computerUseOrigin: cu ? .verifiedHelper : .unrelated)
         if got != want { failures.append("\(name): got \(got.rawValue), want \(want.rawValue)") }
     }
-    return ["ok": failures.isEmpty, "cases": cases.count, "failures": failures]
+    return ["ok": failures.isEmpty, "cases": cases.count + 2 + (rejectedHelperPID == nil ? 0 : 1), "failures": failures]
 }

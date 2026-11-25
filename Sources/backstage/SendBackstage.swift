@@ -75,7 +75,8 @@ func sendBackstage(pid: pid_t, focusTo: pid_t?) -> [String: Any] {
     }
     guard let d = liveDaemon(), !d.protocolMismatch, d.stopping != true else { return refuse("the backstage daemon isn't running") }
     guard d.audio == true else { return refuse("backstage can't mute apps right now (\(d.audioReason ?? "audio unavailable"))") }
-    guard let app = NSRunningApplication(processIdentifier: pid), !app.isTerminated, let birth = processBirth(pid) else {
+    guard let birth = processBirth(pid), let app = NSRunningApplication(processIdentifier: pid),
+          !app.isTerminated, processBirth(pid) == birth else {
         return refuse("no app with that process ID")
     }
     name = app.localizedName ?? name
@@ -113,49 +114,62 @@ func sendBackstage(pid: pid_t, focusTo: pid_t?) -> [String: Any] {
         return refuse("backstage is busy (a stop or show is in progress); try again")
     }
     defer { owner.release(); lifecycle.release() }
-
-    // Focus first: once the app is managed, the input guard keeps the user's input out of it.
-    var focus = "unchanged"
-    if NSWorkspace.shared.frontmostApplication?.processIdentifier == pid {
-        focus = handFocus(awayFrom: pid, to: focusTo)
+    guard let current = liveDaemon(), current.pid == d.pid, current.processStart == d.processStart,
+          current.startedAt == d.startedAt, current.stopping != true, current.audio == true else {
+        return refuse("the backstage daemon changed while checking the app")
     }
+
     let record = ManagedApp(pid: pid, name: name, bundleID: app.bundleIdentifier, path: path ?? "",
                             launchedAt: Date().timeIntervalSince1970, stdout: nil, processStart: birth,
                             agent: nil, agentPID: nil, session: Session.user, audio: AudioMode.muted.rawValue)
     let placement: StateLock
     do {
         placement = try Locks.app(record, nonblocking: true)
-        try AppStore.add(record)
+        try AppStore.update { apps in
+            guard record.matchesProcess else { throw CLIError("the app exited") }
+            guard !apps.contains(where: { $0.pid == pid }) else { throw CLIError("the app is already backstage") }
+            apps.append(record)
+        }
     } catch {
         return refuse("couldn't register \(name): \(error)")
     }
     defer { placement.release() }
     lifecycle.release()
 
-    let vd = d.bounds
-    var placed: [CGRect] = []
-    for w in open { placed.append(placeBeside(w, display: vd, avoiding: placed)) }
+    let vd = current.bounds
     func released() -> Bool {
         !AppStore.load().contains { $0.pid == pid && $0.processStart == birth && Session.isUser($0.session) }
+    }
+    var focus = "unchanged"
+    if !released(), NSWorkspace.shared.frontmostApplication?.processIdentifier == pid {
+        focus = handFocus(awayFrom: pid, to: focusTo)
+    }
+    var placed: [CGRect] = []
+    for w in open {
+        guard !released() else { break }
+        placed.append(placeBeside(w, display: vd, avoiding: placed))
     }
     let contained = waitFor(timeout: 1.5) { () -> Bool? in
         // Given back already (its sound couldn't be muted): leave its windows where they went.
         if released() { return false }
         guard let current = try? ax.readElements(kAXWindowsAttribute) else { return nil }
         let ok = current.allSatisfy { ($0.attr(kAXMinimizedAttribute) as? Bool) == true || $0.frame.map { vd.contains($0) } == true }
-        if !ok { adoptWindows(pid: pid, display: vd) }
+        if !ok, !released() { adoptWindows(pid: pid, display: vd) }
         return ok ? true : nil
     } ?? false
+    // The daemon taps it on its next registry read; it may release the app during this wait.
+    let tap = waitFor(timeout: 2) {
+        released() ? "" : readAudioStatus(pid, birth)?.tap
+    } ?? "pending"
+    guard processBirth(pid) == birth else { return refuse("\(name) exited while being sent backstage") }
     if released() {
         if app.isHidden { _ = app.unhide() }
         let why = readAudioStatus(pid, birth)?.reason ?? "it was given back"
-        sendLog("pid \(pid) (\(name)) couldn't be muted, so it was given back: \(why)")
-        return ["ok": false, "pid": pid, "name": name, "refused": "\(name) couldn't be muted, so it stays on your screen: \(why)"]
+        sendLog("pid \(pid) (\(name)) was released: \(why)")
+        return ["ok": false, "pid": pid, "name": name, "refused": "\(name) was given back to your screen: \(why)"]
     }
     // A hidden app (the test fixture) shows its windows once they're on the agent display.
     if contained, app.isHidden { _ = app.unhide() }
-    // The daemon taps it on its next registry read; report the tap once it's published.
-    let tap = waitFor(timeout: 2) { readAudioStatus(pid, birth)?.tap } ?? "pending"
     sendLog("sent pid \(pid) (\(name)) backstage; windows \(contained ? "on the agent display" : "not all placed yet"), focus \(focus), tap \(tap)")
     var out: [String: Any] = [
         "ok": true, "pid": pid, "name": name, "session": Session.user, "audio": AudioMode.muted.rawValue, "tap": tap,
@@ -189,8 +203,11 @@ func cmdSendBackstage(_ args: Args) throws -> [String: Any] {
     guard fromDaemon || ProcessInfo.processInfo.environment["BACKSTAGE_TEST_HOOKS"] == "1" else {
         throw CLIError("internal command: the menu bar's Send Front Window Backstage runs it (tests set BACKSTAGE_TEST_HOOKS=1)")
     }
-    guard let pid = args.int("pid").map(pid_t.init) else { throw CLIError("usage: backstage __send-backstage --pid P [--focus-to N]") }
-    return sendBackstage(pid: pid, focusTo: args.int("focus-to").map(pid_t.init))
+    guard let pid = args.opt("pid").flatMap(pid_t.init), pid > 0 else {
+        throw CLIError("usage: backstage __send-backstage --pid P [--focus-to N]")
+    }
+    let focusTo = args.opt("focus-to").flatMap(pid_t.init)
+    return sendBackstage(pid: pid, focusTo: focusTo)
 }
 
 /// Give a user-sent app back without quitting it: out of the registry (the daemon removes its
@@ -198,11 +215,20 @@ func cmdSendBackstage(_ args: Args) throws -> [String: Any] {
 /// didn't quit at shutdown (an unsaved-changes dialog) or its sound couldn't be muted: the
 /// user's work is never force-quit.
 func releaseToUser(_ record: ManagedApp, log: (String) -> Void) {
+    var removed = false
     do {
-        try AppStore.update { $0.removeAll { $0.pid == record.pid && $0.processStart == record.processStart && Session.isUser($0.session) } }
+        try AppStore.update { apps in
+            guard let index = apps.firstIndex(where: {
+                $0.pid == record.pid && $0.processStart == record.processStart && Session.isUser($0.session)
+            }) else { return }
+            apps.remove(at: index)
+            removed = true
+        }
     } catch { log("couldn't release pid \(record.pid) to the user: \(error)"); return }
-    if let target = userDisplayBounds().first {
+    guard removed else { return }
+    if record.matchesProcess, let target = userDisplayBounds().first {
         for (i, w) in axApp(record.pid).windows.enumerated() {
+            guard record.matchesProcess else { break }
             let size = w.size ?? CGSize(width: 600, height: 400)
             w.setPosition(CGPoint(x: target.midX - size.width / 2 + CGFloat(i * 30),
                                   y: max(target.minY + 60, target.midY - size.height / 2 + CGFloat(i * 30))))

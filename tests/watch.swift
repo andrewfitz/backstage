@@ -119,6 +119,7 @@ var active: [CGWindowID: Exposure] = [:]
 var completed: [Exposure] = []
 let t0 = ProcessInfo.processInfo.systemUptime
 var samples = 0
+var ownerMatches: [pid_t: Bool] = [:]
 let end = t0 + secs
 let frontAtStart = NSWorkspace.shared.frontmostApplication?.bundleIdentifier ?? "?"
 let stopFile = args.count > 3 ? args[3] : nil
@@ -133,13 +134,15 @@ while ProcessInfo.processInfo.systemUptime < end && !(stopFile.map { FileManager
     }
     let now = ProcessInfo.processInfo.systemUptime
     var exposed: Set<CGWindowID> = []
+    if samples % 20 == 1 { ownerMatches.removeAll(keepingCapacity: true) }
     for w in wins {
-        guard w[kCGWindowOwnerName as String] as? String == "BackstageTestApp",
-              let pid = w[kCGWindowOwnerPID as String] as? pid_t,
-              NSRunningApplication(processIdentifier: pid)?.bundleIdentifier == bundleID else { continue }
+        guard let pid = w[kCGWindowOwnerPID as String] as? pid_t else { continue }
         guard let bd = w[kCGWindowBounds as String] as? NSDictionary, let b = CGRect(dictionaryRepresentation: bd) else { continue }
         if (w[kCGWindowLayer as String] as? Int ?? 0) >= 1000 { continue }
         if screens.contains(where: { $0.intersects(b) }), let id = w[kCGWindowNumber as String] as? CGWindowID {
+            let matches = ownerMatches[pid] ?? (NSRunningApplication(processIdentifier: pid)?.bundleIdentifier == bundleID)
+            ownerMatches[pid] = matches
+            guard matches else { continue }
             exposed.insert(id)
             var episode = active[id] ?? Exposure(title: w[kCGWindowName as String] as? String ?? "?", first: now, last: now, samples: 0)
             episode.last = now

@@ -20,33 +20,53 @@ if [[ -z ${BACKSTAGE_BIN:-} ]]; then
     BACKSTAGE_BIN="$(cd "$ROOT" && swift build -c release --show-bin-path)/backstage"
 fi
 BS="$BACKSTAGE_BIN"
-BUNDLE_ID=dev.backstage.testapp.load
 BUILD="${BACKSTAGE_LOAD_BUILD:-/tmp/backstage-load-build-$(id -u)}"
+mkdir -p -m 700 "$BUILD" || exit 1
+if [[ ! -O "$BUILD" || -L "$BUILD" ]]; then
+    echo "helper cache must be a directory owned by this user: $BUILD" >&2
+    exit 1
+fi
+toolchain=$(swiftc --version 2>&1) || { echo "$toolchain" >&2; exit 1; }
+sdk=$(xcrun --show-sdk-path) || exit 1
 
-# Helpers are cached between runs and rebuilt when their source changes, so the build can happen
-# before (and outside of) whatever serializes GUI runs on the machine.
-build() {
-    mkdir -p "$BUILD/BackstageTestApp.app/Contents/MacOS" || return 1
-    local exe="$BUILD/BackstageTestApp.app/Contents/MacOS/BackstageTestApp"
-    if [[ ! -x $exe || TestApp.swift -nt $exe ]]; then
-        swiftc -O TestApp.swift -o "$exe" || return 1
-    fi
-    cat > "$BUILD/BackstageTestApp.app/Contents/Info.plist" <<PLIST
-<?xml version="1.0" encoding="UTF-8"?><!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd"><plist version="1.0"><dict>
-<key>CFBundleExecutable</key><string>BackstageTestApp</string><key>CFBundleIdentifier</key><string>$BUNDLE_ID</string><key>CFBundleName</key><string>BackstageTestApp</string><key>CFBundlePackageType</key><string>APPL</string><key>NSPrincipalClass</key><string>NSApplication</string></dict></plist>
-PLIST
-    local tool
-    for tool in watch pixels probe; do
-        if [[ ! -x $BUILD/$tool || $tool.swift -nt $BUILD/$tool ]]; then
-            swiftc -O "$tool.swift" -o "$BUILD/$tool" || return 1
+# A cache hit reads an immutable executable. Concurrent misses compile privately and
+# publish a complete executable with an atomic rename on the same filesystem.
+cached_helper() (
+    local source=$1 name=$2 checksum key target stage
+    checksum=$(shasum -a 256 "$source") || return 1
+    key=$(printf '%s\n' "$checksum" "$toolchain" "$sdk" "${SDKROOT:-}" '-O' | shasum -a 256) || return 1
+    target="$BUILD/$name-${key%% *}"
+    if [[ ! -f "$target" || ! -x "$target" ]]; then
+        stage=$(mktemp -d "$BUILD/.compile.XXXXXX") || return 1
+        trap 'rm -f "$stage/$name"; rmdir "$stage"' EXIT
+        swiftc -O "$source" -o "$stage/$name" || return 1
+        local compiled_checksum
+        compiled_checksum=$(shasum -a 256 "$source") || return 1
+        if [[ "$compiled_checksum" != "$checksum" ]]; then
+            echo "$source changed while compiling, rerun the load harness" >&2
+            return 1
         fi
-    done
-}
-echo "== build helpers in $BUILD"
-build || exit 1
+        mv -f "$stage/$name" "$target" || return 1
+    fi
+    printf '%s\n' "$target"
+)
+echo "== cache helpers in $BUILD"
+FIXTURE_EXE=$(cached_helper TestApp.swift BackstageTestApp) || exit 1
+WATCH_EXE=$(cached_helper watch.swift watch) || exit 1
+PIXELS_EXE=$(cached_helper pixels.swift pixels) || exit 1
+PROBE_EXE=$(cached_helper probe.swift probe) || exit 1
 for arg in "$@"; do [[ $arg == --build-only ]] && exit 0; done
 
 WORK="$(mktemp -d /tmp/backstage-load.XXXX)" || exit 1
+BUNDLE_ID="dev.backstage.testapp.load.${WORK##*.}"
+APP="$WORK/BackstageTestApp.app"
+mkdir -p "$APP/Contents/MacOS" || exit 1
+cp "$FIXTURE_EXE" "$APP/Contents/MacOS/BackstageTestApp" || exit 1
+cat > "$APP/Contents/Info.plist" <<PLIST || exit 1
+<?xml version="1.0" encoding="UTF-8"?><!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd"><plist version="1.0"><dict>
+<key>CFBundleExecutable</key><string>BackstageTestApp</string><key>CFBundleIdentifier</key><string>$BUNDLE_ID</string><key>CFBundleName</key><string>BackstageTestApp</string><key>CFBundlePackageType</key><string>APPL</string><key>NSPrincipalClass</key><string>NSApplication</string></dict></plist>
+PLIST
+
 export BACKSTAGE_HOME="$WORK/state"
 # The menu bar item isn't under test, and its thumbnails would add captures if someone opened it.
 export BACKSTAGE_MENUBAR="${BACKSTAGE_MENUBAR:-off}"
@@ -54,11 +74,22 @@ unset BACKSTAGE_SESSION
 echo "BACKSTAGE_HOME=$BACKSTAGE_HOME"
 echo "  (if this is interrupted: BACKSTAGE_HOME=$BACKSTAGE_HOME $BS stop --all)"
 WATCH=
+RUN_PID=
 RUN=1
 cleanup() {
     local result=$?
     trap - EXIT
-    if [[ -f "$BACKSTAGE_HOME/daemon.json" || -s "$BACKSTAGE_HOME/apps.json" ]]; then
+    if [[ -n "$RUN_PID" ]]; then
+        kill "$RUN_PID" 2>/dev/null || true
+        wait "$RUN_PID" 2>/dev/null || true
+        # The daemon detaches before publishing daemon.json. Give an interrupted
+        # startup the same publication window as a normal start call.
+        if [[ -f "$BACKSTAGE_HOME/daemon.log" && ! -f "$BACKSTAGE_HOME/daemon.json" ]]; then
+            local deadline=$((SECONDS + 10))
+            until [[ -f "$BACKSTAGE_HOME/daemon.json" ]] || (( SECONDS >= deadline )); do sleep 0.1; done
+        fi
+    fi
+    if [[ -f "$BACKSTAGE_HOME/daemon.json" || -s "$BACKSTAGE_HOME/apps.json" || -d "$BACKSTAGE_HOME/launching" ]]; then
         "$BS" stop --all >/dev/null 2>&1 || result=1
     fi
     local watch_status=1
@@ -86,17 +117,11 @@ if not status["ok"]:
     sys.exit("\n".join(status["problems"]))
 PYTHON
 
-"$BUILD/watch" "$BUNDLE_ID" 86400 "$WORK/watch.stop" "$WORK/watch.ready" > "$WORK/watch.out" 2>&1 &
-WATCH=$!
-watch_deadline=$((SECONDS + 10))
-while [[ ! -f "$WORK/watch.ready" ]]; do
-    if (( SECONDS >= watch_deadline )) || ! kill -0 "$WATCH" 2>/dev/null; then
-        echo "watchdog did not become ready" >&2
-        kill "$WATCH" 2>/dev/null
-        exit 1
-    fi
-    sleep 0.05
-done
-python3 load.py run "$@" --bin "$BS" --work "$WORK" --app "$BUILD/BackstageTestApp.app" \
-    --pixels "$BUILD/pixels" --probe "$BUILD/probe" --root "$ROOT"
+. ./watch.sh
+start_watch "$BUNDLE_ID" 86400 "$WATCH_EXE" || exit 1
+python3 load.py run "$@" --bin "$BS" --work "$WORK" --app "$APP" \
+    --pixels "$PIXELS_EXE" --probe "$PROBE_EXE" --root "$ROOT" &
+RUN_PID=$!
+wait "$RUN_PID"
 RUN=$?
+RUN_PID=

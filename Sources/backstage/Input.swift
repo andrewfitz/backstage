@@ -47,8 +47,10 @@ func hitTest(_ p: CGPoint, pids: Set<pid_t>) -> WindowHit? {
     return nil
 }
 
-private func mouseEvent(_ type: CGEventType, at p: CGPoint, hit: WindowHit, button: CGMouseButton, clicks: Int) -> CGEvent {
-    let e = CGEvent(mouseEventSource: nil, mouseType: type, mouseCursorPosition: p, mouseButton: button)!
+private func mouseEvent(_ type: CGEventType, at p: CGPoint, hit: WindowHit, button: CGMouseButton, clicks: Int) throws -> CGEvent {
+    guard let e = CGEvent(mouseEventSource: nil, mouseType: type, mouseCursorPosition: p, mouseButton: button) else {
+        throw CLIError("could not create mouse event")
+    }
     e.setIntegerValueField(.mouseEventClickState, value: Int64(clicks))
     e.setIntegerValueField(.mouseEventWindowUnderMousePointer, value: Int64(hit.windowID))
     e.setIntegerValueField(.mouseEventWindowUnderMousePointerThatCanHandleThisEvent, value: Int64(hit.windowID))
@@ -63,59 +65,90 @@ private func mouseEvent(_ type: CGEventType, at p: CGPoint, hit: WindowHit, butt
 /// WindowServer's frontmost app, the user's menu bar and keyboard focus are untouched.
 /// Only sent when the app doesn't already consider itself active (AppKit answers AXFrontmost from
 /// its own state), so the app sees a single activation, like a human switching to it once.
-func primeActivation(_ pid: pid_t) {
+func primeActivation(_ pid: pid_t, birth: UInt64? = nil) {
+    guard let birth = birth ?? processBirth(pid), processBirth(pid) == birth else { return }
     if (axApp(pid).attr(kAXFrontmostAttribute) as? Bool) == true { return }
     guard let e = NSEvent.otherEvent(with: .appKitDefined, location: .zero, modifierFlags: [], timestamp: ProcessInfo.processInfo.systemUptime,
                                      windowNumber: 0, context: nil, subtype: NSEvent.EventSubtype.applicationActivated.rawValue, data1: 0, data2: 0),
-          let cg = e.cgEvent else { return }
+          let cg = e.cgEvent, processBirth(pid) == birth else { return }
     cg.postTagged(to: pid)
     usleep(30_000)
 }
 
-func postClick(at p: CGPoint, hit: WindowHit, right: Bool = false, count: Int = 1) {
+private struct InputTarget {
+    let pid: pid_t
+    let birth: UInt64
+
+    init(pid: pid_t, birth: UInt64?) throws {
+        guard let birth = birth ?? processBirth(pid) else { throw CLIError("input target exited") }
+        self.pid = pid
+        self.birth = birth
+    }
+
+    func post(_ event: CGEvent) throws {
+        guard processBirth(pid) == birth else { throw CLIError("input target exited or changed") }
+        event.timestamp = clock_gettime_nsec_np(CLOCK_UPTIME_RAW)
+        event.postTagged(to: pid)
+    }
+}
+
+func postClick(at p: CGPoint, hit: WindowHit, right: Bool = false, count: Int = 1, birth: UInt64? = nil) throws {
     let (down, up, btn): (CGEventType, CGEventType, CGMouseButton) = right ? (.rightMouseDown, .rightMouseUp, .right) : (.leftMouseDown, .leftMouseUp, .left)
-    primeActivation(hit.pid)
-    mouseEvent(.mouseMoved, at: p, hit: hit, button: btn, clicks: 0).postTagged(to: hit.pid)
+    let target = try InputTarget(pid: hit.pid, birth: birth)
+    primeActivation(target.pid, birth: target.birth)
+    try target.post(mouseEvent(.mouseMoved, at: p, hit: hit, button: btn, clicks: 0))
     usleep(20_000)
     for c in 1...max(1, count) {
-        mouseEvent(down, at: p, hit: hit, button: btn, clicks: c).postTagged(to: hit.pid)
+        let release = try mouseEvent(up, at: p, hit: hit, button: btn, clicks: c)
+        try target.post(mouseEvent(down, at: p, hit: hit, button: btn, clicks: c))
         usleep(30_000)
-        mouseEvent(up, at: p, hit: hit, button: btn, clicks: c).postTagged(to: hit.pid)
+        try target.post(release)
         usleep(40_000)
     }
 }
 
-func postMove(to p: CGPoint, hit: WindowHit) {
-    mouseEvent(.mouseMoved, at: p, hit: hit, button: .left, clicks: 0).postTagged(to: hit.pid)
+func postMove(to p: CGPoint, hit: WindowHit, birth: UInt64? = nil) throws {
+    let target = try InputTarget(pid: hit.pid, birth: birth)
+    try target.post(mouseEvent(.mouseMoved, at: p, hit: hit, button: .left, clicks: 0))
 }
 
-func postDrag(from a: CGPoint, to b: CGPoint, hit: WindowHit, steps: Int = 20) {
-    primeActivation(hit.pid)
-    mouseEvent(.mouseMoved, at: a, hit: hit, button: .left, clicks: 0).postTagged(to: hit.pid)
+func postDrag(from a: CGPoint, to b: CGPoint, hit: WindowHit, steps: Int = 20, birth: UInt64? = nil) throws {
+    guard (1...1000).contains(steps) else { throw CLIError("--steps must be between 1 and 1000") }
+    let target = try InputTarget(pid: hit.pid, birth: birth)
+    let release = try mouseEvent(.leftMouseUp, at: b, hit: hit, button: .left, clicks: 1)
+    primeActivation(target.pid, birth: target.birth)
+    try target.post(mouseEvent(.mouseMoved, at: a, hit: hit, button: .left, clicks: 0))
     usleep(20_000)
-    mouseEvent(.leftMouseDown, at: a, hit: hit, button: .left, clicks: 1).postTagged(to: hit.pid)
+    try target.post(mouseEvent(.leftMouseDown, at: a, hit: hit, button: .left, clicks: 1))
     usleep(50_000)
-    let segments = max(1, steps)
-    for i in 1...segments {
-        let t = CGFloat(i) / CGFloat(segments)
-        let p = CGPoint(x: a.x + (b.x - a.x) * t, y: a.y + (b.y - a.y) * t)
-        mouseEvent(.leftMouseDragged, at: p, hit: hit, button: .left, clicks: 1).postTagged(to: hit.pid)
-        usleep(15_000)
+    do {
+        for i in 1...steps {
+            let t = CGFloat(i) / CGFloat(steps)
+            let p = CGPoint(x: a.x + (b.x - a.x) * t, y: a.y + (b.y - a.y) * t)
+            try target.post(mouseEvent(.leftMouseDragged, at: p, hit: hit, button: .left, clicks: 1))
+            usleep(15_000)
+        }
+    } catch {
+        try? target.post(release)
+        throw error
     }
-    mouseEvent(.leftMouseUp, at: b, hit: hit, button: .left, clicks: 1).postTagged(to: hit.pid)
+    try target.post(release)
 }
 
-func postScroll(at p: CGPoint, hit: WindowHit, dx: Int32, dy: Int32) {
-    primeActivation(hit.pid)
-    postMove(to: p, hit: hit)
-    usleep(20_000)
-    guard let e = CGEvent(scrollWheelEvent2Source: nil, units: .pixel, wheelCount: 2, wheel1: dy, wheel2: dx, wheel3: 0) else { return }
+func postScroll(at p: CGPoint, hit: WindowHit, dx: Int32, dy: Int32, birth: UInt64? = nil) throws {
+    let target = try InputTarget(pid: hit.pid, birth: birth)
+    guard let e = CGEvent(scrollWheelEvent2Source: nil, units: .pixel, wheelCount: 2, wheel1: dy, wheel2: dx, wheel3: 0) else {
+        throw CLIError("could not create scroll event")
+    }
     e.location = p
     e.setIntegerValueField(.mouseEventWindowUnderMousePointer, value: Int64(hit.windowID))
     e.setIntegerValueField(.mouseEventWindowUnderMousePointerThatCanHandleThisEvent, value: Int64(hit.windowID))
     e.setIntegerValueField(kWindowNumberField, value: Int64(hit.windowID))
     setWindowLocation?(e, CGPoint(x: p.x - hit.bounds.minX, y: p.y - hit.bounds.minY))
-    e.postTagged(to: hit.pid)
+    primeActivation(target.pid, birth: target.birth)
+    try target.post(mouseEvent(.mouseMoved, at: p, hit: hit, button: .left, clicks: 0))
+    usleep(20_000)
+    try target.post(e)
 }
 
 // MARK: keyboard
@@ -165,46 +198,47 @@ func parseCombo(_ combo: String) throws -> (CGKeyCode, CGEventFlags) {
     return (k, flags)
 }
 
-func postKeys(pid: pid_t, keys: [(CGKeyCode, CGEventFlags)]) {
+func postKeys(pid: pid_t, keys: [(CGKeyCode, CGEventFlags)], birth: UInt64? = nil) throws {
     guard !keys.isEmpty else { return }
-    primeActivation(pid)
+    let target = try InputTarget(pid: pid, birth: birth)
+    primeActivation(target.pid, birth: target.birth)
     let source = CGEventSource(stateID: .privateState)
     for key in keys {
-        postKey(pid: pid, key: key, source: source)
+        try postKey(target: target, key: key, source: source)
     }
 }
 
-private func postKey(pid: pid_t, key: (CGKeyCode, CGEventFlags), source: CGEventSource?) {
-    let (k, flags) = key
-    for down in [true, false] {
-        let e = CGEvent(keyboardEventSource: source, virtualKey: k, keyDown: down)!
-        e.flags = flags
-        e.postTagged(to: pid)
-        usleep(15_000)
+private func postKey(target: InputTarget, key: (CGKeyCode, CGEventFlags), source: CGEventSource?, unicode: [UInt16] = [],
+                     delayMicros: UInt32 = 15_000) throws {
+    let (code, flags) = key
+    guard let down = CGEvent(keyboardEventSource: source, virtualKey: code, keyDown: true),
+          let up = CGEvent(keyboardEventSource: source, virtualKey: code, keyDown: false) else {
+        throw CLIError("could not create keyboard events")
     }
-}
-
-func postText(pid: pid_t, text: String, delayMicros: UInt32 = 8_000) {
-    guard !text.isEmpty else { return }
-    primeActivation(pid)
-    let src = CGEventSource(stateID: .privateState)
-    for ch in text {
-        switch ch {
-        case "\n", "\r", "\r\n":
-            postKey(pid: pid, key: (returnKeyCode, []), source: src)
-            continue
-        case "\t":
-            postKey(pid: pid, key: (tabKeyCode, []), source: src)
-            continue
-        default:
-            break
+    for event in [down, up] {
+        event.flags = flags
+        if !unicode.isEmpty {
+            event.keyboardSetUnicodeString(stringLength: unicode.count, unicodeString: unicode)
         }
-        var u = Array(String(ch).utf16)
-        for down in [true, false] {
-            let e = CGEvent(keyboardEventSource: src, virtualKey: 0, keyDown: down)!
-            e.keyboardSetUnicodeString(stringLength: u.count, unicodeString: &u)
-            e.postTagged(to: pid)
-            usleep(delayMicros)
+        try target.post(event)
+        usleep(delayMicros)
+    }
+}
+
+func postText(pid: pid_t, text: String, delayMicros: UInt32 = 8_000, birth: UInt64? = nil) throws {
+    guard !text.isEmpty else { return }
+    let target = try InputTarget(pid: pid, birth: birth)
+    primeActivation(target.pid, birth: target.birth)
+    let source = CGEventSource(stateID: .privateState)
+    for character in text {
+        switch character {
+        case "\n", "\r", "\r\n":
+            try postKey(target: target, key: (returnKeyCode, []), source: source)
+        case "\t":
+            try postKey(target: target, key: (tabKeyCode, []), source: source)
+        default:
+            try postKey(target: target, key: (0, []), source: source, unicode: Array(String(character).utf16),
+                        delayMicros: delayMicros)
         }
     }
 }

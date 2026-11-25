@@ -171,12 +171,16 @@ struct ManagedApp: Codable, Equatable {
         }
     }
 
-    var matchesProcess: Bool {
-        guard let start = processBirth(pid) else { return false }
-        if let processStart { return start == processStart }
+    var matchesProcess: Bool { liveProcessBirth != nil }
+
+    var liveProcessBirth: UInt64? {
+        guard let start = processBirth(pid) else { return nil }
+        if let processStart { return start == processStart ? start : nil }
         guard Double(start) / 1e6 <= launchedAt,
-              let app = NSRunningApplication(processIdentifier: pid) else { return false }
-        return app.bundleURL?.resolvingSymlinksInPath() == URL(fileURLWithPath: path).resolvingSymlinksInPath()
+              let app = NSRunningApplication(processIdentifier: pid),
+              app.bundleURL?.resolvingSymlinksInPath() == URL(fileURLWithPath: path).resolvingSymlinksInPath(),
+              processBirth(pid) == start else { return nil }
+        return start
     }
 }
 
@@ -196,6 +200,7 @@ private func isDaemonCommand(_ pid: pid_t) -> Bool {
     guard sysctl(&mib, 3, nil, &size, nil, 0) == 0, size > 4 else { return false }
     var bytes = [UInt8](repeating: 0, count: size)
     guard sysctl(&mib, 3, &bytes, &size, nil, 0) == 0,
+          size > 4, size <= bytes.count,
           bytes.withUnsafeBytes({ $0.loadUnaligned(as: Int32.self) }) == 2 else { return false }
     let args = bytes[4..<size].split(separator: 0, maxSplits: 3)
     return args.count >= 3 && args[2].elementsEqual("__daemon".utf8)
@@ -206,13 +211,20 @@ private func isDaemonCommand(_ pid: pid_t) -> Bool {
 final class StateLock {
     private(set) var fd: Int32
 
-    init(_ name: String, nonblocking: Bool = false, shared: Bool = false) throws {
+    init(_ name: String, nonblocking: Bool = false, shared: Bool = false, create: Bool = true) throws {
         let url = Paths.dir.appendingPathComponent(name)
-        try Paths.ensureDirectory(url.deletingLastPathComponent())
+        if create { try Paths.ensureDirectory(url.deletingLastPathComponent()) }
         let path = url.path
+        let flags = O_RDWR | O_CLOEXEC | O_NOFOLLOW | O_NONBLOCK | (create ? O_CREAT : 0)
         while true {
-            let descriptor = open(path, O_CREAT | O_RDWR | O_CLOEXEC, 0o600)
+            let descriptor = open(path, flags, 0o600)
+            if descriptor < 0, errno == EINTR { continue }
             guard descriptor >= 0 else { throw CLIError("cannot open lock at " + path) }
+            var held = stat(), current = stat()
+            guard fstat(descriptor, &held) == 0, held.st_mode & S_IFMT == S_IFREG else {
+                close(descriptor)
+                throw CLIError("cannot open regular lock file at " + path)
+            }
             while flock(descriptor, (shared ? LOCK_SH : LOCK_EX) | (nonblocking ? LOCK_NB : 0)) != 0 {
                 if errno == EINTR { continue }
                 let error = errno
@@ -221,13 +233,7 @@ final class StateLock {
             }
             // Lock files of dead apps and old sessions are pruned (unlinked under the lock). If
             // that happened while this waited, the lock is on an orphaned file: start over.
-            var held = stat(), current = stat()
-            guard fstat(descriptor, &held) == 0 else {
-                let error = errno
-                close(descriptor)
-                throw POSIXError(POSIXErrorCode(rawValue: error) ?? .EIO)
-            }
-            if stat(path, &current) == 0 {
+            if lstat(path, &current) == 0 {
                 if held.st_dev != current.st_dev || held.st_ino != current.st_ino {
                     close(descriptor)
                     continue
@@ -313,13 +319,16 @@ enum AppStore {
     static func load() -> [ManagedApp] { (try? read()) ?? [] }
 
     static func add(_ a: ManagedApp) throws {
-        var app = a
-        guard let birth = processBirth(a.pid), a.processStart.map({ $0 == birth }) ?? true,
-              Double(birth) / 1e6 <= a.launchedAt else {
-            throw CLIError("managed process exited during launch")
+        try update { apps in
+            guard let birth = processBirth(a.pid), a.processStart.map({ $0 == birth }) ?? true,
+                  Double(birth) / 1e6 <= a.launchedAt else {
+                throw CLIError("managed process exited during launch")
+            }
+            var app = a
+            app.processStart = birth
+            apps.removeAll { $0.pid == a.pid }
+            apps.append(app)
         }
-        app.processStart = birth
-        try update { $0.removeAll { $0.pid == a.pid }; $0.append(app) }
     }
 
     static func remove(_ pid: Int32) throws {
@@ -327,7 +336,7 @@ enum AppStore {
     }
 
     static func update(_ change: (inout [ManagedApp]) throws -> Void) throws {
-        let lock = try StateLock("lock")
+        let lock = try Locks.registry()
         try withExtendedLifetime(lock) {
             let records = try readRecords(allowMissing: true)
             var apps = records?.filter { $0.matchesProcess } ?? []

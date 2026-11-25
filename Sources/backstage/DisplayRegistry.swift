@@ -10,6 +10,17 @@ import Foundation
 enum DisplayRegistry {
     static let displayName = "Backstage (agent display)"
 
+    static func attachedKeys() -> Set<String>? {
+        guard let online = onlineDisplays() else { return nil }
+        var keys = Set<String>()
+        for id in online {
+            guard let uuid = CGDisplayCreateUUIDFromDisplayID(id)?.takeRetainedValue(),
+                  let key = CFUUIDCreateString(nil, uuid) as String? else { return nil }
+            keys.insert(key)
+        }
+        return keys
+    }
+
     /// Device IDs of unattached backstage displays registered with ColorSync. Nil when the
     /// attached displays can't all be identified: then nothing may be called a leftover.
     static func leftovers() -> [CFUUID]? {
@@ -19,13 +30,7 @@ enum DisplayRegistry {
             var found: [CFUUID] = []
             init(attached: Set<String>) { self.attached = attached }
         }
-        guard let online = onlineDisplays() else { return nil }
-        var attachedKeys: [String] = []
-        for id in online {
-            guard let uuid = CGDisplayCreateUUIDFromDisplayID(id)?.takeRetainedValue(), let key = CFUUIDCreateString(nil, uuid) as String? else { return nil }
-            attachedKeys.append(key)
-        }
-        let attached = Set(attachedKeys)
+        guard let attached = attachedKeys() else { return nil }
         let collector = Collector(attached: attached)
         let context = Unmanaged.passUnretained(collector).toOpaque()
         withExtendedLifetime(collector) {
@@ -61,7 +66,8 @@ func cmdCleanupDisplays() throws -> [String: Any] {
     var removed = 0
     for uuid in before {
         // Recheck right before each removal: a backstage display may have come up meanwhile.
-        guard let still = DisplayRegistry.leftovers(), still.contains(where: { CFEqual($0, uuid) }) else { continue }
+        guard let attached = DisplayRegistry.attachedKeys() else { break }
+        guard let key = CFUUIDCreateString(nil, uuid) as String?, !attached.contains(key) else { continue }
         if ColorSyncUnregisterDevice(kColorSyncDisplayDeviceClass.takeUnretainedValue(), uuid) { removed += 1 }
     }
     let after = DisplayRegistry.leftovers()?.count ?? -1

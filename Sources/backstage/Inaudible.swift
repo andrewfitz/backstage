@@ -251,42 +251,26 @@ struct CodeSigning {
 
 // MARK: - after launch
 
-/// The launched process made itself inaudible: its acknowledgement says the set succeeded, or
-/// (when it couldn't write one, e.g. a sandboxed app) the library is mapped into it. Returns
-/// nil when confirmed, else why not.
-func confirmInaudible(pid: pid_t, launchID: String, library: URL, timeout: Double = 2) -> String? {
+/// The launched process reports the result of setting Core Audio's audibility property.
+func readInaudibleAcknowledgement(pid: pid_t, launchID: String) -> Int32? {
     let ack = InaudibleLibrary.ackFile(launchID)
-    defer { try? FileManager.default.removeItem(at: ack) }
+    guard let text = try? String(contentsOf: ack, encoding: .utf8) else { return nil }
+    let parts = text.split(whereSeparator: { $0 == " " || $0 == "\n" })
+    guard parts.count == 2, pid_t(parts[0]) == pid else { return nil }
+    return Int32(parts[1])
+}
+
+/// Require an acknowledgement of success. A mapped library can still fail to mute the process.
+func confirmInaudible(pid: pid_t, birth: UInt64, launchID: String, timeout: Double = 2) -> String? {
     var lastError: Int32?
-    let confirmed: Bool = waitFor(timeout: timeout, interval: 0.02) {
-        guard let text = try? String(contentsOf: ack, encoding: .utf8) else { return nil }
-        let parts = text.split(whereSeparator: { $0 == " " || $0 == "\n" })
-        guard parts.count >= 2, pid_t(parts[0]) == pid, let status = Int32(parts[1]) else { return nil }
+    let confirmed = waitFor(timeout: timeout, interval: 0.02) { () -> Bool? in
+        guard processBirth(pid) == birth else { return false }
+        guard let status = readInaudibleAcknowledgement(pid: pid, launchID: launchID) else { return nil }
         if status == 0 { return true }
         lastError = status
         return nil   // it retries for a while
     } ?? false
     if confirmed { return nil }
     if let lastError { return "the app couldn't make itself inaudible: Core Audio returned \(fourCC(lastError))" }
-    if processMaps(pid, library) { return nil }
-    return "the library wasn't loaded into pid \(pid) (dyld ignored DYLD_INSERT_LIBRARIES)"
-}
-
-/// A file is mapped into the process (its image list, read from the outside).
-func processMaps(_ pid: pid_t, _ file: URL) -> Bool {
-    let target = file.resolvingSymlinksInPath().path
-    var expected = stat()
-    guard stat(target, &expected) == 0 else { return false }
-    var info = proc_regionwithpathinfo()
-    var address: UInt64 = 0
-    let size = Int32(MemoryLayout<proc_regionwithpathinfo>.size)
-    for _ in 0..<200_000 {
-        guard proc_pidinfo(pid, PROC_PIDREGIONPATHINFO, address, &info, size) == size else { return false }
-        if info.prp_vip.vip_vi.vi_stat.vst_ino == expected.st_ino,
-           info.prp_vip.vip_vi.vi_stat.vst_dev == UInt32(bitPattern: expected.st_dev) { return true }
-        let (next, overflow) = info.prp_prinfo.pri_address.addingReportingOverflow(info.prp_prinfo.pri_size)
-        guard !overflow, next > address else { return false }
-        address = next
-    }
-    return false
+    return "pid \(pid) didn't acknowledge making itself inaudible"
 }

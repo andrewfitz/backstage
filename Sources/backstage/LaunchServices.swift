@@ -56,6 +56,23 @@ enum LaunchServices {
         fileprivate func finish(_ answer: Answer) { lock.lock(); answered = answered ?? answer; lock.unlock() }
     }
 
+    /// Run the public open client without blocking the launch deadline on its response.
+    /// Tests can exercise the child lifecycle with a windowless executable.
+    static func openThroughTool(_ executable: URL, arguments: [String]) throws -> (OpenRequest, Process) {
+        let request = OpenRequest()
+        let process = Process()
+        process.executableURL = executable
+        process.arguments = arguments
+        process.terminationHandler = { [weak request] completed in
+            let status = completed.terminationStatus
+            let ok = completed.terminationReason == .exit && status == 0
+            let error = ok ? nil : "open failed (status \(status))"
+            request?.finish(.init(ok: ok, error: error, pid: nil))
+        }
+        try process.run()
+        return (request, process)
+    }
+
     /// The open call and every option `launch` needs exist in this macOS.
     static var canOpen: Bool { open != nil && optionKeys != nil }
     /// The open option that starts an app as a UIElement exists.

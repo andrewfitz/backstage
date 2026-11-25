@@ -44,12 +44,9 @@ struct Session {
     /// The app was sent backstage by the user, not launched by an agent.
     static func isUser(_ owner: String?) -> Bool { sameID(owner, user) }
 
-    private static var cached: Session?
+    private static let cached = Result { try derive(ProcessInfo.processInfo.environment) }
     static func current() throws -> Session {
-        if let cached { return cached }
-        let session = try derive(ProcessInfo.processInfo.environment)
-        cached = session
-        return session
+        try cached.get()
     }
 
     /// A file-name-safe key for this session's lock and screenshot folder.
@@ -90,7 +87,7 @@ struct Session {
             // came from an outer agent. Unreadable environments (another user) are trusted.
             func own(_ key: String) -> String? {
                 guard let id = variable(key) else { return nil }
-                return processArguments(agent.pid)?.env[key] == id ? nil : id
+                return processEnvironmentValue(agent.pid, key: key) == id ? nil : id
             }
             if let v = sessionVariables.first(where: { $0.kind == kind }), let id = own(v.key),
                v.key != "CLAUDE_CODE_SESSION_ID" || env["CLAUDE_PID"].map({ Int32($0) == agent.pid }) ?? true {
@@ -153,7 +150,7 @@ struct Session {
             guard pid > 1 else { break }
             var info = proc_bsdinfo()
             let size = Int32(MemoryLayout.size(ofValue: info))
-            guard proc_pidinfo(pid, PROC_PIDTBSDINFO, 0, &info, size) == size else { break }
+            guard proc_pidinfo(pid, PROC_PIDTBSDINFO, 0, &info, size) == size, info.pbi_status != SZOMB else { break }
             let name = withUnsafeBytes(of: info.pbi_name) { String(decoding: $0.prefix { $0 != 0 }, as: UTF8.self) }
             let comm = withUnsafeBytes(of: info.pbi_comm) { String(decoding: $0.prefix { $0 != 0 }, as: UTF8.self) }
             let n = (name.isEmpty ? comm : name).lowercased()
@@ -182,7 +179,8 @@ private func readProcessArguments(_ pid: pid_t, decodeArguments: Bool) -> (argv:
     var size = 0
     guard sysctl(&mib, 3, nil, &size, nil, 0) == 0, size > MemoryLayout<Int32>.size else { return nil }
     var bytes = [UInt8](repeating: 0, count: size)
-    guard sysctl(&mib, 3, &bytes, &size, nil, 0) == 0, size > MemoryLayout<Int32>.size else { return nil }
+    guard sysctl(&mib, 3, &bytes, &size, nil, 0) == 0,
+          size > MemoryLayout<Int32>.size, size <= bytes.count else { return nil }
     let argc = bytes.withUnsafeBytes { Int($0.loadUnaligned(as: Int32.self)) }
     var index = MemoryLayout<Int32>.size
     guard argc > 0, let endOfPath = bytes[index..<size].firstIndex(of: 0) else { return nil }
@@ -245,6 +243,9 @@ enum Locks {
     static func app(_ app: ManagedApp, nonblocking: Bool = false) throws -> StateLock {
         try StateLock("locks/app-\(app.pid)-\(app.processStart ?? 0)", nonblocking: nonblocking)
     }
+    static func registry(nonblocking: Bool = false) throws -> StateLock {
+        try StateLock("lock", nonblocking: nonblocking)
+    }
     /// Remove lock files of apps that are gone. Nobody can hold a dead app's lock usefully.
     /// Records without a start time lock `app-<pid>-0`, which can't be checked: those stay.
     /// StateLock re-checks the path after locking, so unlinking a lock file is safe.
@@ -253,8 +254,12 @@ enum Locks {
         guard let names = try? FileManager.default.contentsOfDirectory(atPath: dir.path) else { return }
         for name in names where name.hasPrefix("app-") {
             let parts = name.dropFirst(4).split(separator: "-")
-            guard parts.count == 2, let pid = pid_t(parts[0]), let birth = UInt64(parts[1]), birth != 0 else { continue }
-            if processBirth(pid) != birth { try? FileManager.default.removeItem(at: dir.appendingPathComponent(name)) }
+            guard parts.count == 2, let pid = pid_t(parts[0]), pid > 0,
+                  let birth = UInt64(parts[1]), birth != 0,
+                  processBirth(pid) != birth,
+                  let lock = try? StateLock("locks/" + name, nonblocking: true, create: false) else { continue }
+            unlink(dir.appendingPathComponent(name).path)
+            lock.release()
         }
     }
 
@@ -279,9 +284,9 @@ enum Locks {
         let live = Set(distinctOwners.map { "session-" + Session.fileKey(String(decoding: $0, as: UTF8.self)) })
         for name in candidates where !live.contains(name) {
             let url = dir.appendingPathComponent(name)
-            guard let lock = try? StateLock("locks/" + name, nonblocking: true) else { continue }
+            guard let lock = try? StateLock("locks/" + name, nonblocking: true, create: false) else { continue }
             // A stop may have written a new stamp after the directory scan.
-            if isOld(url) { try? FileManager.default.removeItem(at: url) }
+            if isOld(url) { unlink(url.path) }
             lock.release()
         }
     }

@@ -20,7 +20,9 @@ cleanup() {
     local result=$?
     trap - EXIT
     for h in ${HOMES[@]+"${HOMES[@]}"}; do
-        [[ -f "$h/daemon.json" ]] && BACKSTAGE_HOME="$h" "$BS" stop --all > /dev/null 2>&1
+        if [[ -f "$h/daemon.json" ]]; then
+            BACKSTAGE_HOME="$h" "$BS" stop --all > /dev/null 2>&1 || result=1
+        fi
     done
     echo "artifacts: $WORK"
     exit "$result"
@@ -37,10 +39,14 @@ home a; home b; home c; home d
 A="$WORK/a"; B="$WORK/b"; C="$WORK/c"; D="$WORK/d"
 
 cycle() {  # one round: two homes at once on 7 and 8, a busy request, a shared slot, restarts
+    local a_pid b_pid started=1
     (BACKSTAGE_HOME="$A" BACKSTAGE_DISPLAY=7 "$BS" start > "$WORK/a.json" 2>&1) &
+    a_pid=$!
     (BACKSTAGE_HOME="$B" BACKSTAGE_DISPLAY=8 "$BS" start > "$WORK/b.json" 2>&1) &
-    wait
-    [[ $(slot "$A") == 7 && $(slot "$B") == 8 ]] && pass "two homes started at once got displays 7 and 8" \
+    b_pid=$!
+    wait "$a_pid" || started=0
+    wait "$b_pid" || started=0
+    [[ $started == 1 && $(slot "$A") == 7 && $(slot "$B") == 8 ]] && pass "two homes started at once got displays 7 and 8" \
         || fail "concurrent start: a=$(cat "$WORK/a.json") b=$(cat "$WORK/b.json")"
 
     local t0=$SECONDS out
@@ -53,14 +59,14 @@ cycle() {  # one round: two homes at once on 7 and 8, a busy request, a shared s
     out=$(BACKSTAGE_HOME="$D" BACKSTAGE_DISPLAY= "$BS" start 2>&1)
     local s; s=$(slot "$D")
     [[ $s =~ ^[2-6]$ ]] && pass "a home asking for no display got shared display $s" || fail "shared slot: $out (slot ${s:-none})"
-    BACKSTAGE_HOME="$D" "$BS" stop --all > /dev/null
+    BACKSTAGE_HOME="$D" "$BS" stop --all > /dev/null || fail "stop --all for home D"
 
     # Right after a stop the old display may still be online for a moment: the restart waits.
-    BACKSTAGE_HOME="$A" "$BS" stop --all > /dev/null
+    BACKSTAGE_HOME="$A" "$BS" stop --all > /dev/null || fail "stop --all for home A"
     out=$(BACKSTAGE_HOME="$A" BACKSTAGE_DISPLAY=7 "$BS" start 2>&1)
     [[ $(slot "$A") == 7 ]] && pass "display 7 is reused right after its daemon stopped" || fail "restart on 7: $out"
-    BACKSTAGE_HOME="$A" "$BS" stop --all > /dev/null
-    BACKSTAGE_HOME="$B" "$BS" stop --all > /dev/null
+    BACKSTAGE_HOME="$A" "$BS" stop --all > /dev/null || fail "stop --all for home A"
+    BACKSTAGE_HOME="$B" "$BS" stop --all > /dev/null || fail "stop --all for home B"
 }
 
 echo "== bad values"

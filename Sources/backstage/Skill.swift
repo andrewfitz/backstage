@@ -4,14 +4,15 @@
 let skillMarkdown = #"""
 ---
 name: backstage
-description: Launch, test, screenshot and click through macOS GUI apps on an invisible display so nothing pops up on the user's screen or steals their focus. Use whenever you need to run a .app or GUI binary to verify a build, reproduce a bug, run a UI check, or look at an app for your own purposes. When the user explicitly asks to see something on their own screen, or you will drive the app with computer-use tools that work on the user's screen, use `backstage show` instead.
+description: Launch, test, screenshot and click through macOS GUI apps on a hidden virtual display. Use whenever you need to run a .app or GUI binary to verify a build, reproduce a bug, run a UI check, or look at an app for your own purposes. When the user explicitly asks to see something on their own screen, or you will drive the app with computer-use tools that work on the user's screen, use `backstage show` instead.
 ---
 
 # backstage: use GUI apps without touching the user's screen
 
 `backstage` runs macOS apps on a hidden virtual display. You can see apps (screenshots,
-accessibility tree) and drive them (clicks, typing, menus) while the user keeps working,
-undisturbed. Their cursor, keyboard focus, frontmost app and windows are never touched.
+accessibility tree) and drive them (clicks, typing, menus) while the user keeps working.
+If an app activates itself or opens a later window on a user display, it can briefly take
+focus or appear before Backstage moves it back.
 
 ## First decide: is this for you, or for the user?
 

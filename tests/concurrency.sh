@@ -27,9 +27,15 @@ unset BACKSTAGE_SESSION
 WATCH=
 BG=()
 cleanup() {
-    local result=$?
+    local result=$? p child
     trap - EXIT
-    for p in ${BG[@]+"${BG[@]}"}; do pkill -P "$p" 2>/dev/null; kill "$p" 2>/dev/null; done
+    for child in $(jobs -pr); do
+        for p in ${BG[@]+"${BG[@]}"}; do
+            [[ $p == "$child" ]] || continue
+            pkill -P "$p" 2>/dev/null
+            kill "$p" 2>/dev/null
+        done
+    done
     for p in ${BG[@]+"${BG[@]}"}; do wait "$p" 2>/dev/null; done
     if [[ -f "$BACKSTAGE_HOME/daemon.json" || -f "$BACKSTAGE_HOME/apps.json" ]]; then
         "$BS" stop --all >/dev/null 2>&1 || result=1
@@ -204,9 +210,8 @@ APP="$WORK/BackstageTestApp.app"
 swiftc -O watch.swift -o "$WORK/watch" || exit 1
 swiftc -O pixels.swift -o "$WORK/pixels" || exit 1
 swiftc -O zorder.swift -o "$WORK/zorder" || exit 1
-"$WORK/watch" "$BUNDLE" 600 "$WORK/watch.stop" > "$WORK/watch.out" 2>&1 &
-WATCH=$!
-sleep 0.3
+. ./watch.sh
+start_watch "$BUNDLE" 600 || exit 1
 
 echo "== placement: new windows go to the first free spot"
 PA=$(a launch "$APP" --env "TESTAPP_LOG=$WORK/a.log" --env TESTAPP_PAD=red --env TESTAPP_OVERLAYS=1 --env "TESTAPP_SPOT=100,100 300,200" | jget "['pid']")

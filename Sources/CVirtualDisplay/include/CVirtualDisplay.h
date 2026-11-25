@@ -1,5 +1,8 @@
 #import <Foundation/Foundation.h>
 #import <CoreGraphics/CoreGraphics.h>
+
+NS_ASSUME_NONNULL_BEGIN
+
 @class CGVirtualDisplay;
 @interface CGVirtualDisplayDescriptor : NSObject
 @property (retain, nonatomic) dispatch_queue_t queue;
@@ -10,10 +13,10 @@
 @property (nonatomic) unsigned int productID;
 @property (nonatomic) unsigned int vendorID;
 @property (nonatomic) unsigned int serialNum;
-@property (copy, nonatomic) void (^terminationHandler)(id, CGVirtualDisplay*);
+@property (copy, nonatomic, nullable) void (^terminationHandler)(id, CGVirtualDisplay*);
 @end
 @interface CGVirtualDisplayMode : NSObject
-- (instancetype)initWithWidth:(unsigned int)width height:(unsigned int)height refreshRate:(double)refreshRate;
+- (nullable instancetype)initWithWidth:(unsigned int)width height:(unsigned int)height refreshRate:(double)refreshRate;
 @end
 @interface CGVirtualDisplaySettings : NSObject
 @property (retain, nonatomic) NSArray<CGVirtualDisplayMode*> *modes;
@@ -21,6 +24,8 @@
 @end
 @interface CGVirtualDisplay : NSObject
 @property (readonly, nonatomic) CGDirectDisplayID displayID;
-- (instancetype)initWithDescriptor:(CGVirtualDisplayDescriptor *)descriptor;
+- (nullable instancetype)initWithDescriptor:(CGVirtualDisplayDescriptor *)descriptor;
 - (BOOL)applySettings:(CGVirtualDisplaySettings *)settings;
 @end
+
+NS_ASSUME_NONNULL_END

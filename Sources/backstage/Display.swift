@@ -22,9 +22,25 @@ func isOurDisplay(_ id: CGDirectDisplayID) -> Bool {
     CGDisplayVendorNumber(id) == kVendor && CGDisplayModelNumber(id) == kProduct
 }
 
-/// Bounds of the backstage displays other than `own` (other homes' daemons).
-func otherAgentDisplayBounds(excluding own: CGDirectDisplayID, from ids: [CGDirectDisplayID] = activeDisplays()) -> [CGRect] {
-    ids.filter { $0 != own && isOurDisplay($0) }.map { CGDisplayBounds($0) }
+/// Active display bounds for one check. Refresh after changing the arrangement.
+struct DisplayGeometry {
+    let ids = activeDisplays()
+    let bounds: [CGDirectDisplayID: CGRect]
+
+    init() {
+        bounds = Dictionary(uniqueKeysWithValues: ids.map { ($0, CGDisplayBounds($0)) })
+    }
+
+    func classified() -> (users: [CGRect], agents: [CGDirectDisplayID: CGRect]) {
+        var users: [CGRect] = []
+        var agents: [CGDirectDisplayID: CGRect] = [:]
+        for id in ids {
+            guard let frame = bounds[id] else { continue }
+            if isOurDisplay(id) { agents[id] = frame }
+            else if CGDisplayMirrorsDisplay(id) == kCGNullDirectDisplay { users.append(frame) }
+        }
+        return (users, agents)
+    }
 }
 
 /// The eight backstage displays. macOS registers every new display identity (vendor, product,
@@ -115,6 +131,12 @@ final class UserLock {
     init?(_ name: String, nonblocking: Bool = false) {
         fd = open("/tmp/backstage-\(getuid())-\(name)", O_CREAT | O_RDWR | O_CLOEXEC | O_NOFOLLOW, 0o600)
         guard fd >= 0 else { return nil }
+        var info = stat()
+        guard fstat(fd, &info) == 0, info.st_mode & S_IFMT == S_IFREG,
+              info.st_uid == geteuid(), info.st_nlink == 1 else {
+            release()
+            return nil
+        }
         while flock(fd, LOCK_EX | (nonblocking ? LOCK_NB : 0)) != 0 {
             if errno == EINTR { continue }
             close(fd); fd = -1
@@ -152,15 +174,22 @@ func nsScreen(_ id: CGDirectDisplayID) -> NSScreen? {
 /// The Dock's PID is looked up only when it changes: asking LaunchServices can be slow while apps
 /// launch and quit, and this runs on the daemon's guard loop.
 private var dockPid: pid_t = 0
-func dockWindowBounds() -> CGRect? {
+func dockWindowBounds(from onscreen: [[String: Any]]?) -> CGRect? {
     if dockPid == 0 || kill(dockPid, 0) != 0 {
         dockPid = NSRunningApplication.runningApplications(withBundleIdentifier: "com.apple.dock").first?.processIdentifier ?? 0
     }
     let dock = dockPid
-    guard dock != 0, let windows = CGWindowListCopyWindowInfo([.optionOnScreenOnly], kCGNullWindowID) as? [[String: Any]] else { return nil }
+    guard dock != 0 else { return nil }
     let level = Int(CGWindowLevelForKey(.dockWindow))
-    return windows.first { ($0[kCGWindowOwnerPID as String] as? pid_t) == dock && ($0[kCGWindowLayer as String] as? Int) == level }
-        .flatMap { ($0[kCGWindowBounds as String] as? NSDictionary).flatMap { CGRect(dictionaryRepresentation: $0) } }
+    func dockBounds(in windows: [[String: Any]]) -> CGRect? {
+        windows.first { ($0[kCGWindowOwnerPID as String] as? pid_t) == dock && ($0[kCGWindowLayer as String] as? Int) == level }
+            .flatMap { ($0[kCGWindowBounds as String] as? NSDictionary).flatMap { CGRect(dictionaryRepresentation: $0) } }
+    }
+    if let onscreen, let bounds = dockBounds(in: onscreen) { return bounds }
+    // Containment excludes desktop elements. If the shared list has no Dock window,
+    // preserve the Dock guard's lookup in the complete on-screen list.
+    guard let windows = CGWindowListCopyWindowInfo([.optionOnScreenOnly], kCGNullWindowID) as? [[String: Any]] else { return nil }
+    return dockBounds(in: windows)
 }
 
 /// Holds the private CGVirtualDisplay alive. Dropping it removes the display.
@@ -192,7 +221,7 @@ final class AgentDisplay {
         func make(_ slot: Int) -> CGVirtualDisplay? {
             let d = CGVirtualDisplayDescriptor()
             d.queue = DispatchQueue.main
-            d.name = "Backstage (agent display)"
+            d.name = DisplayRegistry.displayName
             d.maxPixelsWide = width * scale
             d.maxPixelsHigh = height * scale
             // 100 points per inch, whatever the scale
@@ -240,9 +269,12 @@ final class AgentDisplay {
             guard created != nil else { throw CLIError("no free display left (\(slots.map(String.init).joined(separator: ", ")) are in use)") }
         }
         guard let (vd, slot) = created else { throw CLIError("CGVirtualDisplay init failed") }
+        guard let mode = CGVirtualDisplayMode(width: width, height: height, refreshRate: 30) else {
+            throw CLIError("CGVirtualDisplay mode init failed")
+        }
         let s = CGVirtualDisplaySettings()
         s.hiDPI = scale > 1 ? 1 : 0
-        s.modes = [CGVirtualDisplayMode(width: width, height: height, refreshRate: 30)]
+        s.modes = [mode]
         guard vd.apply(s) else { throw CLIError("CGVirtualDisplay applySettings failed") }
         // A virtual display comes online once it has a mode; only then can others see the slot taken.
         guard waitFor(timeout: 5, { (onlineDisplays() ?? []).contains(vd.displayID) ? true : nil }) != nil else {
@@ -282,11 +314,9 @@ final class AgentDisplay {
     /// other backstage display (see `mayStay`): the cursor essentially can't wander onto it (and
     /// the daemons warp it back if it does), and the Dock, which follows the cursor to a display's
     /// bottom edge and moves to a display arranged below its own, stays on the user's screen.
-    var isParked: Bool {
-        let displays = activeDisplays()
-        let here = bounds
-        return displays.contains(id) && !here.isEmpty
-            && mayStay(here, users: userDisplayBounds(from: displays), others: otherAgentDisplayBounds(excluding: id, from: displays))
+    func isParked(users: [CGRect], agents: [CGDirectDisplayID: CGRect]) -> Bool {
+        guard let here = agents[id], !here.isEmpty else { return false }
+        return mayStay(here, users: users, others: agents.compactMap { $0.key == id ? nil : $0.value })
     }
 
     /// Park the display diagonally off the bottom-right corner of the user's desktop, or chained
@@ -303,11 +333,9 @@ final class AgentDisplay {
         // The size it will have: a display can come up in the mode last used with its identity.
         let target = CGSize(width: Int(size.width), height: Int(size.height))
         for attempt in 0..<5 {
-            let displays = activeDisplays()
-            guard displays.contains(id) else { return false }
-            let users = userDisplayBounds(from: displays)
-            let others = otherAgentDisplayBounds(excluding: id, from: displays)
-            let here = bounds
+            let (users, agents) = DisplayGeometry().classified()
+            guard let here = agents[id] else { return false }
+            let others = agents.compactMap { $0.key == id ? nil : $0.value }
             guard let spot = parkingSpot(size: target, users: users, others: others),
                   let x = Int32(exactly: spot.x), let y = Int32(exactly: spot.y) else { return false }
             if !here.isEmpty, mayStay(here, users: users, others: others), !force || attempt > 0 || here.origin == spot { return true }
@@ -323,15 +351,43 @@ final class AgentDisplay {
                 usleep(20_000)
             }
         }
-        return isParked
+        let (users, agents) = DisplayGeometry().classified()
+        return isParked(users: users, agents: agents)
     }
 }
 
 /// Info about the running daemon's display, validated against the live display list.
 func liveDaemon() -> DaemonInfo? {
-    guard var info = readJSON(Paths.daemon, DaemonInfo.self), info.matchesProcess else { return nil }
+    guard let info = readJSON(Paths.daemon, DaemonInfo.self), info.matchesProcess else { return nil }
+    return liveDisplay(info)
+}
+
+/// Refresh the displays in a daemon record after the caller has verified the process identity.
+func liveDisplay(_ checkedInfo: DaemonInfo) -> DaemonInfo? {
+    var info = checkedInfo
     guard isOurDisplay(info.displayID), CGDisplayIsActive(info.displayID) != 0 else { return nil }
     let b = CGDisplayBounds(info.displayID)
+    guard !b.isEmpty else { return nil }
+    if let entries = info.displays {
+        guard let primary = entries.first, primary.displayID == info.displayID,
+              displaySlot(serial: CGDisplaySerialNumber(primary.displayID)) == primary.slot else { return nil }
+        info.displays = entries.compactMap { entry in
+            let id = entry.displayID
+            let bounds: CGRect
+            if id == primary.displayID {
+                guard entry.slot == primary.slot else { return nil }
+                bounds = b
+            } else {
+                guard isOurDisplay(id), CGDisplayIsActive(id) != 0,
+                      displaySlot(serial: CGDisplaySerialNumber(id)) == entry.slot else { return nil }
+                bounds = CGDisplayBounds(id)
+                guard !bounds.isEmpty else { return nil }
+            }
+            var live = entry
+            live.x = bounds.minX; live.y = bounds.minY; live.width = bounds.width; live.height = bounds.height
+            return live
+        }
+    }
     info.x = b.origin.x; info.y = b.origin.y; info.width = b.width; info.height = b.height
     return info
 }

@@ -11,7 +11,8 @@ func emit(_ obj: Any) {
     if let d = try? JSONSerialization.data(withJSONObject: obj, options: opts), let s = String(data: d, encoding: .utf8) {
         print(s)
     } else {
-        print(obj)
+        print(#"{"ok":false,"error":"could not encode command result as JSON"}"#)
+        exit(1)
     }
 }
 
@@ -97,7 +98,9 @@ struct Args {
             let value: String
             if parts.count == 2 { value = String(parts[1]) }
             else {
-                guard i < raw.count, !raw[i].hasPrefix("--") else { throw CLIError("--\(name) needs a value") }
+                guard i < raw.count, !raw[i].hasPrefix("--"), raw[i] != "-o", raw[i] != "-h" else {
+                    throw CLIError("--\(name) needs a value (use --\(name)=VALUE for a value that looks like an option)")
+                }
                 value = raw[i]
                 i += 1
             }
@@ -111,6 +114,7 @@ struct Args {
         switch command {
         case "launch", "open":
             allowed = ["env", "timeout", "dock", "audio", "inaudible", "display"]; arity = 1...1
+            if has("audio") && has("inaudible") { throw CLIError("--audio and --inaudible exclude each other") }
             if let d = opt("display"), d != "new", !(Int(d).map { displaySlots.contains($0) } ?? false) {
                 throw CLIError("--display takes a display number (1-8) or new")
             }
@@ -126,6 +130,9 @@ struct Args {
         case "screenshot", "shot":
             allowed = target + ["window", "o", "out", "scale", "full", "display"]; arity = 0...0
             if opt("display") != nil && !has("full") { throw CLIError("--display goes with --full (an app's screenshot is taken on its own display)") }
+            if let display = opt("display"), !(Int(display).map { displaySlots.contains($0) } ?? false) {
+                throw CLIError("--display takes a display number (1-8)")
+            }
             if has("full"), (target + ["window"]).contains(where: { opt($0) != nil }) {
                 throw CLIError("--full captures all of your session's apps over the whole display and takes no app or window selector")
             }
@@ -190,7 +197,11 @@ struct Args {
         case "settings": allowed = []; arity = 0...2
         case "__send-backstage": allowed = ["pid", "focus-to"]; arity = 0...0
         case "__send-refusal": allowed = ["bundle-id", "name", "path"]; arity = 0...0
-        default: allowed = []; arity = 0...0
+        case "__guard-selftest": allowed = ["pid"]; arity = 0...0
+        case "help", "-h", "--help", "version", "--version", "start", "status", "doctor",
+             "__daemon", "__audio-taps":
+            allowed = []; arity = 0...0
+        default: throw CLIError("unknown command '\(command)'. Run `backstage help`.")
         }
         if let unexpected = switches.union(options.keys).subtracting(allowed).sorted().first {
             throw CLIError("--\(unexpected) is not an option for \(command)")
@@ -200,8 +211,20 @@ struct Args {
         if let pid = opt("pid"), (Int32(pid) ?? 0) <= 0 { throw CLIError("--pid needs a positive process ID") }
         if let pid = opt("focus-to"), (Int32(pid) ?? 0) <= 0 { throw CLIError("--focus-to needs a positive process ID") }
         if opt("app") == "" { throw CLIError("--app needs a name or bundle identifier") }
-        for name in ["lines", "depth", "steps"] where opt(name) != nil {
-            guard let n = int(name), n >= (name == "steps" ? 1 : 0) else { throw CLIError("invalid --\(name)") }
+        for name in ["o", "out", "ref"] where opt(name) == "" {
+            throw CLIError("--\(name) needs a nonempty value")
+        }
+        if let spec = opt("window") {
+            let valid = spec.hasPrefix("w") ? UInt32(spec.dropFirst()) != nil : (Int(spec) ?? -1) >= 0
+            guard valid else { throw CLIError("--window takes a window ref (w1234) or a nonnegative index") }
+        }
+        for name in ["lines", "depth"] where opt(name) != nil {
+            guard let n = int(name), n >= 0 else { throw CLIError("invalid --\(name)") }
+        }
+        if opt("steps") != nil {
+            guard let steps = int("steps"), (1...1000).contains(steps) else {
+                throw CLIError("--steps must be between 1 and 1000")
+            }
         }
         for name in ["dx", "dy"] where opt(name) != nil && Int32(opt(name)!) == nil {
             throw CLIError("--\(name) must fit in a signed 32-bit integer")
@@ -216,6 +239,13 @@ struct Args {
             if name == "timeout", ["launch", "open"].contains(command), Int(exactly: n.rounded(.towardZero)) == nil {
                 throw CLIError("invalid --timeout")
             }
+        }
+        if ["click", "hover", "drag", "scroll"].contains(command), opt("ref") == nil {
+            let scale = double("scale") ?? 1
+            guard positional.allSatisfy({ value in
+                guard let number = Double(value) else { return false }
+                return (number / scale).isFinite
+            }) else { throw CLIError("coordinates must be finite numbers at the selected scale") }
         }
     }
     func has(_ s: String) -> Bool { switches.contains(s) }

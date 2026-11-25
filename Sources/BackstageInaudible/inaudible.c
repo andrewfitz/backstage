@@ -31,15 +31,17 @@ static OSStatus bs_set_inaudible(void) {
 
 // Tell `backstage launch` the outcome: "<pid> <OSStatus>\n" in the file BACKSTAGE_INAUDIBLE_ACK
 // names, written atomically. Only the launched process does this (the variable is removed from
-// its environment once read, so its children don't); a sandboxed app may not be able to, and
-// launch then falls back to checking that the library is mapped.
+// its environment once read, so its children don't). A sandboxed app may not be able to write
+// the acknowledgement, in which case the launcher cannot confirm inaudibility.
 static void bs_acknowledge(OSStatus err, int replace) {
     if (!ack_path) return;
     char tmp[1100], line[64];
-    if (snprintf(tmp, sizeof tmp, "%s.XXXXXX", ack_path) >= (int)sizeof tmp) return;
+    int path_length = snprintf(tmp, sizeof tmp, "%s.XXXXXX", ack_path);
+    if (path_length < 0 || path_length >= (int)sizeof tmp) return;
+    int n = snprintf(line, sizeof line, "%d %d\n", getpid(), (int)err);
+    if (n < 0 || n >= (int)sizeof line) return;
     int fd = mkstemp(tmp);
     if (fd < 0) return;
-    int n = snprintf(line, sizeof line, "%d %d\n", getpid(), (int)err);
     size_t used = 0;
     while (used < (size_t)n) {
         ssize_t written = write(fd, line + used, (size_t)n - used);

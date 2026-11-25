@@ -40,14 +40,29 @@ reject 'thumbnail dimensions' __menu-thumbnail 1 0 641 360
 reject 'pid' quit --pid xyz
 reject 'pid' quit --pid 2147483648
 reject 'pid' quit --pid
+reject 'unknown command' invalid-command extra
+reject 'needs a value' find --text -h
+reject 'needs a value' screenshot --scale -o screenshot.png
 reject 'lines' logs --lines -1
 reject 'scale' screenshot --scale nan
 reject 'steps' drag 0 0 10 10 --steps 0
+reject 'steps.*1000' drag 0 0 10 10 --steps 1001
+reject 'coordinates' click inf 5
+reject 'coordinates' hover unparseable 0
+reject 'coordinates' scroll 1e308 0 --scale 0.1
+reject 'coordinates' drag 0 0 nan 10
 reject 'dy' scroll 0 0 --dy 2147483648
 reject 'scale' screenshot --scale 0
+reject 'display number' screenshot --full --display new
+reject 'display number' screenshot --full --display 9
+reject 'nonempty' screenshot --out=
+reject 'nonempty' click --ref=
+reject 'window ref' tree --window w4294967296
+reject 'window ref' window fill --window -1
 reject 'timeout' wait --text ready --timeout inf
 reject 'needs --text and/or --role' wait
 reject 'env' launch fixture --env MISSING_VALUE
+reject 'exclude each other' launch fixture --audio --inaudible
 reject 'pid' stop --pid "$child"
 reject 'selector' screenshot --full --pid "$child"
 reject 'usage: backstage window' window
@@ -130,6 +145,14 @@ jq -n --argjson pid "$child" --argjson birth "$birth" \
     '{pid:$pid,displayID:1,x:0,y:0,width:1,height:1,startedAt:now,processStart:$birth,inputGuard:true}' > "$BACKSTAGE_HOME/daemon.json"
 reject 'older version.*stop --all' windows
 reject 'older version.*stop --all' press --pid "$child" w0
+reject 'older version.*stop --all' quit --force --pid "$child"
+reject 'older version.*stop --all' show --pid "$child"
+reject 'older version.*stop --all' stop
+kill -0 "$child"
+jq '.protocol = 3 | .stopping = true' "$BACKSTAGE_HOME/daemon.json" > "$work/stopping"
+mv "$work/stopping" "$BACKSTAGE_HOME/daemon.json"
+reject 'shutting down' windows
+reject 'shutting down' press --pid "$child" w0
 kill -0 "$child"
 rm "$BACKSTAGE_HOME/daemon.json"
 

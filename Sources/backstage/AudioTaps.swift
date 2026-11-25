@@ -15,15 +15,16 @@ struct AudioRegistryEntry: Equatable {
     /// Made inaudible from inside (injected): a tap that attaches late can't have let anything through.
     let inaudible: Bool
 
-    init(_ app: ManagedApp) {
-        pid = app.pid; birth = app.processStart ?? 0; name = app.name; session = app.session
+    init?(_ app: ManagedApp) {
+        guard let birth = app.processStart ?? app.liveProcessBirth else { return nil }
+        pid = app.pid; self.birth = birth; name = app.name; session = app.session
         metered = app.audioMode.metered
         inaudible = app.audioMode == .inaudible
     }
 
     static func == (lhs: AudioRegistryEntry, rhs: AudioRegistryEntry) -> Bool {
         lhs.pid == rhs.pid && lhs.birth == rhs.birth && lhs.name == rhs.name
-            && Session.sameID(lhs.session, rhs.session) && lhs.metered == rhs.metered
+            && Session.sameID(lhs.session, rhs.session) && lhs.metered == rhs.metered && lhs.inaudible == rhs.inaudible
     }
 }
 
@@ -329,7 +330,7 @@ final class AudioTapManager: AudioTapControl, AudioLevelSource {
             // Snapshots can arrive out of order with a direct read (see match): confirm with a
             // fresh, successful read of the registry. A read error never unmutes.
             guard let current = try? AppStore.read(),
-                  !current.contains(where: { $0.pid == app.key.pid && $0.processStart == app.key.birth }) else { continue }
+                  !current.contains(where: { $0.pid == app.key.pid && ($0.processStart ?? $0.liveProcessBirth) == app.key.birth }) else { continue }
             destroy(app, keepFile: false, why: "handed over to the user (show): unmuted")
         }
         // Newly managed apps may already be audio clients (or have helpers that are): look at
@@ -449,7 +450,7 @@ final class AudioTapManager: AudioTapControl, AudioLevelSource {
         }
         // The launch ended a moment ago: it registered the app, and the daemon's registry view
         // may be a tick behind. Read the registry itself before deciding it's not ours.
-        let fresh = AppStore.load().map(AudioRegistryEntry.init)
+        let fresh = AppStore.load().compactMap(AudioRegistryEntry.init)
         guard !fresh.isEmpty else { return nil }
         applyRegistry(fresh, rescanAfter: false)
         if let a = root(pid) { return a }
@@ -695,7 +696,8 @@ final class AudioTapManager: AudioTapControl, AudioLevelSource {
     }
 
     private func startIO(_ app: AppTap) {
-        guard let proc = app.ioProc, let meter = app.meter, app.sampleRate > 0, app.channels > 0 else { return }
+        guard let proc = app.ioProc, let meter = app.meter, app.sampleRate >= 1, app.sampleRate <= 768_000,
+              app.channels > 0, app.channels <= 32 else { return }
         refreshGain(app)
         if app.ring == nil, let ring = RingBox(url: AudioFiles.ring(app.key.pid, app.key.birth), sampleRate: app.sampleRate,
                                                 channels: app.channels, gain: app.gain) {
@@ -708,7 +710,7 @@ final class AudioTapManager: AudioTapControl, AudioLevelSource {
             let nowTicks = mach_absolute_time()
             let gap = hostTicksToSeconds(nowTicks) - ring.header.pointee.endUptime
             if ring.header.pointee.framesWritten > 0, gap > 0 {
-                bs_ring_fill_silence(meter.pointer, UInt64(min(gap, 15) * app.sampleRate), nowTicks)
+                bs_ring_fill_silence(meter.pointer, UInt64(min(gap, audioRingSeconds) * app.sampleRate), nowTicks)
             }
         }
         let started = audioClock()
@@ -934,7 +936,7 @@ final class AudioTapManager: AudioTapControl, AudioLevelSource {
         defer { AudioHardwareDestroyAggregateDevice(made.aggregate); AudioHardwareDestroyProcessTap(made.tap) }
         let tapRate = HAL.tapFormat(made.tap)?.mSampleRate ?? 0
         let rate = HAL.nominalRate(device)
-        guard tapRate.isFinite, tapRate > 37_000, rate.isFinite, rate > 37_000 else {
+        guard tapRate > 37_000, tapRate <= 768_000, rate > 37_000, rate <= 768_000 else {
             finish(false, "the current sample rates cannot represent the 18.5 kHz probe")
             return
         }
@@ -961,8 +963,8 @@ final class AudioTapManager: AudioTapControl, AudioLevelSource {
         }
         promptQueue.sync { promptWatch.cancel() }
         result.ioSetupMs = (audioClock() - setupStart) * 1000
+        defer { if let tapProc { AudioDeviceDestroyIOProcID(made.aggregate, tapProc) } }
         guard err == noErr, let tapProc else { finish(false, "IOProc on the tap failed: \(fourCC(err))"); return }
-        defer { AudioDeviceDestroyIOProcID(made.aggregate, tapProc) }
         let tone = ProbeTone(hz: 18500, dbfs: -60, seconds: 0.5, rate: rate)
         var rendered = 0
         var outProc: AudioDeviceIOProcID?
@@ -980,8 +982,8 @@ final class AudioTapManager: AudioTapControl, AudioLevelSource {
             }
             rendered += frames
         }
+        defer { if let outProc { AudioDeviceDestroyIOProcID(device, outProc) } }
         guard outErr == noErr, let outProc else { finish(false, "couldn't play the probe on \(HAL.name(device)): \(fourCC(outErr))"); return }
-        defer { AudioDeviceDestroyIOProcID(device, outProc) }
         let tapStart = AudioDeviceStart(made.aggregate, tapProc)
         guard tapStart == noErr else { finish(false, "couldn't start the self-test tap: \(fourCC(tapStart))"); return }
         defer { AudioDeviceStop(made.aggregate, tapProc) }

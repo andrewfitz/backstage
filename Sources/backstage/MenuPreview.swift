@@ -124,9 +124,9 @@ final class MenuHeroView: NSView {
         override func layout() {
             super.layout()
             guard let parent = superview else { return }
-            let w = min(ceil(field.frame.width) + 10, parent.bounds.width - 12)
+            let w = min(ceil(field.frame.width) + 10, max(0, parent.bounds.width - 12))
             frame = NSRect(x: 6, y: 6, width: w, height: 18)
-            field.frame = NSRect(x: 5, y: ((18 - field.frame.height) / 2).rounded(.down), width: w - 10, height: field.frame.height)
+            field.frame = NSRect(x: 5, y: ((18 - field.frame.height) / 2).rounded(.down), width: max(0, w - 10), height: field.frame.height)
         }
         override func viewDidMoveToSuperview() { super.viewDidMoveToSuperview(); needsLayout = true }
         override func hitTest(_ point: NSPoint) -> NSView? { nil }
@@ -138,6 +138,7 @@ final class MenuHeroView: NSView {
         private let forward = NSButton()
         private let field = NSTextField(labelWithString: "")
         private let onPage: (Int) -> Void
+        private var toward = 0
         override var isFlipped: Bool { true }
         init(frame: NSRect, onPage: @escaping (Int) -> Void) {
             self.onPage = onPage
@@ -161,12 +162,14 @@ final class MenuHeroView: NSView {
         }
         required init?(coder: NSCoder) { fatalError("not used") }
         func update(text: String, canBack: Bool, canForward: Bool, toward: Int) {
-            field.stringValue = text
+            let textChanged = field.stringValue != text
+            guard textChanged || back.isEnabled != canBack || forward.isEnabled != canForward || self.toward != toward else { return }
+            if textChanged { field.stringValue = text; arrange() }
+            self.toward = toward
             back.isEnabled = canBack
             forward.isEnabled = canForward
             back.contentTintColor = toward < 0 && canBack ? .controlAccentColor : nil
             forward.contentTintColor = toward > 0 && canForward ? .controlAccentColor : nil
-            arrange()
         }
         override func layout() {
             super.layout()
@@ -218,7 +221,11 @@ final class DisplayPreviewView: NSView {
     private(set) var hasImage = false
     /// The display the picture is of (StatusMenu's bookkeeping when it pages).
     var shownSlot: Int?
-    var reduceMotion = NSWorkspace.shared.accessibilityDisplayShouldReduceMotion
+    var reduceMotion = NSWorkspace.shared.accessibilityDisplayShouldReduceMotion {
+        didSet {
+            if reduceMotion { imageLayer.removeAnimation(forKey: "frame") }
+        }
+    }
 
     private let canvas = NSView()
     private let imageLayer = CALayer()
@@ -311,10 +318,14 @@ final class DisplayPreviewView: NSView {
 
     /// No picture (paged to a display not captured yet): the placeholder until the first frame.
     func clearImage() {
+        imageLayer.removeAnimation(forKey: "frame")
         imageLayer.contents = nil
         hasImage = false
         isStale = false
+        message = nil
         regions = []
+        highlighted = []
+        resetPointer()
         updateState()
     }
 
@@ -330,14 +341,14 @@ final class DisplayPreviewView: NSView {
         placeholder.frame = NSRect(x: ((bounds.width - icon.width) / 2).rounded(), y: ((bounds.height - block) / 2).rounded(),
                                    width: icon.width, height: icon.height)
         let textY = hasImage ? ((bounds.height - 15) / 2).rounded() : placeholder.frame.maxY + 8
-        messageLabel.frame = NSRect(x: 12, y: textY, width: bounds.width - 24, height: 15)
+        messageLabel.frame = NSRect(x: 12, y: textY, width: max(0, bounds.width - 24), height: 15)
         layoutNameChip()
         updateOverlay()
     }
 
     private func layoutNameChip() {
         nameChip.sizeToFit()
-        nameChip.frame.size.width = min(nameChip.frame.width, bounds.width - 12)
+        nameChip.frame.size.width = min(nameChip.frame.width, max(0, bounds.width - 12))
         nameChip.frame.origin = CGPoint(x: 6, y: bounds.maxY - nameChip.frame.height - 6)
     }
 
@@ -386,7 +397,7 @@ final class DisplayPreviewView: NSView {
 
     /// The app (or the single window under the pointer) to pick out, and the rest dimmed.
     private func updateOverlay() {
-        let live = hasImage && !isStale
+        let live = hasImage && !isStale && message == nil
         let active: [Region] = hovered.map { [$0] } ?? regions.filter { highlighted.contains($0.pid) }
         let show = live && !active.isEmpty
         CATransaction.begin()
@@ -397,10 +408,11 @@ final class DisplayPreviewView: NSView {
             let outline = CGMutablePath()
             for region in active {
                 let r = rect(of: region)
+                guard r.width > 0, r.height > 0 else { continue }
                 let rounded = CGPath(roundedRect: r, cornerWidth: min(3, r.width / 2), cornerHeight: min(3, r.height / 2), transform: nil)
-                dim.addPath(rounded)
                 outline.addPath(rounded)
             }
+            dim.addPath(outline.normalized(using: .winding))
             dimLayer.path = dim
             outlineLayer.path = outline
         }
@@ -409,7 +421,11 @@ final class DisplayPreviewView: NSView {
         CATransaction.commit()
 
         let name = live ? hovered?.name : nil
-        if let name, nameChip.text != name { nameChip.text = name; layoutNameChip() }
+        if let name {
+            if nameChip.text != name { nameChip.text = name; layoutNameChip() }
+        } else if !nameChip.text.isEmpty {
+            nameChip.text = ""
+        }
         nameChip.isHidden = name == nil
     }
 
@@ -446,7 +462,9 @@ final class DisplayPreviewView: NSView {
     private func updateAccessibility() {
         var names: [String] = []
         for region in regions where !names.contains(region.name) { names.append(region.name) }
-        setAccessibilityValue(!hasImage ? (message ?? "Loading") : names.isEmpty ? "No windows" : "Showing " + names.joined(separator: ", "))
+        let value = message ?? (!hasImage ? "Loading" : isStale ? "Waiting for a live preview"
+                               : names.isEmpty ? "No windows" : "Showing " + names.joined(separator: ", "))
+        setAccessibilityValue(value)
     }
 
     /// A small dark capsule over the picture: the name of the app under the pointer.

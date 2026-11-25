@@ -169,7 +169,8 @@ private func soundDict(_ s: AudioSound) -> [String: Any] {
 
 /// The status of a live managed app, waiting briefly for the daemon to publish it.
 private func liveStatus(_ app: ManagedApp) -> AudioAppStatus? {
-    waitFor(timeout: 1, interval: 0.05) { readAudioStatus(app.pid, app.processStart) }
+    let birth = app.processStart ?? app.liveProcessBirth
+    return waitFor(timeout: 1, interval: 0.05) { readAudioStatus(app.pid, birth) }
 }
 
 /// The session's app for `audio`/`audio record`, its published status, and the daemon's audio health.
@@ -206,7 +207,8 @@ func cmdAudio(_ args: Args) throws -> [String: Any] {
     if let v = s.outputChannels, v > 2 { out["outputChannels"] = v; out["levelGainDb"] = rounded(s.levelGainDb ?? 0) }
     if let ms = s.sightToMuteMs, !ms.isEmpty { out["sightToMuteMs"] = ms.map { rounded($0, 100) } }
     if s.playing || s.sounds.contains(where: { $0.start + $0.seconds >= now - 1 }), let ring = s.ring,
-       let snap = readRing(URL(fileURLWithPath: ring), seconds: 1, endingBy: now), let hz = dominantFrequency(snap) {
+       let snap = readRing(URL(fileURLWithPath: ring), seconds: 1, endingBy: now, forFrequency: true),
+       let hz = dominantFrequency(snap) {
         out["hz"] = hz.rounded()
     }
     return out
@@ -341,13 +343,14 @@ func cmdWaitSound(_ args: Args) throws -> [String: Any] {
     let timeout = args.double("timeout") ?? 10
     let began = audioClock()
     let from = since ?? began
+    let birth = app.processStart ?? app.liveProcessBirth
     var last: AudioAppStatus?
     func counts(_ s: AudioSound) -> Bool { minDb.map { s.peakDb >= $0 } ?? true }
     let found: AudioSound?? = try waitFor(timeout: timeout, interval: 0.03) {
-        guard app.matchesProcess else {
-            throw CLIError(audioFailure(app.pid, app.processStart) ?? "app \(app.pid) exited while waiting for sound")
+        guard let birth, processBirth(app.pid) == birth else {
+            throw CLIError(audioFailure(app.pid, birth) ?? "app \(app.pid) exited while waiting for sound")
         }
-        guard let s = readAudioStatus(app.pid, app.processStart) else { return nil }
+        guard let s = readAudioStatus(app.pid, birth) else { return nil }
         last = s
         if s.tap == "failed" { throw CLIError("audio tap failed for pid \(app.pid): \(s.reason ?? "unknown"); backstage is quitting the app") }
         if gone {
@@ -473,13 +476,15 @@ struct RingSnapshot {
 }
 
 /// The last `seconds` of a published ring, cut off at `endingBy` (audio clock): frames after
-/// the newest one are silence and aren't included.
-func readRing(_ url: URL, seconds: Double, endingBy: Double? = nil) -> RingSnapshot? {
-    guard seconds.isFinite, seconds > 0, endingBy?.isFinite != false,
-          let fh = try? FileHandle(forReadingFrom: url) else { return nil }
+/// the newest one are silence and aren't included. A frequency read copies only the trailing FFT window.
+func readRing(_ url: URL, seconds: Double, endingBy: Double? = nil, forFrequency: Bool = false) -> RingSnapshot? {
+    guard seconds.isFinite, seconds > 0, endingBy?.isFinite != false else { return nil }
+    let fd = open(url.path, O_RDONLY | O_CLOEXEC | O_NONBLOCK)
+    guard fd >= 0 else { return nil }
+    let fh = FileHandle(fileDescriptor: fd, closeOnDealloc: true)
     defer { try? fh.close() }
     var info = stat()
-    guard fstat(fh.fileDescriptor, &info) == 0, info.st_size >= 64 else { return nil }
+    guard fstat(fd, &info) == 0, info.st_mode & S_IFMT == S_IFREG, info.st_size >= 64 else { return nil }
 
     func read(_ offset: UInt64, _ count: Int) -> Data? {
         guard (try? fh.seek(toOffset: offset)) != nil, let data = try? fh.read(upToCount: count),
@@ -487,11 +492,12 @@ func readRing(_ url: URL, seconds: Double, endingBy: Double? = nil) -> RingSnaps
         return data
     }
     func header() -> (rate: Double, ch: Int, cap: Int, written: UInt64, end: Double, gain: Double, sequence: UInt64)? {
-        guard let marker = read(56, 8), let data = read(0, 64), data.prefix(4) == Data("BSAR".utf8) else { return nil }
+        guard let before = read(56, 8), let data = read(0, 64), let after = read(56, 8),
+              before == after, data.prefix(4) == Data("BSAR".utf8) else { return nil }
         return data.withUnsafeBytes { raw in
             let sequence = raw.loadUnaligned(fromByteOffset: 56, as: UInt64.self)
             guard raw.loadUnaligned(fromByteOffset: 4, as: UInt32.self) == 1,
-                  sequence & 1 == 0, marker.withUnsafeBytes({ $0.loadUnaligned(as: UInt64.self) }) == sequence else { return nil }
+                  sequence & 1 == 0, before.withUnsafeBytes({ $0.loadUnaligned(as: UInt64.self) }) == sequence else { return nil }
             return (raw.loadUnaligned(fromByteOffset: 8, as: Double.self), Int(raw.loadUnaligned(fromByteOffset: 16, as: UInt32.self)),
                     Int(raw.loadUnaligned(fromByteOffset: 20, as: UInt32.self)), raw.loadUnaligned(fromByteOffset: 24, as: UInt64.self),
                     raw.loadUnaligned(fromByteOffset: 40, as: Double.self), raw.loadUnaligned(fromByteOffset: 48, as: Double.self), sequence)
@@ -507,7 +513,8 @@ func readRing(_ url: URL, seconds: Double, endingBy: Double? = nil) -> RingSnaps
         let cutoff = endingBy ?? h.end
         let skipped = Int(min(Double(available), (max(0, h.end - cutoff) * h.rate).rounded(.up)))
         let length = min(seconds, audioRingSeconds) - max(0, cutoff - h.end)
-        let want = min(available - skipped, Int((max(0, length) * h.rate).rounded()))
+        let windowFrames = min(available - skipped, Int((max(0, length) * h.rate).rounded()))
+        let want = forFrequency ? frequencyWindowFrames(windowFrames) : windowFrames
         let end = h.end - Double(skipped) / h.rate
         guard want > 0 else { return RingSnapshot(sampleRate: h.rate, channels: h.ch, endUptime: end, levelGain: gain, samples: []) }
         let firstFrame = Int((h.written - UInt64(skipped + want)) % UInt64(h.cap))
@@ -547,12 +554,18 @@ func readRing(_ url: URL, seconds: Double, endingBy: Double? = nil) -> RingSnaps
     return nil
 }
 
+private func frequencyWindowFrames(_ available: Int) -> Int {
+    guard available >= 2048 else { return 0 }
+    var frames = 2048
+    while frames * 2 <= available && frames < 65536 { frames *= 2 }
+    return frames
+}
+
 /// The strongest frequency (Hann-windowed FFT, parabolic interpolation). Useful for tones.
 func dominantFrequency(_ snap: RingSnapshot) -> Double? {
     let frames = snap.frames
-    var n = 1
-    while n * 2 <= frames && n < 65536 { n *= 2 }
-    guard n >= 2048 else { return nil }
+    let n = frequencyWindowFrames(frames)
+    guard n > 0 else { return nil }
     var mono = [Float](repeating: 0, count: n)
     let start = frames - n
     for i in 0..<n {

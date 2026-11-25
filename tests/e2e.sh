@@ -56,9 +56,8 @@ PLIST
 swiftc -O watch.swift -o "$WORK/watch"
 
 
-"$WORK/watch" "dev.backstage.testapp.${WORK##*.}" 180 "$WORK/watch.stop" > "$WORK/watch.out" 2>&1 &
-WATCH=$!
-sleep 0.3
+. ./watch.sh
+start_watch "dev.backstage.testapp.${WORK##*.}" 180 || exit 1
 
 echo "== daemon startup"
 # Started by bare name through PATH from a folder holding an unrelated `backstage` (a checkout):

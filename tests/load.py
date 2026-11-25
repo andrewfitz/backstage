@@ -19,6 +19,8 @@ import math
 import os
 import re
 import shutil
+import signal
+import tempfile
 import subprocess
 import sys
 import threading
@@ -125,6 +127,7 @@ class Worker:
         self.start = None
         self.end = None
         self.pid = None
+        self.launch_ms = None
 
     def run_bs(self, op, args, timeout=120, record=True):
         t = time.time() - self.start if self.start is not None else -1
@@ -160,7 +163,9 @@ class Worker:
         return True
 
     def ready(self, extra=None):
-        info = {"session": self.session, "pid": self.pid, "ident": ident(self.pid), "launchMs": round(self.launch_ms, 1)}
+        info = {"session": self.session, "pid": self.pid, "ident": ident(self.pid) if self.pid else None}
+        if self.launch_ms is not None:
+            info["launchMs"] = round(self.launch_ms, 1)
         info.update(extra or {})
         write_json(self.cfg["ready"], info)
 
@@ -231,8 +236,10 @@ class Worker:
                    "" if rejected(code, data) else "exit %s" % code)
         shot = os.path.join(self.cfg["dir"], "cross-%s.png" % self.session)
         _, code, data, _ = bs(self.cfg["bin"], self.session, ["screenshot", "--pid", pid, "-o", shot], 30)
-        self.check("foreign_pixels", "screenshot --pid <other session's app> rejected", rejected(code, data),
-                   "" if rejected(code, data) else "exit %s" % code)
+        wrote_foreign_shot = os.path.exists(shot)
+        self.check("foreign_pixels", "screenshot --pid <other session's app> rejected without writing an image",
+                   rejected(code, data) and not wrote_foreign_shot,
+                   "wrote " + shot if wrote_foreign_shot else "" if rejected(code, data) else "exit %s" % code)
         _, code, data, _ = bs(self.cfg["bin"], self.session, ["quit", "--pid", pid], 30)
         self.check("cross_session_termination", "quit --pid <other session's app> rejected", rejected(code, data),
                    "" if rejected(code, data) else "exit %s" % code)
@@ -548,8 +555,8 @@ class Run:
         self.failed_gates = {g: [] for g in GATES}
         self.other_failures = []
         stamp = datetime.datetime.now().strftime("%Y%m%d-%H%M%S")
-        self.out = os.path.join(a.results, "%s-n%d" % (stamp, self.n))
-        os.makedirs(self.out, exist_ok=True)
+        os.makedirs(a.results, exist_ok=True)
+        self.out = tempfile.mkdtemp(prefix="%s-n%d-" % (stamp, self.n), dir=a.results)
         with open(os.path.join(self.work, "results-path"), "w") as f:
             f.write(self.out)
         self.anchor = None
@@ -637,7 +644,7 @@ class Run:
         self.probe_out = os.path.join(d, "shareable.jsonl")
         with open(self.probe_out, "w") as f:
             self.probe = subprocess.Popen([self.a.probe, "shareable", str(self.a.shareable_interval_ms), self.probe_stop,
-                                           os.path.join(self.home, "capture.lock")], stdout=f)
+                                           os.path.join(self.home, "capture.lock")], stdout=f, start_new_session=True)
         self.children.append(self.probe)
         self.swap_start = self.swap_used_mb()
 
@@ -651,8 +658,7 @@ class Run:
             self.probe.wait(22)
         except subprocess.TimeoutExpired:
             probe_timeout = True
-            self.probe.kill()
-            self.probe.wait()
+            self.kill_child(self.probe)
         self.sampler.join(10)
         if self.sampler.is_alive():
             self.other_failures.append("resource sampler did not exit after its stop signal")
@@ -732,7 +738,8 @@ class Run:
             path = os.path.join(cfg["dir"], "worker-%s.json" % cfg["session"])
             write_json(path, cfg)
             with open(os.path.join(cfg["dir"], "worker-%s.log" % cfg["session"]), "w") as log:
-                p = subprocess.Popen([sys.executable, os.path.abspath(__file__), "worker", path], stdout=log, stderr=subprocess.STDOUT)
+                p = subprocess.Popen([sys.executable, os.path.abspath(__file__), "worker", path], stdout=log, stderr=subprocess.STDOUT,
+                                     start_new_session=True)
             self.children.append(p)
             procs.append(p)
         return procs
@@ -754,8 +761,7 @@ class Run:
                 if p.wait(max(0, deadline - time.time())) != 0:
                     self.other_failures.append("worker %s exited %d" % (p.args[-1], p.returncode))
             except subprocess.TimeoutExpired:
-                p.kill()
-                p.wait()
+                self.kill_child(p)
                 self.other_failures.append("worker %s timed out" % p.args[-1])
 
     def collect(self, cfgs, steady_end=None):
@@ -964,6 +970,10 @@ class Run:
         ms, code, data, out = self.ctl(["start"], 60)
         if not ok(code, data):
             raise RuntimeError("backstage start failed: " + out)
+        daemon_pid = data["pid"]
+        daemon_ident = ident(daemon_pid)
+        if daemon_ident is None:
+            raise RuntimeError("daemon exited after start")
         meta["daemonStartMs"] = round(ms, 1)
         _, code, status, _ = self.ctl(["status"], 30)
         meta["daemon"] = (status or {}).get("daemon")
@@ -976,6 +986,8 @@ class Run:
         if not ok(code, data):
             raise RuntimeError("anchor launch failed: " + out)
         self.anchor = {"pid": data["pid"], "ident": ident(data["pid"])}
+        if self.anchor["ident"] is None:
+            raise RuntimeError("anchor app exited after launch")
         meta["anchor"] = {"session": "anchor", "launchMs": round(ms, 1), "note": "one idle fixture kept alive for the whole run"}
         d = os.path.join(self.work, "baseline")
         os.makedirs(d)
@@ -1000,12 +1012,14 @@ class Run:
             elif w == "cycles":
                 self.cycles("cycles", a.cycles, False)
         meta["leakSnapshotEnd"] = self.snapshot()
+        if self.daemon_pid() != daemon_pid or ident(daemon_pid) != daemon_ident:
+            self.other_failures.append("original daemon no longer running before final stop")
         ms, code, data, out = bs(self.bin, "anchor", ["stop"], 60)
         deadline = time.time() + 10
-        while time.time() < deadline and (self.daemon_pid() and ident(self.daemon_pid())):
+        while time.time() < deadline and ident(daemon_pid) == daemon_ident:
             time.sleep(0.2)
         meta["finalStop"] = {"ms": round(ms, 1), "ok": ok(code, data),
-                             "daemonGone": not (self.daemon_pid() and ident(self.daemon_pid())),
+                             "daemonGone": ident(daemon_pid) != daemon_ident and self.daemon_pid() is None,
                              "fixturesLeft": self.fixtures_alive()}
         if not meta["finalStop"]["ok"]:
             self.other_failures.append("final anchor stop failed: " + out.strip()[:300])
@@ -1021,10 +1035,20 @@ class Run:
             f.write(summary_md(report))
         return report["passed"]
 
+    @staticmethod
+    def kill_child(proc):
+        # Each child is a session leader. Kill the group before reaping its leader so
+        # a worker killed during a CLI call cannot leave that call running into teardown.
+        try:
+            os.killpg(proc.pid, signal.SIGKILL)
+        except ProcessLookupError:
+            pass
+        proc.wait()
+
     def abort(self):
         for p in self.children:
-            if p.poll() is None:
-                p.kill()
+            if p.returncode is None:
+                self.kill_child(p)
 
 
 # ---------------------------------------------------------------- reporting
@@ -1182,6 +1206,10 @@ def main():
         p.error("more than 4 sessions needs --dedicated: run on a separate macOS user account or a dedicated Mac, "
                 "never on a desktop someone is using (docs/LOAD_TESTING.md)")
     a.results = os.path.abspath(a.results or os.path.join(a.root, "load-results"))
+    def terminate(signum, _frame):
+        raise SystemExit(128 + signum)
+
+    signal.signal(signal.SIGTERM, terminate)
     run = Run(a)
     try:
         return 0 if run.execute() else 1

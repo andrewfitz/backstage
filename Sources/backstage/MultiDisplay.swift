@@ -8,6 +8,9 @@ import Foundation
 /// number (created if this daemon may run it, refused if another session reserved it). Returns
 /// the slot. The daemon creates displays itself: a virtual display lives as long as its process.
 func requestDisplay(_ want: String, info: DaemonInfo, session: Session) throws -> Int {
+    guard want == "new" || Int(want).map(displaySlots.contains) == true else {
+        throw CLIError("--display takes a display number (1-8) or new")
+    }
     guard info.displays != nil else {
         throw CLIError("the running backstage daemon (pid \(info.pid)) predates --display; `backstage stop --all` replaces it")
     }
@@ -27,7 +30,11 @@ func requestDisplay(_ want: String, info: DaemonInfo, session: Session) throws -
     }
     guard reply.ok, let slot = reply.slot else { throw CLIError(reply.error ?? "display request refused") }
     // Wait until daemon.json lists it, so the caller can place windows on it.
-    guard waitFor(timeout: 5, { liveDaemon()?.entry(slot) != nil || slot == info.primarySlot ? true : nil }) != nil else {
+    guard waitFor(timeout: 5, { () -> Bool? in
+        guard let current = liveDaemon(), current.pid == info.pid, current.processStart == info.processStart,
+              current.stopping != true, current.entry(slot) != nil else { return nil }
+        return true
+    }) != nil else {
         throw CLIError("display \(slot) didn't appear in the daemon's state")
     }
     return slot
@@ -37,13 +44,15 @@ func requestDisplay(_ want: String, info: DaemonInfo, session: Session) throws -
 /// (its most recent one), else the primary.
 func launchDisplay(_ option: String?, info: DaemonInfo, session: Session) throws -> Int {
     if let want = option {
-        guard want == "new" || Int(want) != nil else { throw CLIError("--display takes a display number or new") }
         return try requestDisplay(want, info: info, session: session)
     }
-    let latest = (try? AppStore.read(matching: { Session.sameID($0.session, session.id) }))?
-        .filter { $0.matchesProcess }
+    let latest = try AppStore.read(matching: { Session.sameID($0.session, session.id) })
         .max { $0.launchedAt < $1.launchedAt }
-    if let slot = latest?.display, info.entry(slot) != nil { return slot }
+    if let slot = latest?.display, info.entry(slot) != nil {
+        // Renew the slot's lease before writing the pending launch record. The app that
+        // led us to this slot could quit before the caller can publish that record.
+        return try requestDisplay(String(slot), info: info, session: session)
+    }
     return info.primarySlot
 }
 
@@ -52,26 +61,36 @@ func cmdMove(_ args: Args) throws -> [String: Any] {
     guard let want = args.opt("display") else { throw CLIError("move needs --display N (or new)") }
     let app = try managedApp(args)
     let session = try Session.current()
+    let lifecycle = try StateLock("lifecycle.lock", shared: true)
+    defer { lifecycle.release() }
     let info = try requireDaemon()
-    let from = app.display ?? info.primarySlot
     let slot = try requestDisplay(want, info: info, session: session)
-    guard let live = liveDaemon(), let view = live.on(slot) else { throw CLIError("display \(slot) isn't running") }
-    if slot == from { return ["pid": app.pid, "display": slot, "moved": 0] }
     let lock = try Locks.app(app)
     defer { lock.release() }
+    guard let live = liveDaemon(), live.pid == info.pid, live.processStart == info.processStart,
+          live.stopping != true, let view = live.on(slot) else { throw CLIError("display \(slot) isn't running") }
     // `show` may have handed the app to the user meanwhile: then it's theirs, leave it alone.
-    var updated = 0
+    var from: Int?
     try AppStore.update { apps in
-        for i in apps.indices where apps[i].pid == app.pid && apps[i].processStart == app.processStart && apps[i].owner == app.owner {
+        guard let i = apps.firstIndex(where: {
+            $0.pid == app.pid && $0.processStart == app.processStart && $0.launchedAt == app.launchedAt
+                && Session.sameID($0.owner, app.owner)
+        }) else { return }
+        from = apps[i].display ?? live.primarySlot
+        if from != slot {
             apps[i].display = slot == live.primarySlot ? nil : slot
-            updated += 1
         }
     }
-    guard updated > 0 else { throw CLIError("pid \(app.pid) is no longer a managed app (it was shown on the user's screen or quit)") }
+    guard let from, app.matchesProcess else {
+        throw CLIError("pid \(app.pid) is no longer a managed app (it was shown on the user's screen or quit)")
+    }
+    if slot == from { return ["pid": app.pid, "display": slot, "moved": 0] }
     // Place its windows on the new display; the daemon's guard keeps them there from now on.
     var placed: [CGRect] = []
     var moved = 0
-    for w in axApp(app.pid).windows where (w.attr(kAXMinimizedAttribute) as? Bool) != true {
+    let windows = axApp(app.pid).windows
+    guard app.matchesProcess else { throw CLIError("pid \(app.pid) quit while moving its windows") }
+    for w in windows where (w.attr(kAXMinimizedAttribute) as? Bool) != true {
         placed.append(placeBeside(w, display: view.bounds, avoiding: placed))
         moved += 1
     }
@@ -84,11 +103,12 @@ func cmdMove(_ args: Args) throws -> [String: Any] {
 func displaysStatus(_ d: DaemonInfo) -> [[String: Any]] {
     let entries = d.displays ?? [DisplayEntry(slot: d.primarySlot, displayID: d.displayID, x: d.x, y: d.y, width: d.width, height: d.height)]
     let active = activeDisplays()
-    let apps = AppStore.load().filter { $0.matchesProcess }
+    var appCounts: [Int: Int] = [:]
+    for app in AppStore.load() { appCounts[app.display ?? d.primarySlot, default: 0] += 1 }
     return entries.map { e in
         var out: [String: Any] = ["display": e.slot, "displayID": e.displayID, "primary": e.slot == d.primarySlot,
                                   "globalOrigin": ["x": Int(e.x), "y": Int(e.y)],
-                                  "apps": apps.filter { ($0.display ?? d.primarySlot) == e.slot }.count]
+                                  "apps": appCounts[e.slot, default: 0]]
         if let by = e.reserved(), let until = e.reservedUntil {
             out["reservedBy"] = by
             out["reservedUntil"] = ISO8601DateFormatter().string(from: Date(timeIntervalSince1970: until))

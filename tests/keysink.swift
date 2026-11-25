@@ -1,4 +1,4 @@
-// A windowless app that backstage doesn't manage, for tests/computer-use.sh: logs every key it
+// A windowless app that backstage doesn't manage, for tests/focus.sh: logs every key it
 // receives ("key <chars>") to the file given. No window, no Dock tile, never activates, so it
 // never shows on the user's screen; input reaches it only when something posts to its PID.
 // usage: keysink <log-file>

@@ -4,7 +4,7 @@ import ApplicationServices
 
 let usage = """
 backstage — drive macOS apps on an invisible display, without touching the user's screen,
-cursor, keyboard focus or frontmost app. Output is JSON except for help, logs and plain-text trees.
+cursor, keyboard focus or frontmost app. Output is JSON except for help, version, skill, logs and plain-text trees.
 
 COORDINATES: everything uses agent-display points with (0,0) at the display's top-left.
 A default `screenshot` is cropped from (0,0), so image pixel (x,y) == click point (x,y)
@@ -44,8 +44,9 @@ LIFECYCLE
                                     and stop the daemon
   settings                          show settings (also in `status`)
   settings keep-in-menu-bar on|off  keep the menu bar icon (and the daemon) up with no apps running
-  settings hotkey <combo|off>       Send Front Window Backstage shortcut (default ctrl+opt+cmd+b);
-                                    two or more modifiers incl. cmd or ctrl, plus a letter, digit or F-key
+  settings hotkey <combo|off|default>   Send Front Window Backstage shortcut (off by default);
+                                    default chooses ctrl+opt+cmd+b. A custom shortcut needs two or
+                                    more modifiers incl. cmd or ctrl, plus a letter, digit or F-key
   logs [--pid P] [--lines N]        tail the app's stdout/stderr
   cleanup-displays                  (sudo) remove leftover backstage displays from ColorSync
   version                           print the version (also `status`'s "version")
@@ -95,7 +96,7 @@ ACT (all delivered in the background)
   click <x> <y> [--right] [--double]   mouse click at agent-display point
   click --ref <ref> [--right] [--double]
   hover <x> <y>                     best-effort: tracking-area hover effects/tooltips won't fire
-  drag <x1> <y1> <x2> <y2>
+  drag <x1> <y1> <x2> <y2> [--steps N]   interpolate over 1-1000 steps (default 20)
   scroll <x> <y> [--dy N] [--dx N]  (pixels; negative dy scrolls down)
   type <text> [--ref R]             type into the focused element (or focus R first)
   key <combo>… [--ref R]            e.g. return, esc, tab, cmd+s, cmd+shift+z, down
@@ -119,8 +120,9 @@ func managedApp(_ args: Args) throws -> ManagedApp {
         }
         return a
     }
-    let mine = try AppStore.read(matching: { Session.sameID($0.session, me) })
     if let name = args.opt("app") {
+        let visible = try AppStore.read(matching: { Session.sameID($0.session, me) || Session.isUser($0.session) })
+        let mine = visible.filter { Session.sameID($0.session, me) }
         let n = name.lowercased()
         func pick(_ apps: [ManagedApp]) -> ManagedApp? {
             apps.reversed().lazy.filter({ $0.name.lowercased() == n || $0.bundleID?.lowercased() == n })
@@ -128,34 +130,40 @@ func managedApp(_ args: Args) throws -> ManagedApp {
                 ?? apps.reversed().lazy.filter({ $0.name.lowercased().contains(n) }).max(by: { $0.launchedAt < $1.launchedAt })
         }
         // Your own apps first, then apps the user sent backstage (never another session's).
-        let sent = try AppStore.read(matching: { Session.isUser($0.session) })
-        guard let a = pick(mine) ?? pick(sent) else {
+        guard let a = pick(mine) ?? pick(visible.filter { Session.isUser($0.session) }) else {
             throw CLIError("no managed app matching '\(name)' in this session or sent backstage by the user. Yours: \(mine.map { "\($0.name)(\($0.pid))" }.joined(separator: ", "))")
         }
         return a
     }
+    let mine = try AppStore.read(matching: { Session.sameID($0.session, me) })
     guard let last = mine.max(by: { $0.launchedAt < $1.launchedAt }) else {
         throw CLIError("no managed apps in this session; run `backstage launch <app>` first")
     }
     return last
 }
 
-func managedPid(_ args: Args) throws -> pid_t { try managedApp(args).pid }
+func rejectIncompatibleDaemon() throws {
+    if let d = readJSON(Paths.daemon, DaemonInfo.self), d.protocolMismatch, d.matchesProcess {
+        throw daemonVersionError(d)
+    }
+}
 
 func requireDaemon() throws -> DaemonInfo {
-    if let d = readJSON(Paths.daemon, DaemonInfo.self), d.matchesProcess, d.protocolMismatch { throw daemonVersionError(d) }
-    guard let d = liveDaemon() else { throw CLIError("daemon not running (run `backstage launch …` or `backstage start`)") }
-    return d
+    guard let d = readJSON(Paths.daemon, DaemonInfo.self), d.matchesProcess else {
+        throw CLIError("daemon not running (run `backstage launch …` or `backstage start`)")
+    }
+    if d.protocolMismatch { throw daemonVersionError(d) }
+    guard d.stopping != true else { throw CLIError("the backstage daemon is shutting down; try again") }
+    guard let running = liveDisplay(d) else { throw CLIError("the backstage daemon's display isn't available") }
+    return running
 }
 
 /// The daemon as seen from a managed app's display: bounds and display ID are that display's,
 /// so coordinates, crops and placement are relative to it (docs/MULTI_DISPLAY_PLAN.md).
-func requireDaemon(for pid: pid_t) throws -> DaemonInfo { try daemonView(requireDaemon(), for: pid) }
-
-func daemonView(_ d: DaemonInfo, for pid: pid_t) throws -> DaemonInfo {
-    let slot = AppStore.load().first { $0.pid == pid }?.display
+func daemonView(_ d: DaemonInfo, for app: ManagedApp) throws -> DaemonInfo {
+    let slot = app.display
     guard let view = d.on(slot) else {
-        throw CLIError("display \(slot.map(String.init) ?? "?") of pid \(pid) is gone; move it with `backstage move --pid \(pid) --display \(d.primarySlot)`")
+        throw CLIError("display \(slot.map(String.init) ?? "?") of pid \(app.pid) is gone; move it with `backstage move --pid \(app.pid) --display \(d.primarySlot)`")
     }
     return view
 }
@@ -169,6 +177,7 @@ func requireInputGuard() throws {
             + "while one of its menus is open; `backstage stop --all`, then launch the app again")
     }
     if d.protocolMismatch { throw daemonVersionError(d) }
+    guard d.stopping != true else { throw CLIError("the backstage daemon is shutting down; try again") }
     guard let up = d.inputGuard else {
         throw CLIError("the running backstage daemon (pid \(d.pid)) is from an older build without the input guard; "
             + "run `backstage stop --all` (quits every managed app) to replace it, then retry")
@@ -186,20 +195,21 @@ func elementCenter(_ e: AXUIElement) throws -> CGPoint {
 
 /// Make the element's window the app's key window (within the app only — the app is never
 /// really activated, so the user's focus is untouched) so keystrokes land there.
-func focusWindowOf(_ e: AXUIElement, pid: pid_t) {
+func focusWindowOf(_ e: AXUIElement, pid: pid_t, birth: UInt64) {
     var w = e
     if w.role != "AXWindow", let win = e.attr(kAXWindowAttribute), CFGetTypeID(win) == AXUIElementGetTypeID() { w = win as! AXUIElement }
-    guard w.role == "AXWindow" else { return }
-    primeActivation(pid)
+    guard w.role == "AXWindow", w.pid == pid, processBirth(pid) == birth else { return }
+    primeActivation(pid, birth: birth)
     AXUIElementSetAttributeValue(w, kAXMainAttribute as CFString, kCFBooleanTrue)
     AXUIElementPerformAction(w, kAXRaiseAction as CFString)
     usleep(50_000)
 }
 
-func focusRef(_ ref: String?, pid: pid_t) throws {
+func focusRef(_ ref: String?, pid: pid_t, birth: UInt64) throws {
     guard let ref else { return }
     let e = try resolveRef(pid, ref)
-    focusWindowOf(e, pid: pid)
+    focusWindowOf(e, pid: pid, birth: birth)
+    guard processBirth(pid) == birth else { throw CLIError("pid \(pid) exited before it could receive input") }
     let status = AXUIElementSetAttributeValue(e, kAXFocusedAttribute as CFString, kCFBooleanTrue)
     guard status == .success else { throw CLIError("could not focus \(ref) (AXError \(status.rawValue))") }
     pump(0.05)
@@ -212,14 +222,14 @@ func elementAt(_ p: CGPoint, pid: pid_t) -> AXUIElement? {
 }
 
 /// Real (background) mouse click at a global point.
-func doClick(global p: CGPoint, pid: pid_t, args: Args) throws -> [String: Any] {
+func doClick(global p: CGPoint, pid: pid_t, birth: UInt64, args: Args) throws -> [String: Any] {
     guard let hit = hitTest(p, pids: [pid]) else { throw CLIError("no window of pid \(pid) at that point (take a screenshot / check `windows`)") }
     // A click on a non-key window is consumed as "focus this window" (same as for a human), so
     // make the target window key inside the app first. Menus/popovers aren't AX windows: skip those.
     if let w = axApp(pid).windows.first(where: { $0.windowID == hit.windowID }), (w.attr(kAXMainAttribute) as? Bool) != true {
-        focusWindowOf(w, pid: pid)
+        focusWindowOf(w, pid: pid, birth: birth)
     }
-    postClick(at: p, hit: hit, right: args.has("right"), count: args.has("double") ? 2 : 1)
+    try postClick(at: p, hit: hit, right: args.has("right"), count: args.has("double") ? 2 : 1, birth: birth)
     var res: [String: Any] = ["ok": true, "windowID": hit.windowID, "via": "mouse"]
     if let e = elementAt(p, pid: pid), let i = try? info(e, ref: "", depth: 0) {
         res["element"] = i.label.isEmpty ? i.role : "\(i.role) \(i.label.prefix(60))"
@@ -258,21 +268,24 @@ func cmdScreenshot(_ args: Args) throws -> [String: Any] {
             slot = only
         }
         guard let d = base.on(slot) else { throw CLIError("display \(slot) isn't running") }
-        let pids = Set(mine.filter { ($0.display ?? base.primarySlot) == slot }.map(\.pid))
-        guard !pids.isEmpty else { throw CLIError("none of your session's apps are on display \(slot)") }
-        let size = try capture(.apps(pids, display: d.displayID, crop: d.bounds), to: out, scale: scale)
-        return ["path": out.path, "width": Int(size.width), "height": Int(size.height), "origin": ["x": 0, "y": 0], "scale": scale,
-                "pids": pids.sorted(), "display": slot]
+        let apps = mine.filter { ($0.display ?? base.primarySlot) == slot }
+        guard !apps.isEmpty else { throw CLIError("none of your session's apps are on display \(slot)") }
+        let (size, origin) = try capture(.apps(apps, display: d, crop: d.bounds), to: out, scale: scale)
+        return ["path": out.path, "width": Int(size.width), "height": Int(size.height), "origin": ["x": r(origin.x), "y": r(origin.y)], "scale": scale,
+                "pids": Set(apps.map(\.pid)).sorted(), "display": slot]
     }
-    let pid = try managedPid(args)
-    let d = try daemonView(base, for: pid)
+    let app = try managedApp(args)
+    let pid = app.pid
+    guard let d = base.on(app.display) else {
+        throw CLIError("display \(app.display ?? base.primarySlot) of pid \(pid) is gone; move it with `backstage move --pid \(pid) --display \(base.primarySlot)`")
+    }
     let vd = d.bounds
     if let ws = args.opt("window") {
         let w = try resolveWindow(pid, ws)
-        guard let wid = w.windowID, let f = w.frame else { throw CLIError("window \(ws) has no id/frame") }
-        let size = try capture(.window(wid), to: out, scale: scale)
+        guard let wid = w.windowID else { throw CLIError("window \(ws) has no id") }
+        let (size, origin) = try capture(.window(wid, app: app, display: d), to: out, scale: scale)
         return ["path": out.path, "width": Int(size.width), "height": Int(size.height),
-                "origin": ["x": r(f.minX - vd.minX), "y": r(f.minY - vd.minY)], "scale": scale,
+                "origin": ["x": r(origin.x), "y": r(origin.y)], "scale": scale,
                 "note": "pixel (px,py) -> point (origin.x + px/scale, origin.y + py/scale)"]
     }
     // Union of the app's on-screen windows (incl. menus, sheets, popovers), cropped from the display's origin.
@@ -283,8 +296,8 @@ func cmdScreenshot(_ args: Args) throws -> [String: Any] {
     }
     guard !union.isNull else { throw CLIError("app \(pid) has no visible windows on the agent display") }
     let crop = CGRect(x: vd.minX, y: vd.minY, width: union.maxX - vd.minX, height: union.maxY - vd.minY)
-    let size = try capture(.apps([pid], display: d.displayID, crop: crop), to: out, scale: scale)
-    return ["path": out.path, "width": Int(size.width), "height": Int(size.height), "origin": ["x": 0, "y": 0], "scale": scale, "pid": pid]
+    let (size, origin) = try capture(.apps([app], display: d, crop: crop), to: out, scale: scale)
+    return ["path": out.path, "width": Int(size.width), "height": Int(size.height), "origin": ["x": r(origin.x), "y": r(origin.y)], "scale": scale, "pid": pid]
 }
 
 /// The agent display's usable area, in global points: the display below its menu bar.
@@ -300,10 +313,10 @@ func agentVisibleFrame(_ d: DaemonInfo) -> CGRect {
 
 /// `window fill` / `window size <w> <h>`: resize one of the app's windows (default: its frontmost)
 /// with AX, staying inside the agent display.
-func cmdWindow(_ args: Args, pid: pid_t) throws -> [String: Any] {
-    let d = try requireDaemon(for: pid)
+func cmdWindow(_ args: Args, app: ManagedApp) throws -> [String: Any] {
+    let d = try daemonView(requireDaemon(), for: app)
     let spec = args.opt("window") ?? "0"
-    let w = try resolveWindow(pid, spec)
+    let w = try resolveWindow(app.pid, spec)
     guard let current = w.frame else { throw CLIError("window \(spec) has no frame") }
     let area = agentVisibleFrame(d)
     let target: CGRect
@@ -332,7 +345,7 @@ func cmdWindow(_ args: Args, pid: pid_t) throws -> [String: Any] {
     w.setPosition(target.origin)
     pump(0.1)
     guard let got = w.frame else { throw CLIError("could not read window \(spec) frame after resize") }
-    var res: [String: Any] = ["ok": true, "pid": pid, "window": windowRef(w, index: Int(spec) ?? 0),
+    var res: [String: Any] = ["ok": true, "pid": app.pid, "window": windowRef(w, index: Int(spec) ?? 0),
                               "frame": rectDict(got.offsetBy(dx: -d.bounds.minX, dy: -d.bounds.minY))]
     if abs(got.width - target.width) > 1 || abs(got.height - target.height) > 1
         || abs(got.minX - target.minX) > 1 || abs(got.minY - target.minY) > 1 {
@@ -344,8 +357,9 @@ func cmdWindow(_ args: Args, pid: pid_t) throws -> [String: Any] {
 
 func cmdTree(_ args: Args) throws {
     let base = try requireDaemon()
-    let pid = try managedPid(args)
-    let d = try daemonView(base, for: pid)
+    let app = try managedApp(args)
+    let pid = app.pid
+    let d = try daemonView(base, for: app)
     let depth = args.int("depth") ?? 40
     if args.has("json") {
         var nodes: [[String: Any]] = []
@@ -369,8 +383,9 @@ func matches(_ i: ElementInfo, role: String?, text: String?) -> Bool {
 
 func cmdFind(_ args: Args) throws -> [String: Any] {
     let base = try requireDaemon()
-    let pid = try managedPid(args)
-    let d = try daemonView(base, for: pid)
+    let app = try managedApp(args)
+    let pid = app.pid
+    let d = try daemonView(base, for: app)
     let role = args.opt("role")?.lowercased(), text = (args.opt("text") ?? args.pos(0))?.lowercased()
     var out: [[String: Any]] = []
     try walkTree(pid: pid, window: args.opt("window"), maxDepth: 60) { i, _ in
@@ -384,13 +399,15 @@ func cmdWait(_ args: Args) throws -> [String: Any] {
     let role = args.opt("role"), text = args.opt("text") ?? args.pos(0)
     guard role != nil || text != nil else { throw CLIError("wait needs --text and/or --role") }
     let base = try requireDaemon()
-    let pid = try managedPid(args)
-    let d = try daemonView(base, for: pid)
+    let app = try managedApp(args)
+    let pid = app.pid
+    let d = try daemonView(base, for: app)
     let normalizedRole = role?.lowercased(), normalizedText = text?.lowercased()
     let timeout = args.double("timeout") ?? 10
     let gone = args.has("gone")
     let t0 = ProcessInfo.processInfo.systemUptime
     let found: [String: Any]? = try waitFor(timeout: timeout, interval: 0.2) {
+        guard app.matchesProcess else { throw CLIError("app \(pid) exited while waiting for an element") }
         var hit: ElementInfo?
         try walkTree(pid: pid, window: args.opt("window"), maxDepth: 60) { i, _ in
             if matches(i, role: normalizedRole, text: normalizedText) { hit = i; return false }
@@ -407,7 +424,8 @@ func cmdList(_ args: Args) throws -> [String: Any] {
     let live = liveDaemon()
     let me = try Session.current().id
     let all = args.has("all")
-    let apps = try AppStore.read(matching: { all || Session.sameID($0.session, me) }).map { a -> [String: Any] in
+    let visible = try AppStore.read(matching: { all || Session.sameID($0.session, me) || Session.isUser($0.session) })
+    let apps = visible.filter { all || Session.sameID($0.session, me) }.map { a -> [String: Any] in
         let view = live?.on(a.display)
         var d: [String: Any] = ["pid": a.pid, "name": a.name, "path": a.path, "session": a.owner,
                                 "windows": axWindowsSummary(a.pid, origin: view?.bounds.origin ?? .zero)]
@@ -423,7 +441,7 @@ func cmdList(_ args: Args) throws -> [String: Any] {
     }
     var out: [String: Any] = ["session": me, "apps": apps]
     if !all {
-        let sent = try AppStore.read(matching: { Session.isUser($0.session) })
+        let sent = visible.filter { Session.isUser($0.session) }
         if !sent.isEmpty {
             out["sentByUser"] = sent.map { ["pid": $0.pid, "name": $0.name] }
             out["note"] = "the user sent \(sent.count == 1 ? "an app" : "\(sent.count) apps") backstage (session \"user\"): "
@@ -433,12 +451,13 @@ func cmdList(_ args: Args) throws -> [String: Any] {
     let failures = recentAudioFailures(session: me, live: Set(apps.compactMap { $0["pid"] as? Int32 }))
     if !failures.isEmpty { out["audioFailures"] = failures }
     // Launches that gave up waiting for their app: the daemon registers the app here if it starts.
+    let dateFormatter = ISO8601DateFormatter()
     let pending = Launching.records().filter { $0.handedOver == true && (all || Session.sameID($0.session, me)) }
         .sorted { $0.startedAt < $1.startedAt }
         .map { r -> [String: Any] in
             ["launch": r.id, "path": r.executable ?? r.bundle, "log": r.log, "session": r.session,
-             "startedAt": ISO8601DateFormatter().string(from: Date(timeIntervalSince1970: r.startedAt)),
-             "until": ISO8601DateFormatter().string(from: Date(timeIntervalSince1970: r.startedAt + Launching.handOverWindow))]
+             "startedAt": dateFormatter.string(from: Date(timeIntervalSince1970: r.startedAt)),
+             "until": dateFormatter.string(from: Date(timeIntervalSince1970: r.startedAt + Launching.handOverWindow))]
         }
     if !pending.isEmpty { out["pendingLaunches"] = pending }
     return out
@@ -483,8 +502,9 @@ func cmdStatus(doctor: Bool = false) throws -> [String: Any] {
         s["session"] = ["error": "\(error)"]
     }
     s["managedApps"] = try AppStore.read().map { ["pid": $0.pid, "name": $0.name, "session": $0.owner] }
-    var settings = Settings.load().json()
-    if let d = live { settings.merge(hotkeyState(d, wanted: Settings.load().effectiveHotKey)) { _, new in new } }
+    let loadedSettings = Settings.load()
+    var settings = loadedSettings.json()
+    if let d = live { settings.merge(hotkeyState(d, wanted: loadedSettings.effectiveHotKey)) { _, new in new } }
     s["settings"] = settings
     let audio = doctor ? audioDoctor() : audioSummary(live)
     s["audio"] = audio
@@ -514,6 +534,7 @@ func cmdQuit(_ args: Args) throws -> [String: Any] {
     let pid = target.pid
     let lock = try Locks.session(target.owner)
     defer { lock.release() }
+    try rejectIncompatibleDaemon()
     guard let record = try AppStore.read(matching: {
         $0.pid == pid && $0.processStart == target.processStart && Session.sameID($0.owner, target.owner)
     }).first else {
@@ -522,15 +543,15 @@ func cmdQuit(_ args: Args) throws -> [String: Any] {
     let force = args.has("force")
     try record.requestTermination(force: force)
     let gone = waitFor(timeout: force ? 7 : 5) { record.matchesProcess ? nil : true } != nil
-    if !gone && !force {
-        return ["ok": false, "pid": pid, "note": "app didn't quit (unsaved-changes dialog?). Inspect with screenshot/tree, or use --force"]
+    if !gone {
+        let error = force ? "app didn't exit after forced termination" :
+            "app didn't quit (unsaved-changes dialog?). Inspect with screenshot/tree, or use --force"
+        return ["ok": false, "pid": pid, "note": error, "error": error]
     }
-    if gone {
-        // Prune by process identity so a concurrent registration survives PID reuse.
-        try AppStore.update { _ in }
-        Locks.pruneAppLocks()
-    }
-    return ["ok": gone, "pid": pid]
+    // Prune by process identity so a concurrent registration survives PID reuse.
+    try AppStore.update { _ in }
+    Locks.pruneAppLocks()
+    return ["ok": true, "pid": pid]
 }
 
 func cmdLogs(_ args: Args) throws {
@@ -583,27 +604,40 @@ func run() throws {
 
     // Input commands hold the target app's lock from focus through the last event, so two
     // clients typing into one app can't interleave. Other apps are unaffected.
-    var input: (pid: pid_t, lock: StateLock)?
+    var input: (app: ManagedApp, birth: UInt64, lock: StateLock)?
+    defer { input?.lock.release() }
     if ["press", "focus", "action", "set", "click", "hover", "drag", "scroll", "type", "key", "menu", "window"].contains(cmd) {
         let app = try managedApp(args)
+        guard let birth = app.processStart ?? processBirth(app.pid) else {
+            throw CLIError("pid \(app.pid) is no longer a live managed app in this session")
+        }
         let lock = try Locks.app(app)
         // A handoff may have completed while this input command was waiting for the app lock.
-        guard try !AppStore.read(matching: {
+        guard let checked = try AppStore.read(matching: {
             $0.pid == app.pid && $0.processStart == app.processStart && Session.sameID($0.owner, app.owner)
-        }).isEmpty else {
+        }).first, app.processStart != nil || processBirth(app.pid) == birth else {
             throw CLIError("pid \(app.pid) is no longer a live managed app in this session")
         }
         if cmd != "window" { try requireInputGuard() }
-        input = (app.pid, lock)
+        input = (checked, birth, lock)
     }
-    defer { input?.lock.release() }
-    func inputTarget() throws -> pid_t { try input?.pid ?? managedPid(args) }
+    func inputTarget() throws -> (app: ManagedApp, birth: UInt64) {
+        guard let input, processBirth(input.app.pid) == input.birth else {
+            throw CLIError("managed app exited before it could receive input")
+        }
+        return (input.app, input.birth)
+    }
+    func inputOnDisplay() throws -> (pid: pid_t, birth: UInt64, daemon: DaemonInfo) {
+        let base = try requireDaemon()
+        let (app, birth) = try inputTarget()
+        return (app.pid, birth, try daemonView(base, for: app))
+    }
 
     switch cmd {
     case "__menu-thumbnail":
         try runMenuThumbnail(args)
     case "__guard-selftest":
-        let result = guardSelfTest()
+        let result = guardSelfTest(rejectedHelperPID: args.int("pid").flatMap(pid_t.init(exactly:)))
         emit(result)
         if result["ok"] as? Bool != true { exit(1) }
     case "__audio-taps":
@@ -618,7 +652,7 @@ func run() throws {
         var stop = false
         for sig in [SIGTERM, SIGINT] { signal(sig) { _ in exit(0) } }
         while !stop {
-            let entries = AppStore.load().map(AudioRegistryEntry.init)
+            let entries = AppStore.load().compactMap(AudioRegistryEntry.init)
             if entries != last { last = entries; taps.updateRegistry(entries) }
             pump(0.25)
             stop = FileManager.default.fileExists(atPath: Paths.dir.appendingPathComponent("audio-taps.stop").path)
@@ -683,23 +717,28 @@ func run() throws {
         emit(result)
         if result["ok"] as? Bool == false { exit(1) }
     case "logs": try cmdLogs(args)
-    case "window": emit(try cmdWindow(args, pid: try inputTarget()))
+    case "window": emit(try cmdWindow(args, app: try inputTarget().app))
     case "windows":
-        let base = try requireDaemon(); let pid = try managedPid(args); let d = try daemonView(base, for: pid)
-        emit(["pid": pid, "windows": axWindowsSummary(pid, origin: d.bounds.origin)])
+        let base = try requireDaemon()
+        let app = try managedApp(args)
+        let d = try daemonView(base, for: app)
+        emit(["pid": app.pid, "windows": axWindowsSummary(app.pid, origin: d.bounds.origin)])
     case "screenshot", "shot": emit(try cmdScreenshot(args))
     case "tree": try cmdTree(args)
     case "find": emit(try cmdFind(args))
     case "wait": emit(try args.has("sound") ? cmdWaitSound(args) : cmdWait(args))
     case "press", "focus", "action", "set":
-        let pid = try inputTarget()
+        let (app, birth) = try inputTarget()
+        let pid = app.pid
         guard let ref = args.pos(0) else { throw CLIError("usage: backstage \(cmd) <ref>") }
         let e = try resolveRef(pid, ref)
+        _ = try inputTarget()
         let rc: AXError
         switch cmd {
         case "press": rc = AXUIElementPerformAction(e, kAXPressAction as CFString)
         case "focus":
-            focusWindowOf(e, pid: pid)
+            focusWindowOf(e, pid: pid, birth: birth)
+            _ = try inputTarget()
             rc = AXUIElementSetAttributeValue(e, kAXFocusedAttribute as CFString, kCFBooleanTrue)
         case "action":
             guard let a = args.pos(1) else { throw CLIError("usage: backstage action <ref> <AXAction>") }
@@ -707,14 +746,21 @@ func run() throws {
         default:
             guard let v = args.pos(1) else { throw CLIError("usage: backstage set <ref> <value>") }
             let cur = e.attr(kAXValueAttribute)
-            let val: CFTypeRef = (cur is NSNumber) ? (Double(v).map { NSNumber(value: $0) } ?? v as NSString) : v as NSString
+            let val: CFTypeRef
+            if cur is NSNumber, let number = Double(v) {
+                guard number.isFinite else { throw CLIError("numeric element values must be finite") }
+                val = NSNumber(value: number)
+            } else {
+                val = v as NSString
+            }
+            _ = try inputTarget()
             rc = AXUIElementSetAttributeValue(e, kAXValueAttribute as CFString, val)
         }
         guard rc == .success else { throw CLIError("\(cmd) failed: AXError \(rc.rawValue)\(rc == .actionUnsupported ? " (unsupported — try `click --ref \(ref)`)" : "")") }
         pump(0.15)
         emit(["ok": true])
     case "click":
-        let base = try requireDaemon(); let pid = try inputTarget(); let d = try daemonView(base, for: pid)
+        let (pid, birth, d) = try inputOnDisplay()
         var res: [String: Any]
         var location: CGPoint?
         if let ref = args.opt("ref") {
@@ -722,56 +768,62 @@ func run() throws {
             let e = try resolveRef(pid, ref)
             location = try? elementCenter(e)
             if !args.has("right") && !args.has("double") && !args.has("raw") && e.actions.contains(kAXPressAction as String),
+               processBirth(pid) == birth,
                AXUIElementPerformAction(e, kAXPressAction as CFString) == .success {
                 res = ["ok": true, "via": "ax-press"]
             } else {
                 guard let location, d.bounds.contains(location) else { throw CLIError("element has no clickable center on the agent display") }
-                res = try doClick(global: location, pid: pid, args: args)
+                res = try doClick(global: location, pid: pid, birth: birth, args: args)
             }
         } else {
             let p = try point(args, 0, d.bounds)
             location = p
-            res = try doClick(global: p, pid: pid, args: args)
+            res = try doClick(global: p, pid: pid, birth: birth, args: args)
         }
-        if let location { res["at"] = ["x": r(location.x - d.bounds.minX), "y": r(location.y - d.bounds.minY)] }
+        if let location, let x = Int(exactly: (location.x - d.bounds.minX).rounded()),
+           let y = Int(exactly: (location.y - d.bounds.minY).rounded()) {
+            res["at"] = ["x": x, "y": y]
+        }
         pump(0.15)
         emit(res)
     case "hover":
-        let base = try requireDaemon(); let pid = try inputTarget(); let d = try daemonView(base, for: pid)
+        let (pid, birth, d) = try inputOnDisplay()
         let p = try point(args, 0, d.bounds)
         guard let hit = hitTest(p, pids: [pid]) else { throw CLIError("no window of pid \(pid) at that point") }
         if let w = axApp(pid).windows.first(where: { $0.windowID == hit.windowID }), (w.attr(kAXMainAttribute) as? Bool) != true {
-            focusWindowOf(w, pid: pid)
+            focusWindowOf(w, pid: pid, birth: birth)
         }
-        primeActivation(pid)
+        primeActivation(pid, birth: birth)
         // A short approach path so enter/move handlers see motion, not a single teleport.
         for i in stride(from: 4, through: 0, by: -1) {
-            postMove(to: CGPoint(x: p.x - CGFloat(i * 3), y: p.y), hit: hit); usleep(15_000)
+            try postMove(to: CGPoint(x: p.x - CGFloat(i * 3), y: p.y), hit: hit, birth: birth); usleep(15_000)
         }
         pump(0.1); emit(["ok": true])
     case "drag":
-        let base = try requireDaemon(); let pid = try inputTarget(); let d = try daemonView(base, for: pid)
+        let (pid, birth, d) = try inputOnDisplay()
         let a = try point(args, 0, d.bounds), b = try point(args, 2, d.bounds)
         guard let hit = hitTest(a, pids: [pid]) else { throw CLIError("no window of pid \(pid) at start point") }
-        postDrag(from: a, to: b, hit: hit, steps: args.int("steps") ?? 20); pump(0.15); emit(["ok": true])
+        try postDrag(from: a, to: b, hit: hit, steps: args.int("steps") ?? 20, birth: birth); pump(0.15); emit(["ok": true])
     case "scroll":
-        let base = try requireDaemon(); let pid = try inputTarget(); let d = try daemonView(base, for: pid)
+        let (pid, birth, d) = try inputOnDisplay()
         let p = try point(args, 0, d.bounds)
         guard let hit = hitTest(p, pids: [pid]) else { throw CLIError("no window of pid \(pid) at that point") }
-        postScroll(at: p, hit: hit, dx: Int32(args.int("dx") ?? 0), dy: Int32(args.int("dy") ?? -100)); pump(0.15); emit(["ok": true])
+        try postScroll(at: p, hit: hit, dx: Int32(args.int("dx") ?? 0), dy: Int32(args.int("dy") ?? -100), birth: birth); pump(0.15); emit(["ok": true])
     case "type":
-        let pid = try inputTarget()
+        let (app, birth) = try inputTarget()
+        let pid = app.pid
         guard let text = args.pos(0) else { throw CLIError("usage: backstage type <text> [--ref R]") }
-        try focusRef(args.opt("ref"), pid: pid)
-        postText(pid: pid, text: text); pump(0.1); emit(["ok": true, "chars": text.count])
+        try focusRef(args.opt("ref"), pid: pid, birth: birth)
+        try postText(pid: pid, text: text, birth: birth); pump(0.1); emit(["ok": true, "chars": text.count])
     case "key":
-        let pid = try inputTarget()
+        let (app, birth) = try inputTarget()
+        let pid = app.pid
         let keys = try args.positional.map(parseCombo)
-        try focusRef(args.opt("ref"), pid: pid)
-        postKeys(pid: pid, keys: keys)
+        try focusRef(args.opt("ref"), pid: pid, birth: birth)
+        try postKeys(pid: pid, keys: keys, birth: birth)
         pump(0.1); emit(["ok": true])
     case "menu":
-        let pid = try inputTarget()
+        let pid = try inputTarget().app.pid
         guard let path = args.pos(0) else { throw CLIError("usage: backstage menu \"File > Save\"") }
         try pressMenu(pid: pid, path: path); pump(0.2); emit(["ok": true])
     default:

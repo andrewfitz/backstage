@@ -190,7 +190,10 @@ final class AudioMeter {
         silentSince = nil
         readings = [Float](repeating: -.infinity, count: Self.barCount)
         removeBars()
-        if let button, button.image !== icon { button.image = icon }
+        if let button {
+            button.layer?.removeAnimation(forKey: "meterFade")
+            if button.image !== icon { button.image = icon }
+        }
         if playingApp != nil { playingApp = nil; onChange?() }
     }
 

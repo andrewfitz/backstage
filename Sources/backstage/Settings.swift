@@ -16,9 +16,26 @@ struct Settings: Codable, Equatable {
 
     static func load() -> Settings { readJSON(url, Settings.self) ?? Settings() }
 
-    func save() throws {
-        try Paths.ensure()
-        try writeJSON(Settings.url, self)
+    /// Serialize updates from the CLI and menu, preserving keys from newer versions.
+    @discardableResult
+    static func update(_ change: (inout Settings) -> Void) throws -> (settings: Settings, stamp: String) {
+        let lock = try StateLock("settings.lock")
+        defer { lock.release() }
+        let destination = try configurationTarget(url)
+        let data = try configurationData(destination) ?? Data("{}".utf8)
+        let current = try JSONDecoder().decode(Settings.self, from: data)
+        guard var object = try JSONSerialization.jsonObject(with: data) as? [String: Any] else {
+            throw CLIError("invalid settings in \(url.path)")
+        }
+        var updated = current
+        change(&updated)
+        if updated != current {
+            if updated.keepInMenuBar != current.keepInMenuBar { object["keepInMenuBar"] = updated.keepInMenuBar }
+            if updated.hotkey != current.hotkey { object["hotkey"] = updated.hotkey }
+            let output = try JSONSerialization.data(withJSONObject: object, options: [.prettyPrinted, .sortedKeys])
+            try output.write(to: destination, options: .atomic)
+        }
+        return (updated, settingsStamp())
     }
 
     var keep: Bool { keepInMenuBar ?? false }
@@ -180,32 +197,30 @@ final class GlobalHotKey {
 
 /// `backstage settings` / `settings keep-in-menu-bar on|off` / `settings hotkey <combo|off>`.
 func cmdSettings(_ args: Args) throws -> [String: Any] {
-    var settings = Settings.load()
-    var changed = false
+    let change: ((inout Settings) -> Void)?
     switch (args.pos(0), args.pos(1)) {
-    case (nil, nil): break
+    case (nil, nil): change = nil
     case ("keep-in-menu-bar", let value?):
         switch value.lowercased() {
-        case "on", "true", "yes", "1": settings.keepInMenuBar = true
-        case "off", "false", "no", "0": settings.keepInMenuBar = false
+        case "on", "true", "yes", "1": change = { $0.keepInMenuBar = true }
+        case "off", "false", "no", "0": change = { $0.keepInMenuBar = false }
         default: throw CLIError("usage: backstage settings keep-in-menu-bar on|off")
         }
-        changed = true
     case ("hotkey", let value?):
-        if value.lowercased() == "off" || value.lowercased() == "none" { settings.hotkey = "off" }
-        else if value.lowercased() == "default" { settings.hotkey = HotKeyCombo.defaultSpec }
+        if value.lowercased() == "off" || value.lowercased() == "none" { change = { $0.hotkey = "off" } }
+        else if value.lowercased() == "default" { change = { $0.hotkey = HotKeyCombo.defaultSpec } }
         else {
             let combo = try HotKeyCombo(value)
             if combo.systemShortcutConflict() {
                 throw CLIError("\(combo.symbols) is a macOS keyboard shortcut (System Settings › Keyboard › Keyboard Shortcuts), which would take the press first; pick another")
             }
-            settings.hotkey = combo.spec
+            change = { $0.hotkey = combo.spec }
         }
-        changed = true
     default:
         throw CLIError("usage: backstage settings [keep-in-menu-bar on|off | hotkey <combo|off>]  (combo e.g. ctrl+opt+cmd+b)")
     }
-    if changed { try settings.save() }
+    let update = try change.map(Settings.update)
+    let settings = update?.settings ?? Settings.load()
     var out = settings.json()
     out["ok"] = true
     out["file"] = Settings.url.path
@@ -215,11 +230,13 @@ func cmdSettings(_ args: Args) throws -> [String: Any] {
         return out
     }
     out["daemon"] = daemon.pid
-    if changed {
+    if let update {
         // The daemon picks the file up within half a second; wait for it to say what it registered.
         let want = settings.effectiveHotKey
         let published = waitFor(timeout: 3) { () -> DaemonInfo? in
-            guard let d = readJSON(Paths.daemon, DaemonInfo.self), d.settingsApplied == settingsStamp() else { return nil }
+            guard let d = readJSON(Paths.daemon, DaemonInfo.self),
+                  d.pid == daemon.pid, d.processStart == daemon.processStart,
+                  d.settingsApplied == update.stamp else { return nil }
             return d
         }
         if let d = published { out.merge(hotkeyState(d, wanted: want)) { _, new in new } }
@@ -234,7 +251,9 @@ func cmdSettings(_ args: Args) throws -> [String: Any] {
 /// What the running daemon did with the hotkey, for `settings` and `status`.
 func hotkeyState(_ d: DaemonInfo, wanted: String?) -> [String: Any] {
     if let error = d.hotkeyError { return ["hotkeyRegistered": false, "hotkeyError": error] }
-    if let registered = d.hotkey { return ["hotkeyRegistered": registered == wanted] }
+    if let registered = d.hotkey, let wanted, let combo = try? HotKeyCombo(wanted) {
+        return ["hotkeyRegistered": registered == combo.spec]
+    }
     return ["hotkeyRegistered": false]
 }
 

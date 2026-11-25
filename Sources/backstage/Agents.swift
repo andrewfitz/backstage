@@ -206,25 +206,35 @@ func handOver(_ record: ManagedApp, wait: Bool = true) throws -> (unmuted: Bool,
     defer { owner.release() }
     let input = try Locks.app(record, nonblocking: !wait)
     defer { input.release() }
+    try rejectIncompatibleDaemon()
     func same(_ a: ManagedApp) -> Bool {
         a.pid == pid && a.processStart == record.processStart && Session.sameID(a.owner, record.owner)
     }
     guard AppStore.load().contains(where: same) else { throw CLIError("pid \(pid) is not a live managed app") }
     guard let target = userDisplayBounds().first else { throw CLIError("no user display available for handoff") }
-    guard let app = NSRunningApplication(processIdentifier: pid), record.matchesProcess else { throw CLIError("app \(pid) is gone") }
+    guard let birth = record.liveProcessBirth,
+          let app = NSRunningApplication(processIdentifier: pid) else { throw CLIError("app \(pid) is gone") }
+    func checkProcess() throws {
+        guard processBirth(pid) == birth else { throw CLIError("app \(pid) exited during handoff") }
+    }
+    try checkProcess()
     try AppStore.update { $0.removeAll(where: same) }
     pump(0.2) // the daemon re-reads the app list on change; give it a beat so it stops pulling windows back
     // The daemon sees the handover and destroys the app's tap: from then on the user hears it.
     let status = record.processStart.map { AudioFiles.status(pid, $0) }
     let unmuted = !wait || status == nil
         || waitFor(timeout: 2, { FileManager.default.fileExists(atPath: status!.path) ? nil : true }) != nil
+    try checkProcess()
     for (i, w) in axApp(pid).windows.enumerated() {
         let size = w.size ?? CGSize(width: 600, height: 400)
         let x = target.midX - size.width / 2 + CGFloat(i * 30), y = max(target.minY + 60, target.midY - size.height / 2 + CGFloat(i * 30))
+        try checkProcess()
         w.setPosition(CGPoint(x: x, y: y))
     }
+    try checkProcess()
     // A regular app again (Dock tile, ⌘-Tab) before it's activated for the user.
     let dock = restoreDock(pid)
+    try checkProcess()
     // Activation: AX first (works regardless of cooperative-activation rules), then AppKit.
     AXUIElementSetAttributeValue(axApp(pid), kAXFrontmostAttribute as CFString, kCFBooleanTrue)
     if !app.isActive { app.activate() }
@@ -274,7 +284,7 @@ func selfCommandPath() -> String {
     if a0.contains("/") { return URL(fileURLWithPath: a0).standardizedFileURL.path }
     for dir in (ProcessInfo.processInfo.environment["PATH"] ?? "").split(separator: ":") {
         let p = "\(dir)/\(a0)"
-        if FileManager.default.isExecutableFile(atPath: p) { return p }
+        if FileManager.default.isExecutableFile(atPath: p) { return URL(fileURLWithPath: p).standardizedFileURL.path }
     }
     return Bundle.main.executablePath ?? a0
 }
@@ -296,18 +306,52 @@ let tomlBegin = "# >>> backstage hook (managed by `backstage install`) >>>"
 let tomlEnd = "# <<< backstage hook <<<"
 private let tomlBeginAfterMissingNewline = tomlBegin + " (added separator)"
 
+/// Atomic replacement must target the file behind a user-managed symlink.
+func configurationTarget(_ url: URL) throws -> URL {
+    var metadata = stat()
+    if lstat(url.path, &metadata) != 0 {
+        if errno == ENOENT { return url }
+        throw POSIXError(POSIXErrorCode(rawValue: errno) ?? .EIO)
+    }
+    let target = url.resolvingSymlinksInPath()
+    guard stat(target.path, &metadata) == 0, metadata.st_mode & S_IFMT == S_IFREG else {
+        throw CLIError("expected a regular configuration file at \(url.path)")
+    }
+    return target
+}
+
+func configurationData(_ url: URL) throws -> Data? {
+    do { return try Data(contentsOf: url) }
+    catch CocoaError.fileReadNoSuchFile { return nil }
+}
+
 private func backup(_ url: URL) throws {
     let bak = url.appendingPathExtension("backstage-bak")
-    if FileManager.default.fileExists(atPath: url.path), !FileManager.default.fileExists(atPath: bak.path) {
-        try FileManager.default.copyItem(at: url, to: bak)
+    do { try FileManager.default.copyItem(at: url, to: bak) }
+    catch CocoaError.fileWriteFileExists { }
+}
+
+/// Install and uninstall for one agent share the directory lock, regardless of BACKSTAGE_HOME.
+private func withAgentLock<T>(_ agent: Agent, create: Bool, _ body: () throws -> T) throws -> T? {
+    if create { try FileManager.default.createDirectory(at: agent.root, withIntermediateDirectories: true) }
+    let fd = open(agent.root.path, O_RDONLY | O_DIRECTORY | O_CLOEXEC)
+    if fd < 0 {
+        if !create && errno == ENOENT { return nil }
+        throw POSIXError(POSIXErrorCode(rawValue: errno) ?? .EIO)
     }
+    defer { close(fd) }
+    while flock(fd, LOCK_EX) != 0 {
+        if errno != EINTR { throw POSIXError(POSIXErrorCode(rawValue: errno) ?? .EIO) }
+    }
+    return try body()
 }
 
 /// Add/remove our PreToolUse entry in a Claude-style JSON hooks file, leaving everything else intact.
 private func editJSONHooks(_ url: URL, matcher: String, command: String?) throws -> String {
+    let target = try configurationTarget(url)
     var root: [String: Any] = [:]
-    if FileManager.default.fileExists(atPath: url.path) {
-        let d = try Data(contentsOf: url)
+    let source = try configurationData(target)
+    if let d = source {
         guard let obj = try JSONSerialization.jsonObject(with: d) as? [String: Any] else { throw CLIError("\(url.path) is not a JSON object; not touching it") }
         root = obj
     }
@@ -315,6 +359,7 @@ private func editJSONHooks(_ url: URL, matcher: String, command: String?) throws
           var pre = (hooks["PreToolUse"] ?? [[String: Any]]()) as? [[String: Any]] else {
         throw CLIError("invalid hooks or PreToolUse in \(url.path)")
     }
+    let previous = pre
     var removed = false
     pre = try pre.compactMap { group in
         guard let entries = group["hooks"] as? [[String: Any]] else {
@@ -330,21 +375,25 @@ private func editJSONHooks(_ url: URL, matcher: String, command: String?) throws
     }
     if let command {
         pre.append(["matcher": matcher, "hooks": [["type": "command", "command": command, "timeout": 5]]])
+        if NSArray(array: pre).isEqual(to: previous) { return "hook already installed" }
     } else if !removed {
         return "no backstage hook present"
     }
     hooks["PreToolUse"] = pre.isEmpty ? nil : pre
     root["hooks"] = hooks.isEmpty ? nil : hooks
-    try backup(url)
-    try FileManager.default.createDirectory(at: url.deletingLastPathComponent(), withIntermediateDirectories: true)
+    if source != nil { try backup(target) }
     let out = try JSONSerialization.data(withJSONObject: root, options: [.prettyPrinted, .withoutEscapingSlashes])
-    try out.write(to: url, options: .atomic)
+    try out.write(to: target, options: .atomic)
     return command == nil ? "removed hook" : (removed ? "updated hook" : "added hook")
 }
 
 /// Same for Grok's config.toml, using a marked block so it can be removed cleanly.
 private func editTOMLHooks(_ url: URL, matcher: String, command: String?) throws -> String {
-    var text = FileManager.default.fileExists(atPath: url.path) ? try String(contentsOf: url, encoding: .utf8) : ""
+    let target = try configurationTarget(url)
+    let source = try configurationData(target)
+    guard var text = String(data: source ?? Data(), encoding: .utf8) else {
+        throw CLIError("invalid UTF-8 in \(url.path)")
+    }
     var removed = false
     let lines = text.components(separatedBy: "\n")
     let markers = lines.map { $0.hasSuffix("\r") ? String($0.dropLast()) : $0 }
@@ -393,9 +442,10 @@ private func editTOMLHooks(_ url: URL, matcher: String, command: String?) throws
     } else if !removed {
         return "no backstage hook present"
     }
-    try backup(url)
-    try FileManager.default.createDirectory(at: url.deletingLastPathComponent(), withIntermediateDirectories: true)
-    try text.write(to: url, atomically: true, encoding: .utf8)
+    let output = Data(text.utf8)
+    if output == source { return "hook already installed" }
+    if source != nil { try backup(target) }
+    try output.write(to: target, options: .atomic)
     return command == nil ? "removed hook" : (removed ? "updated hook" : "added hook")
 }
 
@@ -420,34 +470,45 @@ func cmdInstall(_ args: Args) throws -> [String: Any] {
     let command = "'\(path)'" + hookSuffix + ownershipComment
     var report: [String: Any] = [:]
     for a in agents {
-        var r: [String: Any] = [:]
-        let skill = a.skillDir.appendingPathComponent("SKILL.md")
-        var skillNeedsWrite = true
-        if FileManager.default.fileExists(atPath: skill.path) {
-            let existing = try String(contentsOf: skill, encoding: .utf8)
-            guard isBackstageSkill(existing) else {
-                throw CLIError("found a different skill at \(skill.path); move it before installing")
+        report[a.rawValue] = try withAgentLock(a, create: true) {
+            var r: [String: Any] = [:]
+            let skill = a.skillDir.appendingPathComponent("SKILL.md")
+            let target = try configurationTarget(skill)
+            let previous = try configurationData(target)
+            let output = Data(skillMarkdown.utf8)
+            if let previous {
+                guard let existing = String(data: previous, encoding: .utf8), isBackstageSkill(existing) else {
+                    throw CLIError("found a different skill at \(skill.path); move it before installing")
+                }
+                var metadata = stat()
+                if previous != output, lstat(skill.path, &metadata) == 0, metadata.st_mode & S_IFMT == S_IFLNK {
+                    throw CLIError("found a linked skill at \(skill.path); update its target before installing")
+                }
             }
-            skillNeedsWrite = existing != skillMarkdown
-        }
-        if args.has("hooks") {
-            r["hook"] = a == .grok ? try editTOMLHooks(a.hookFile, matcher: a.hookMatcher, command: command)
-                                   : try editJSONHooks(a.hookFile, matcher: a.hookMatcher, command: command)
-            r["hookFile"] = a.hookFile.path
-        }
-        if skillNeedsWrite {
-            if FileManager.default.fileExists(atPath: skill.path) {
-                // An older or locally edited backstage skill: upgrade it, keeping a copy.
-                let bak = skill.appendingPathExtension("backstage-bak")
-                try? FileManager.default.removeItem(at: bak)
-                try FileManager.default.copyItem(at: skill, to: bak)
-                r["previousSkill"] = bak.path
+            if args.has("hooks") {
+                r["hook"] = a == .grok ? try editTOMLHooks(a.hookFile, matcher: a.hookMatcher, command: command)
+                                       : try editJSONHooks(a.hookFile, matcher: a.hookMatcher, command: command)
+                r["hookFile"] = a.hookFile.path
             }
-            try FileManager.default.createDirectory(at: a.skillDir, withIntermediateDirectories: true)
-            try skillMarkdown.write(to: skill, atomically: true, encoding: .utf8)
+            if previous != output {
+                if previous != nil {
+                    // Keep the previous copy without replacing any existing backup.
+                    let bak = skill.appendingPathExtension("backstage-bak")
+                    do {
+                        try FileManager.default.copyItem(at: target, to: bak)
+                        r["previousSkill"] = bak.path
+                    } catch CocoaError.fileWriteFileExists {
+                        let next = bak.appendingPathExtension(UUID().uuidString)
+                        try FileManager.default.copyItem(at: target, to: next)
+                        r["previousSkill"] = next.path
+                    }
+                }
+                try FileManager.default.createDirectory(at: a.skillDir, withIntermediateDirectories: true)
+                try output.write(to: target, options: .atomic)
+            }
+            r["skill"] = skill.path
+            return r
         }
-        r["skill"] = skill.path
-        report[a.rawValue] = r
     }
     var out: [String: Any] = ["ok": true, "installed": report]
     if args.has("hooks") {
@@ -462,23 +523,26 @@ func cmdInstall(_ args: Args) throws -> [String: Any] {
 func cmdUninstall(_ args: Args) throws -> [String: Any] {
     var report: [String: Any] = [:]
     for a in selectedAgents(args) {
-        var r: [String: Any] = [:]
-        let skill = a.skillDir.appendingPathComponent("SKILL.md")
-        if FileManager.default.fileExists(atPath: a.hookFile.path) {
+        report[a.rawValue] = try withAgentLock(a, create: false) {
+            var r: [String: Any] = [:]
+            let skill = a.skillDir.appendingPathComponent("SKILL.md")
             r["hook"] = a == .grok ? try editTOMLHooks(a.hookFile, matcher: a.hookMatcher, command: nil)
                                    : try editJSONHooks(a.hookFile, matcher: a.hookMatcher, command: nil)
-        }
-        if FileManager.default.fileExists(atPath: skill.path) {
-            if isBackstageSkill(try String(contentsOf: skill, encoding: .utf8)) {
-                try FileManager.default.removeItem(at: skill)
-                // rmdir removes only an empty directory, even if another writer adds a file.
-                _ = rmdir(a.skillDir.path)
-                r["skill"] = "removed"
-            } else {
-                r["skill"] = "preserved different skill"
+            var metadata = stat()
+            if lstat(skill.path, &metadata) == 0 {
+                // A custom link may expose a shared skill. It remains under the user's control.
+                if metadata.st_mode & S_IFMT == S_IFREG,
+                   let existing = try? String(contentsOf: skill, encoding: .utf8), isBackstageSkill(existing) {
+                    try FileManager.default.removeItem(at: skill)
+                    // rmdir removes only an empty directory, even if another writer adds a file.
+                    _ = rmdir(a.skillDir.path)
+                    r["skill"] = "removed"
+                } else {
+                    r["skill"] = "preserved different skill"
+                }
             }
-        }
-        report[a.rawValue] = r
+            return r
+        } ?? [:]
     }
     return ["ok": true, "uninstalled": report]
 }

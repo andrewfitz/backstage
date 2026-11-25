@@ -8,6 +8,7 @@
 //   sendhelper launch <App.app> [KEY=VALUE…]   open a new instance hidden and in the background
 //                                              (LaunchServices' launch-and-hide, as `open -g -j -n`),
 //                                              print its pid
+//   sendhelper terminate <pid> <App.app>       terminate only the named fixture instance
 import AppKit
 import Carbon.HIToolbox
 
@@ -70,6 +71,12 @@ case "launch":
     guard let (app, error) = result, let app else { fail("launch failed: \(String(describing: result?.1))") }
     _ = error
     print(app.processIdentifier)
+case "terminate":
+    guard args.count == 4, let pid = pid_t(args[2]), pid > 0 else { fail("usage: sendhelper terminate <pid> <App.app>") }
+    let expected = URL(fileURLWithPath: args[3]).resolvingSymlinksInPath()
+    guard let app = NSRunningApplication(processIdentifier: pid),
+          app.bundleURL?.resolvingSymlinksInPath() == expected else { break }
+    if !app.forceTerminate() && !app.isTerminated { fail("could not terminate fixture at \(expected.path)") }
 default:
-    fail("usage: sendhelper items|hold|launch …")
+    fail("usage: sendhelper items|hold|launch|terminate …")
 }

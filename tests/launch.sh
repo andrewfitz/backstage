@@ -90,9 +90,8 @@ printf '%s\n' '#include <stdio.h>' '#include <unistd.h>' \
     'int main(void) { printf("late process up\n"); fflush(stdout); sleep(300); return 0; }' > "$WORK/late.c"
 cc -O2 -o "$WORK/bin/late" "$WORK/late.c" || exit 1
 swiftc -O watch.swift -o "$WORK/watch" || exit 1
-"$WORK/watch" "$BID" 240 "$WORK/watch.stop" > "$WORK/watch.out" 2>&1 &
-WATCH=$!
-sleep 0.3
+. ./watch.sh
+start_watch "$BID" 240 || exit 1
 "$BS" start > /dev/null || { fail "daemon start"; exit 1; }
 
 echo "== LaunchServices never answers: launch identifies the app by its token"

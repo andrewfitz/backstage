@@ -4,6 +4,9 @@
 set -u
 cd "$(dirname "$0")/.."
 bin=${BACKSTAGE_BIN:-.build/release/backstage}
+export BACKSTAGE_HOOK=on
+scratch=$(mktemp -d) || exit 1
+trap 'rm -rf "$scratch"' EXIT
 fails=0
 ok()   { echo "  ok   $*"; }
 bad()  { echo "  FAIL $*"; fails=1; }
@@ -20,9 +23,9 @@ check() {
             grok)       payload=$(jq -n --arg c "$cmd" '{toolName:"run_terminal_command",toolInput:{command:$c}}') ;;
         esac
         code=0
-        printf '%s' "$payload" | "$bin" hook pre-tool-use 2>/tmp/backstage-hook-err.$$ || code=$?
+        printf '%s' "$payload" | "$bin" hook pre-tool-use 2>"$scratch/hook.err" || code=$?
         if [ "$code" != "$expect" ]; then bad "[$shape] expected $expect got $code: $cmd"; return; fi
-        if [ "$expect" = 2 ] && ! grep -q "backstage launch" /tmp/backstage-hook-err.$$; then bad "[$shape] no guidance in deny message"; return; fi
+        if [ "$expect" = 2 ] && ! grep -q "backstage launch" "$scratch/hook.err"; then bad "[$shape] no guidance in deny message"; return; fi
     done
     ok "$([ "$expect" = 2 ] && echo block || echo allow): $cmd"
 }
@@ -50,7 +53,6 @@ check 0 'ls build/MyApp.app/Contents/MacOS/'
 check 0 'swift build -c release'
 check 0 'xcodebuild -scheme MyApp build'
 check 0 'python3 -c "import os; print(os.open)"'
-rm -f /tmp/backstage-hook-err.$$
 
 # Non-shell tools and junk input fail open.
 printf '%s' '{"tool_name":"Write","tool_input":{"command":"open -a X"}}' | "$bin" hook pre-tool-use && ok "non-shell tool allowed" || bad "non-shell tool"
@@ -84,7 +86,7 @@ for c in 'backstage show Calculator' 'backstage show --pid 123' 'backstage launc
 done
 
 echo "== install / uninstall (throwaway HOME)"
-H=$(mktemp -d)
+H="$scratch/home"
 mkdir -p "$H/.claude" "$H/.codex" "$H/.grok"
 # Pre-existing user config that must survive untouched.
 cat > "$H/.claude/settings.json" <<'JSON'
@@ -117,7 +119,6 @@ grep -rq 'backstage-managed-hook' "$H/.claude/settings.json" "$H/.codex/hooks.js
 jq -e '([.hooks.PreToolUse[].hooks[].command] == ["/usr/local/bin/other-guard"]) and .model == "opus"' "$H/.claude/settings.json" >/dev/null \
     && ok "claude settings intact after uninstall" || bad "claude settings after uninstall"
 grep -q 'theme = "dark"' "$H/.grok/config.toml" && ok "grok config intact after uninstall" || bad "grok after uninstall"
-rm -rf "$H"
 
 echo "== dist skill in sync"
 diff <("$bin" skill) dist/skills/backstage/SKILL.md >/dev/null && ok "dist/skills/backstage/SKILL.md matches binary" || bad "dist skill stale: run make dist"

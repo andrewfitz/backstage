@@ -118,5 +118,5 @@ PID=$(echo "$OUT" | jget "['pid']")
     && pass "--dock launches a regular app" || fail "--dock: $(echo "$OUT" | jget "['dock']") / $("$WORK/dockwatch" type "$PID")"
 "$BS" quit --pid "$PID" > /dev/null
 
-[[ $("$BS" stop | jget "['ok']") == True ]]
+[[ $("$BS" stop | jget "['ok']") == True ]] && pass "stop" || fail "stop"
 [ $FAIL = 0 ] && echo "ALL PASSED" || { echo "SOME CHECKS FAILED"; exit 1; }

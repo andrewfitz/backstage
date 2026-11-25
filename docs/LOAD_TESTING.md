@@ -33,7 +33,7 @@ One-time setup on that account:
 make load                                   # 2-session smoke: every workload, short (~2 min)
 tests/load.sh 2 all                         # 2 sessions, every workload, full length
 tests/load.sh 8 input,capture --dedicated   # chosen workloads
-tests/load.sh --build-only                  # compile the helpers only
+tests/load.sh --build-only                  # warm the compiled helper cache without running a workload
 ```
 
 The full matrix, about 10–20 minutes per session count:
@@ -69,8 +69,11 @@ fall onto the real screen.
 
 ## What a run does
 
-Each run uses a fresh `BACKSTAGE_HOME` under `/tmp` and builds the fixture (`tests/TestApp.swift`)
-once, as one bundle (`dev.backstage.testapp.load`). Every session is a separate client process
+Compiled helpers are reused when their source and toolchain match. Set `BACKSTAGE_LOAD_BUILD`
+to choose the cache directory (default `/tmp/backstage-load-build-$(id -u)`).
+Each run uses a fresh `BACKSTAGE_HOME` under `/tmp` and copies the cached fixture executable into
+its own bundle with an ID of the form `dev.backstage.testapp.load.<run suffix>`.
+Every session is a separate client process
 (`tests/load.py worker`) with its own `BACKSTAGE_SESSION` (`s00`, `s01`…), driving its own
 fixture instance with its own marker text and pad colour (red for even sessions, green for odd).
 

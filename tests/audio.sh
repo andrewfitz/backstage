@@ -44,6 +44,12 @@ trap cleanup EXIT
 trap 'exit 130' INT
 trap 'exit 143' TERM
 
+# Exercise the callback and ring arithmetic without starting audio or needing permissions.
+xcrun clang -O2 -I "$ROOT/Sources/CBackstageAudio/include" \
+    "$ROOT/Sources/CBackstageAudio/audio.c" audio-meter.c -o "$WORK/audio-meter" || exit 1
+"$WORK/audio-meter" || exit 1
+pass "native meter, planar input, and PCM ring wrap"
+
 # --- macOS 14.2 ---
 if ! sw_vers -productVersion | awk -F. '{ exit !($1 > 14 || ($1 == 14 && $2 >= 2)) }'; then
     use_home old
@@ -320,6 +326,17 @@ near "$SECS" 0.3 0.03 && pass "a 300 ms burst measured $SECS s" || fail "300 ms 
 OUT=$("$BS" wait --sound --pid "$A" --min-db -20 --timeout 1.5 2>&1)
 echo "$OUT" | jq -e '.error | test("below --min-db")' > /dev/null && pass "--min-db: $(echo "$OUT" | jq -r .error | sed 's/.*: //')" || fail "--min-db: $OUT"
 G=$("$BS" wait --sound --gone --pid "$A" --timeout 3) && pass "wait --sound --gone: ended $(echo "$G" | jq -r .sound.seconds) s sound" || fail "--gone: $G"
+
+# Pre-birth registrations still have a live, matching bundle. They should read the same tap.
+APP_STORE="$BACKSTAGE_HOME/apps.json"
+cp "$APP_STORE" "$WORK/apps-with-birth.json" || exit 1
+jq --argjson pid "$A" 'map(if .pid == $pid then del(.processStart) else . end)' "$APP_STORE" > "$BACKSTAGE_HOME/apps.legacy.tmp" \
+    && mv "$BACKSTAGE_HOME/apps.legacy.tmp" "$APP_STORE" || exit 1
+S=$(audio "$A")
+echo "$S" | jq -e --argjson pid "$A" '.pid == $pid and .tap == "muted"' > /dev/null \
+    && pass "legacy registration reads the birth-keyed tap" || fail "legacy audio status: $S"
+cp "$WORK/apps-with-birth.json" "$BACKSTAGE_HOME/apps.restore.tmp" \
+    && mv "$BACKSTAGE_HOME/apps.restore.tmp" "$APP_STORE" || exit 1
 
 echo "== two sessions, two frequencies"
 B=$(BACKSTAGE_SESSION=audio-b launch --env TESTAPP_TONE=19500 --env TESTAPP_TONE_DEVICE="$DEV") || fail "launch B"

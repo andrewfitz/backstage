@@ -143,8 +143,9 @@ If your session runs `stop` in the meantime, the daemon quits the app instead.
 - **How inaudible works:** `DYLD_INSERT_LIBRARIES` loads `libbackstage-inaudible.dylib` into
   the app before its own code runs. It sets `kAudioHardwarePropertyProcessIsAudible` to 0 for
   the process, so Core Audio zeroes its output before any tap or capture sees it. `launch`
-  confirms the app did it (or that the library is mapped into it); otherwise the launch is
-  reported `muted` with the reason. A `DYLD_INSERT_LIBRARIES` you pass with `--env` is kept
+  waits for the app to acknowledge that Core Audio accepted the change. If the acknowledgement
+  is missing or reports failure, a default launch reports `muted` and includes the reason.
+  A `DYLD_INSERT_LIBRARIES` you pass with `--env` is kept
   (the library is put first).
 - **Which targets qualify:** the process's real executable (a bundle's `CFBundleExecutable`, or
   the bare executable itself) must be a Mach-O that dyld honours DYLD variables for: not
@@ -327,7 +328,8 @@ back to the user's screens.
 
 Per-app background tools (Claude's `app_*` tools, Codex's `get_app_state`, `click`,
 `type_text`…) capture one window wherever it is and post input to that app's process, so they
-can also drive a hidden app. The input guard lets input from their helpers into managed apps
+can also drive a hidden app. The input guard validates the running helpers' vendor signatures
+before letting their input into managed apps
 (`Claude.app/Contents/Helpers/app-cu-helper`, `…/Contents/MacOS/SkyComputerUseService`).
 Name the app unambiguously when the user runs their own copy too. Don't drive one app with
 backstage's input commands and computer-use input at the same time. See the README section

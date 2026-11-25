@@ -85,9 +85,8 @@ swiftc -O watch.swift -o "$WORK/watch" || exit 1
 swiftc -O pixels.swift -o "$WORK/pixels" || exit 1
 swiftc -O probe.swift -o "$WORK/probe" || exit 1
 swiftc -O axmove.swift -o "$WORK/axmove" || exit 1
-"$WORK/watch" "dev.backstage.testapp.${WORK##*.}" 600 "$WORK/watch.stop" > "$WORK/watch.out" 2>&1 &
-WATCH=$!
-sleep 0.3
+. ./watch.sh
+start_watch "dev.backstage.testapp.${WORK##*.}" 600 || exit 1
 
 echo "== each session launches its own instance"
 PA=$(a launch "$WORK/BackstageTestApp.app" --env "TESTAPP_LOG=$WORK/a.log" --env TESTAPP_MARKER=alpha --env TESTAPP_PAD=red | jget "['pid']")

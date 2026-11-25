@@ -63,26 +63,56 @@ static void meter_append(BSMeter *m, BSMeterBlock block) {
     bs_store_release_u64(&m->blocksWritten, index + 1);
 }
 
-static void ring_append(BSMeter *m, const float *data, uint64_t frameCount, uint64_t endHostTime) {
+static uint32_t buffer_frames(const AudioBuffer *buffer) {
+    return buffer->mData && buffer->mNumberChannels > 0
+        ? buffer->mDataByteSize / sizeof(float) / buffer->mNumberChannels : 0;
+}
+
+static void copy_ring_frames(float *dest, uint32_t channels, const AudioBufferList *input,
+                             uint32_t offset, uint32_t frames) {
+    if (!input) {
+        memset(dest, 0, (size_t)frames * channels * sizeof(float));
+        return;
+    }
+    if (input->mNumberBuffers == 1) {
+        const float *src = input->mBuffers[0].mData;
+        memcpy(dest, src + (size_t)offset * channels, (size_t)frames * channels * sizeof(float));
+        return;
+    }
+    uint32_t firstChannel = 0;
+    for (uint32_t i = 0; i < input->mNumberBuffers; i++) {
+        const AudioBuffer *buffer = &input->mBuffers[i];
+        const float *src = buffer->mData;
+        uint32_t available = buffer_frames(buffer);
+        uint32_t count = buffer->mNumberChannels;
+        for (uint32_t f = 0; f < frames; f++) {
+            float *target = dest + (size_t)f * channels + firstChannel;
+            if (offset + f < available) {
+                memcpy(target, src + (size_t)(offset + f) * count, (size_t)count * sizeof(float));
+            } else {
+                memset(target, 0, (size_t)count * sizeof(float));
+            }
+        }
+        firstChannel += count;
+    }
+}
+
+static void ring_append(BSMeter *m, const AudioBufferList *input, uint64_t frameCount, uint64_t endHostTime) {
     BSRingHeader *r = m->ring;
     uint32_t cap = r->capacityFrames, ch = r->channels;
     if (cap == 0 || ch == 0) return;
     uint32_t frames = frameCount > cap ? cap : (uint32_t)frameCount;
     uint64_t skipped = frameCount - frames;
-    if (data) data += (size_t)skipped * ch;
     uint64_t written = __atomic_load_n(&r->framesWritten, __ATOMIC_RELAXED);
     uint32_t pos = (uint32_t)((written + skipped) % cap);
     uint32_t first = frames < cap - pos ? frames : cap - pos;
     uint64_t sequence = __atomic_load_n(&r->writeSequence, __ATOMIC_RELAXED);
     __atomic_store_n(&r->writeSequence, sequence + 1, __ATOMIC_RELAXED);
     __atomic_thread_fence(__ATOMIC_SEQ_CST);
-    if (data) {
-        memcpy(m->ringData + (size_t)pos * ch, data, (size_t)first * ch * sizeof(float));
-        if (frames > first) memcpy(m->ringData, data + (size_t)first * ch, (size_t)(frames - first) * ch * sizeof(float));
-    } else {
-        memset(m->ringData + (size_t)pos * ch, 0, (size_t)first * ch * sizeof(float));
-        if (frames > first) memset(m->ringData, 0, (size_t)(frames - first) * ch * sizeof(float));
-    }
+    // Only silence can exceed the UInt32 frame count of an AudioBufferList.
+    uint32_t offset = input ? (uint32_t)skipped : 0;
+    copy_ring_frames(m->ringData + (size_t)pos * ch, ch, input, offset, first);
+    if (frames > first) copy_ring_frames(m->ringData, ch, input, offset + first, frames - first);
     r->endHostTime = endHostTime;
     r->endUptime = (double)endHostTime * m->secondsPerTick;
     bs_store_release_u64(&r->framesWritten, written + frameCount);
@@ -100,10 +130,6 @@ OSStatus bs_meter_ioproc(AudioObjectID device, const AudioTimeStamp *now, const 
     (void)device; (void)output; (void)outputTime;
     BSMeter *m = (BSMeter *)client;
     if (!m || !input || input->mNumberBuffers == 0) return 0;
-    const AudioBuffer *b0 = &input->mBuffers[0];
-    uint32_t ch0 = b0->mNumberChannels ? b0->mNumberChannels : 1;
-    uint32_t frames = b0->mDataByteSize / sizeof(float) / ch0;
-    if (frames == 0) return 0;
     uint64_t host = (inputTime && (inputTime->mFlags & kAudioTimeStampHostTimeValid)) ? inputTime->mHostTime
                   : (now ? now->mHostTime : 0);
     uint32_t thresholdBits = __atomic_load_n(&m->loudThresholdBits, __ATOMIC_RELAXED);
@@ -111,33 +137,40 @@ OSStatus bs_meter_ioproc(AudioObjectID device, const AudioTimeStamp *now, const 
     memcpy(&threshold, &thresholdBits, sizeof threshold);
     double sum = 0;
     int32_t firstLoud = -1, lastLoud = -1;
-    uint32_t totalChannels = 0;
+    const bool hasThreshold = threshold > 0;
+    uint32_t frames = 0;
+    uint64_t totalChannels = 0;
     for (uint32_t b = 0; b < input->mNumberBuffers; b++) {
         const AudioBuffer *buf = &input->mBuffers[b];
         const float *d = (const float *)buf->mData;
-        uint32_t ch = buf->mNumberChannels ? buf->mNumberChannels : 1;
-        if (!d) continue;
-        uint32_t n = buf->mDataByteSize / sizeof(float) / ch;
-        if (n > frames) n = frames;
+        uint32_t ch = buf->mNumberChannels;
+        uint32_t n = buffer_frames(buf);
+        totalChannels += ch;
+        if (n > frames) frames = n;
         for (uint32_t i = 0; i < n; i++) {
+            float framePeak = 0;
+            double frameSquares = 0;
             for (uint32_t c = 0; c < ch; c++) {
                 float x = d[(size_t)i * ch + c];
+                // Malformed samples must not poison an entire level window or its JSON status.
+                if (!isfinite(x)) continue;
                 float ax = fabsf(x);
-                if (ax > peak) peak = ax;
-                sum += (double)x * (double)x;
-                if (threshold > 0 && ax >= threshold) {
-                    if (firstLoud < 0 || (int32_t)i < firstLoud) firstLoud = (int32_t)i;
-                    if ((int32_t)i > lastLoud) lastLoud = (int32_t)i;
-                }
+                if (ax > framePeak) framePeak = ax;
+                frameSquares += (double)x * (double)x;
+            }
+            sum += frameSquares;
+            if (framePeak > peak) peak = framePeak;
+            if (hasThreshold && framePeak >= threshold) {
+                if (firstLoud < 0 || (int32_t)i < firstLoud) firstLoud = (int32_t)i;
+                if ((int32_t)i > lastLoud) lastLoud = (int32_t)i;
             }
         }
-        totalChannels += ch;
     }
-    if (totalChannels == 0) return 0;
-    if (m->ring && input->mNumberBuffers == 1 && ch0 == m->ring->channels && b0->mData && m->ring->sampleRate > 0) {
+    if (frames == 0) return 0;
+    if (m->ring && totalChannels == m->ring->channels && m->ring->sampleRate > 0) {
         double seconds = (double)frames / m->ring->sampleRate;
         uint64_t end = host + (uint64_t)(seconds / m->secondsPerTick);
-        ring_append(m, (const float *)b0->mData, frames, end);
+        ring_append(m, input, frames, end);
     }
     meter_append(m, (BSMeterBlock){
         .hostTime = host,

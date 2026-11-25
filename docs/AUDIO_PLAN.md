@@ -638,10 +638,9 @@ The capture spike's last row, turned into the default. Files: `Sources/Backstage
 - **Delivery:** LaunchServices passes `DYLD_INSERT_LIBRARIES` through
   `_kLSOpenOptionEnvironmentVariablesKey` (measured: the constructor ran and the library was
   mapped). The `launch` wrapper is a symlink, so nothing strips it.
-- **Confirmation:** after the process is identified, `launch` waits up to 2 s for the
-  acknowledgement (err 0), else checks the library is mapped (`proc_pidinfo`
-  `PROC_PIDREGIONPATHINFO`, about 3 ms for 130 regions). Not confirmed: `muted` with the
-  reason, or for `--inaudible` the app is quit and `launch` fails.
+- **Confirmation.** After identifying the process, `launch` waits up to 2 s for its
+  acknowledgement of Core Audio success. A missing or unsuccessful acknowledgement falls
+  back to `muted` with the reason. With `--inaudible`, the app is quit and the launch fails.
 - **Cost per injected process:** about 30 ms at start (connecting to Core Audio: 1.4 ms →
   31.9 ms per spawn of a trivial binary; loading CoreAudio alone is about 3 ms, and nearly
   every process loads it anyway, Foundation included), and the process becomes an audio

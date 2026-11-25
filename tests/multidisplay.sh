@@ -22,7 +22,9 @@ fail() { echo "  FAIL $*"; FAIL=1; }
 cleanup() {
     local result=$?
     trap - EXIT
-    [[ -f "$BACKSTAGE_HOME/daemon.json" ]] && "$BS" stop --all > /dev/null 2>&1
+    if [[ -f "$BACKSTAGE_HOME/daemon.json" || -f "$BACKSTAGE_HOME/apps.json" ]]; then
+        "$BS" stop --all > /dev/null 2>&1 || result=1
+    fi
     if [[ -n $WATCH ]]; then touch "$WORK/watch.stop"; wait "$WATCH" || result=1; cat "$WORK/watch.out"; fi
     echo "artifacts: $WORK"
     exit "$result"
@@ -42,8 +44,9 @@ cat > "$APP/Contents/Info.plist" <<PLIST
 PLIST
 swiftc -O watch.swift -o "$WORK/watch" || exit 1
 swiftc -O csdevices.swift -o "$WORK/csdevices" || exit 1
-"$WORK/watch" "$BID" 300 "$WORK/watch.stop" > "$WORK/watch.out" 2>&1 &
-WATCH=$!
+swiftc -O pixels.swift -o "$WORK/pixels" || exit 1
+. ./watch.sh
+start_watch "$BID" 300 || exit 1
 DEVICES0=$("$WORK/csdevices")
 
 as() { local who=$1; shift; BACKSTAGE_SESSION="$who" "$BS" "$@"; }
@@ -51,7 +54,7 @@ launch() {  # session, pad colour, extra args… ; prints the launch JSON
     local who=$1 pad=$2; shift 2
     as "$who" launch "$APP" --env "TESTAPP_LOG=$WORK/$who-$pad.log" --env "TESTAPP_PAD=$pad" "$@"
 }
-displays() { "$BS" status | jq -c '[.daemon.displays[]? | .display]'; }
+displays() { "$BS" status | jq -ec '.daemon | select(.pid != null) | ([.displays[]?.display] + [.display] | unique)'; }
 
 echo "== menu layouts (synthetic: no displays created)"
 R1=$("$BS" __menu-render --displays 1); R2=$("$BS" __menu-render --displays 2)
@@ -82,10 +85,16 @@ PADXY=$(as B find --pid "$PB" --role window --text BackstageTestApp | jq -r '.el
 as B click $PADXY --pid "$PB" > /dev/null
 for _ in $(seq 1 40); do grep -q "pad click 1" "$WORK/B-green.log" 2>/dev/null && break; sleep 0.1; done
 grep -q "pad click 1" "$WORK/B-green.log" && pass "a coordinate click at ($PADXY) on display 8 hit B's pad" || fail "click on display 8 missed"
-SHOT=$(as B screenshot --pid "$PB")
-[[ $(echo "$SHOT" | jq -r '.width > 0') == true ]] && pass "B's screenshot comes from display 8" || fail "screenshot: $SHOT"
+SHOT=$(as B screenshot --pid "$PB" -o "$WORK/b-window.png")
+if [[ -s "$WORK/b-window.png" ]] && read -r red green < <("$WORK/pixels" "$WORK/b-window.png") &&
+   (( green > 20000 && red < 1000 )); then
+    pass "B's screenshot shows B's green pad"
+else
+    fail "screenshot: $SHOT"
+fi
 FULL=$(as B screenshot --full)
-[[ $(echo "$FULL" | jq -r .display) == 8 ]] && pass "screenshot --full picks B's only display" || fail "--full: $FULL"
+echo "$FULL" | jq -e --argjson pid "$PB" '.display == 8 and .pids == [$pid] and .width == 900 and .height == 600' > /dev/null \
+    && pass "screenshot --full picks B's only display" || fail "--full: $FULL"
 FILL=$(as B window fill --pid "$PB")
 echo "$FILL" | jq -e '.frame.x >= 0 and .frame.y >= 0 and .frame.x + .frame.w <= 900 and .frame.y + .frame.h <= 600' > /dev/null \
     && pass "window fill stays inside display 8" || fail "window fill: $FILL"
@@ -121,8 +130,8 @@ as C windows --pid "$PC" | jq -e '.windows[0].frame | .x >= 0 and .y >= 0 and .x
 
 echo "== an empty extra display goes away"
 as B quit --pid "$PB" > /dev/null; as B quit --pid "$PB2" > /dev/null; as C move --pid "$PC" --display 7 > /dev/null
-for _ in $(seq 1 30); do [[ $(displays) == '[]' || $(displays) == '[7]' ]] && break; sleep 0.25; done
-[[ $(displays) == '[]' || $(displays) == '[7]' ]] && pass "display 8 was removed once nothing was on it" || fail "displays left: $(displays)"
+for _ in $(seq 1 30); do [[ $(displays) == '[7]' ]] && break; sleep 0.25; done
+[[ $(displays) == '[7]' ]] && pass "display 8 was removed once nothing was on it" || fail "displays left: $(displays)"
 DEVICES1=$("$WORK/csdevices")
 [[ $DEVICES1 -le $((DEVICES0 + 1)) ]] && pass "ColorSync's backstage displays: $DEVICES0 before, $DEVICES1 after" \
     || fail "ColorSync's backstage displays grew from $DEVICES0 to $DEVICES1"
@@ -131,6 +140,6 @@ echo "== bad values"
 OUT=$(launch A blue --display 5 2>&1)
 echo "$OUT" | jq -e '.ok == false and (.error | test("isn.t one this daemon runs"))' > /dev/null && pass "a display this daemon can't run is refused" || fail "display 5: $OUT"
 
-"$BS" stop --all > /dev/null
+"$BS" stop --all > /dev/null || fail "stop --all"
 [[ $FAIL == 0 ]] && echo "multidisplay: all passed"
 exit $FAIL

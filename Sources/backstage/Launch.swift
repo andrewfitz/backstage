@@ -140,9 +140,11 @@ private func launchResolved(_ url: URL, bareExecutable: URL?, args: Args, info: 
     var audio = plan
     // Which display: --display N|new, else where this session already has apps, else the primary.
     let slot = try launchDisplay(args.opt("display"), info: info, session: session)
-    // A display just created is in the daemon's info only from now on.
-    let current = slot == info.primarySlot || info.entry(slot) != nil ? info : (liveDaemon() ?? info)
-    guard let view = current.on(slot) else { throw CLIError("display \(slot) isn't running") }
+    guard let current = liveDaemon(), current.pid == info.pid,
+          current.processStart == info.processStart, current.startedAt == info.startedAt,
+          current.stopping != true, let view = current.on(slot) else {
+        throw CLIError("display \(slot) isn't running")
+    }
     let vd = view.bounds
     let recordSlot: Int? = slot == current.primarySlot ? nil : slot
     let bundle = Bundle(url: url)
@@ -158,7 +160,7 @@ private func launchResolved(_ url: URL, bareExecutable: URL?, args: Args, info: 
     guard !env.contains(where: { $0 == tokenKey || $0.hasPrefix(tokenKey + "=") }) else {
         throw CLIError("\(tokenKey) is reserved for launch identification")
     }
-    guard !env.contains(where: { $0.hasPrefix(InaudibleLibrary.ackKey + "=") }) else {
+    guard !env.contains(where: { $0 == InaudibleLibrary.ackKey || $0.hasPrefix(InaudibleLibrary.ackKey + "=") }) else {
         throw CLIError("\(InaudibleLibrary.ackKey) is reserved for inaudible launches")
     }
     let logURL = Paths.appLogs.appendingPathComponent("\(launchID).log")
@@ -178,7 +180,11 @@ private func launchResolved(_ url: URL, bareExecutable: URL?, args: Args, info: 
     // the app: it quits what the launch started. If instead the app's process doesn't appear in
     // time, the record is handed over (kept, with the receipt): the daemon registers the app to
     // this session if it turns up late.
+    // Once an open request is submitted, retain these files on any error until the daemon
+    // can settle the launch. Even an error response can race a process appearing.
     var leaveToDaemon = false
+    let ack = InaudibleLibrary.ackFile(launchID)
+    defer { if !leaveToDaemon { try? FileManager.default.removeItem(at: ack) } }
     defer { if bareExecutable != nil && !leaveToDaemon { try? FileManager.default.removeItem(at: receipt) } }
     let launcher = launchingAgent()
     var provisional = LaunchRecord(id: launchID, session: session.id, cliPID: getpid(), cliStart: processBirth(getpid()) ?? 0,
@@ -202,20 +208,23 @@ private func launchResolved(_ url: URL, bareExecutable: URL?, args: Args, info: 
     if audio.mode == .inaudible, let library = audio.library {
         let insert = "DYLD_INSERT_LIBRARIES"
         environment[insert] = ([library.path] + (environment[insert].map { [$0] } ?? [])).filter { !$0.isEmpty }.joined(separator: ":")
-        environment[InaudibleLibrary.ackKey] = InaudibleLibrary.ackFile(launchID).path
+        environment[InaudibleLibrary.ackKey] = ack.path
     }
 
     let clock = ProcessInfo.processInfo
     var reportedPID: pid_t?
     var launchedAt = clock.systemUptime
     var hidden = hideFromDock
-    var request: LaunchServices.OpenRequest?
+    let request: LaunchServices.OpenRequest
+    let openTool: Process?
+    let opened = clock.systemUptime
     if LaunchServices.canOpen {
         // What /usr/bin/open -g -j -n does, through LaunchServices directly, plus (unless --dock)
         // the private option that starts the app as a UIElement: no Dock tile, not in ⌘-Tab.
         hidden = hideFromDock && LaunchServices.canHideFromDock
         request = try LaunchServices.openApplication(url, .init(hideFromDock: hidden, environment: environment,
                                                                 arguments: args.passthrough, log: logURL))
+        openTool = nil
     } else {
         // -g: don't bring to foreground, -j: launch hidden, -n: fresh instance (never touch the user's copy)
         hidden = false
@@ -223,12 +232,12 @@ private func launchResolved(_ url: URL, bareExecutable: URL?, args: Args, info: 
         for (key, value) in environment.sorted(by: { $0.key < $1.key }) { openArgs += ["--env", "\(key)=\(value)"] }
         openArgs.append(url.path)
         if !args.passthrough.isEmpty { openArgs += ["--args"] + args.passthrough }
-        let p = Process()
-        p.executableURL = URL(fileURLWithPath: "/usr/bin/open")
-        p.arguments = openArgs
-        try p.run(); p.waitUntilExit()
-        guard p.terminationStatus == 0 else { throw CLIError("open failed (status \(p.terminationStatus))") }
+        (request, openTool) = try LaunchServices.openThroughTool(URL(fileURLWithPath: "/usr/bin/open"), arguments: openArgs)
     }
+    leaveToDaemon = true
+    let opener = openTool == nil ? "LaunchServices" : "/usr/bin/open"
+    // A request already submitted to LaunchServices can still finish after its client exits.
+    defer { if let openTool, openTool.isRunning { openTool.terminate() } }
 
     // Identify the new process. LaunchServices' answer names it, but under heavy load the answer
     // can come long after the process started, or never: the process is also found by its launch
@@ -241,25 +250,24 @@ private func launchResolved(_ url: URL, bareExecutable: URL?, args: Args, info: 
     func findApp() -> (NSRunningApplication?, pid_t, UInt64)? {
         if blind { return nil }
         // The PID LaunchServices reported, once it's verifiably this launch's process; else a search.
-        if let pid = reportedPID, !before.contains(pid), let found = identity.verify(pid) { return found }
-        return identity.find { pid in
-            pid != reportedPID && !before.contains(pid) && (processBirth(pid).map { Double($0) / 1e6 >= notBefore } ?? false)
-        }
+        if let pid = reportedPID, !before.contains(pid), let found = identity.verify(pid),
+           Double(found.birth) / 1e6 >= notBefore { return found }
+        return identity.find(notBefore: notBefore) { $0 != reportedPID && !before.contains($0) }
     }
     let deadlines = Launching.deadlines()
-    let opened = clock.systemUptime
-    var answeredAt: Double? = request == nil ? opened : nil
+    var answeredAt: Double?
     var refusal: String?
     var identified: (NSRunningApplication?, pid_t, UInt64)?
     while identified == nil {
         // Tapped on sight and failed: the daemon is quitting it; don't wait for it to register.
         if let failure = audioFailure(launch: launchID) { throw CLIError(failure) }
-        if answeredAt == nil, let answer = request?.answer {
+        if answeredAt == nil, let answer = request.answer {
             answeredAt = clock.systemUptime
             launchedAt = clock.systemUptime
             if answer.ok {
                 reportedPID = answer.pid
-                if let pid = reportedPID, bareExecutable != nil, !before.contains(pid) {
+                if let pid = reportedPID, bareExecutable != nil, !before.contains(pid),
+                   let found = identity.verify(pid), Double(found.birth) / 1e6 >= notBefore {
                     // The wrapper runs the binary directly, so the CLI writes the receipt the
                     // daemon's orphan cleanup reads.
                     try? "\(pid)\n".write(to: receipt, atomically: false, encoding: .utf8)
@@ -270,14 +278,13 @@ private func launchResolved(_ url: URL, bareExecutable: URL?, args: Args, info: 
         }
         identified = findApp()
         if identified != nil { break }
-        if let refusal { throw CLIError("LaunchServices couldn't open \(url.path): \(refusal)") }
+        if let refusal { throw CLIError("\(opener) couldn't open \(url.path): \(refusal)") }
         let now = clock.systemUptime
         if now - opened >= deadlines.total || answeredAt.map({ now - $0 >= deadlines.afterAnswer }) == true { break }
         pump(0.05)
     }
     guard let (app, pid, birth) = identified else {
         // LaunchServices can still start it after the CLI gives up waiting.
-        leaveToDaemon = true
         let later: String
         if info.delayedLaunchHandoff == true {
             provisional.handedOver = true
@@ -290,17 +297,18 @@ private func launchResolved(_ url: URL, bareExecutable: URL?, args: Args, info: 
         }
         let waited = Int((clock.systemUptime - opened).rounded())
         let details = "; \(later). Launch log: \(logURL.path)"
-        if request != nil && answeredAt == nil {
-            throw CLIError("LaunchServices didn't answer within \(waited)s opening \(url.path) and no process of this launch appeared"
+        if answeredAt == nil {
+            throw CLIError("\(opener) didn't answer within \(waited)s opening \(url.path) and no process of this launch appeared"
                 + (deadlines.heavyLoad ? " (the system is under heavy load)" : "") + details)
         }
-        throw CLIError("LaunchServices opened \(url.path), but its process could not be identified within \(waited)s" + details)
+        throw CLIError("\(opener) opened \(url.path), but its process could not be identified within \(waited)s" + details)
     }
     var launchWarning: String?
-    if request != nil, let answered = answeredAt, answered - opened > 10 {
-        launchWarning = "LaunchServices took \(Int(answered - opened))s to answer (the system may be under heavy load)"
-    } else if request != nil, answeredAt == nil {
-        launchWarning = String(format: "LaunchServices hadn't answered after %.1fs (the system may be under heavy load); backstage identified the app by its launch token", clock.systemUptime - opened)
+    if let answered = answeredAt, answered - opened > 10 {
+        launchWarning = "\(opener) took \(Int(answered - opened))s to answer (the system may be under heavy load)"
+    } else if answeredAt == nil {
+        let waited = String(format: "%.1f", clock.systemUptime - opened)
+        launchWarning = "\(opener) hadn't answered after \(waited)s (the system may be under heavy load). Backstage verified the launch process independently"
         launchedAt = clock.systemUptime
     }
     func stillRunning() -> Bool { processBirth(pid) == birth }
@@ -316,12 +324,11 @@ private func launchResolved(_ url: URL, bareExecutable: URL?, args: Args, info: 
         if let current = currentApp(), current.forceTerminate() { return }
         if stillRunning() { _ = kill(pid, SIGTERM) }
     }
-    if audio.mode == .inaudible, let library = audio.library,
-       let why = confirmInaudible(pid: pid, launchID: launchID, library: library) {
+    if audio.mode == .inaudible,
+       let why = confirmInaudible(pid: pid, birth: birth, launchID: launchID) {
         if audio.forced {
             terminateUnregisteredApp()
-            leaveToDaemon = stillRunning()
-            throw CLIError("\(name) didn't become inaudible, so backstage quit it: \(why)")
+            throw CLIError("\(name) didn't become inaudible, so backstage requested that it quit: \(why)")
         }
         audio.mode = .muted
         audio.reason = "\(why); muted on this Mac's outputs only, so screen sharing and recordings can still hear it"
@@ -341,9 +348,9 @@ private func launchResolved(_ url: URL, bareExecutable: URL?, args: Args, info: 
         placementLock = try Locks.app(record)
         try AppStore.add(record)
         Launching.end(launchID)
+        leaveToDaemon = false
     } catch {
         terminateUnregisteredApp()
-        leaveToDaemon = stillRunning()
         if let failure = audioFailure(launch: launchID) ?? audioFailure(pid, birth) { throw CLIError(failure) }
         throw error
     }
@@ -357,13 +364,14 @@ private func launchResolved(_ url: URL, bareExecutable: URL?, args: Args, info: 
         if !stillRunning() { return [] }
         let windows = accessibility.windows
         return windows.isEmpty ? nil : windows
-    } ?? accessibility.windows
+    } ?? (stillRunning() ? accessibility.windows : [])
     guard stillRunning() else { throw exited("app exited before window placement") }
     var gotWindow = !initialWindows.isEmpty
     // The app is still hidden, so its own windows aren't on screen yet: keep them apart too.
     var placedFrames: [CGRect] = []
     var crowded = false
     for w in initialWindows {
+        guard stillRunning() else { throw exited("app exited during window placement") }
         let placement = placeBesideReporting(w, display: vd, avoiding: placedFrames)
         placedFrames.append(placement.frame)
         crowded = crowded || placement.cascaded
@@ -377,7 +385,7 @@ private func launchResolved(_ url: URL, bareExecutable: URL?, args: Args, info: 
         guard let windows = try? accessibility.readElements(kAXWindowsAttribute) else { return nil }
         gotWindow = gotWindow || !windows.isEmpty
         let placed = windows.allSatisfy(isContained)
-        if !placed { adoptWindows(pid: pid, display: vd) }
+        if !placed, stillRunning() { adoptWindows(pid: pid, display: vd) }
         return placed ? true : nil
     } ?? false
     let canUnhide = currentApp()
@@ -386,7 +394,7 @@ private func launchResolved(_ url: URL, bareExecutable: URL?, args: Args, info: 
         if gotWindow {
             let raiseAt = ProcessInfo.processInfo.systemUptime + 0.5
             var raised = false
-            _ = waitFor(timeout: 3) {
+            _ = waitFor(timeout: 3) { () -> Bool? in
                 if !stillRunning() || onscreenWindows().contains(where: { ($0[kCGWindowOwnerPID as String] as? pid_t) == pid }) { return true }
                 // Accessory (LSUIElement-style) apps launched hidden keep their windows off screen
                 // after being unhidden, until they think they're active. Send the private "you're
@@ -395,13 +403,14 @@ private func launchResolved(_ url: URL, bareExecutable: URL?, args: Args, info: 
                 if !raised && ProcessInfo.processInfo.systemUptime >= raiseAt {
                     guard let windows = try? accessibility.readElements(kAXWindowsAttribute), !windows.isEmpty else { return nil }
                     guard windows.allSatisfy(isContained) else {
-                        adoptWindows(pid: pid, display: vd)
+                        if stillRunning() { adoptWindows(pid: pid, display: vd) }
                         return nil
                     }
                     raised = true
-                    primeActivation(pid)
+                    primeActivation(pid, birth: birth)
                     for w in windows where (w.attr(kAXMinimizedAttribute) as? Bool) != true
                         && w.frame.map({ vd.contains($0) }) == true {
+                        guard stillRunning() else { return true }
                         AXUIElementPerformAction(w, kAXRaiseAction as CFString)
                     }
                 }

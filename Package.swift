@@ -26,6 +26,7 @@ let package = Package(
                 .linkedFramework("ApplicationServices"),
                 .linkedFramework("ScreenCaptureKit"),
                 .linkedFramework("CoreGraphics"),
+                .linkedFramework("Security"),
                 .linkedFramework("CoreAudio"),
                 .linkedFramework("AudioToolbox"),
                 .linkedFramework("Accelerate"),

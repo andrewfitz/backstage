@@ -6,7 +6,8 @@ When an agent builds a Mac app and wants to check it works, the window normally 
 front of you, steals keyboard focus, and fights you for the mouse. `backstage` runs those apps
 on an invisible virtual display instead. The agent can still see them (screenshots and the
 accessibility tree) and use them (clicks, typing, menus, drags) while you keep working.
-Your cursor, keyboard focus, frontmost app and windows aren't touched.
+Input goes directly to the managed app. If an app activates itself or opens a later window
+on your display, it can briefly take focus or appear before Backstage moves it back.
 
 It ships with an [agent skill](dist/skills/backstage/SKILL.md) and an optional hook for
 **Claude Code, Codex and Grok**. They teach the agent to keep its own testing hidden and to
@@ -293,8 +294,8 @@ each differently:
   to cancel, so a backstage `key esc` may stop it (not verified).
 - **Not verified end to end:** nobody ran Claude's or Codex's computer-use tools against a
   hidden app. The capture APIs they import are the ones `backstage screenshot` uses for the
-  agent display, and `tests/computer-use.sh` checks that input posted from those helpers'
-  paths reaches a managed app while other untagged input still doesn't. How Codex's service
+  agent display. `tests/computer-use.sh` checks the vendor signatures of installed helpers,
+  rejects vendor-unsigned fixtures, and exercises the input classifier. How Codex's service
   posts its input isn't known: it resolves those functions at run time under names it builds
   then. If it posted to the HID system rather than to the app, its keys could land in a hidden
   app while that app's open menu holds the keyboard focus.
@@ -456,7 +457,7 @@ make test           # all of the above, then a GUI fixture app driven through ev
                     # then the two-session test (tests/multi.sh; also `make test-multi`)
                     # and the shared-display test: overlapping windows, menus, sheets,
                     # popovers, and a slow launch (tests/concurrency.sh; `make test-concurrency`),
-                    # the input guard with computer-use helpers' input and an unmanaged app
+                    # computer-use helper signing and input classification
                     # (tests/computer-use.sh; `make test-computer-use`), then audio: muting, levels, sounds, show, refusals, and `audio record`'s
                     # WAVs checked by tests/wavcheck.swift (tests/audio.sh; `make test-audio`;
                     # leak checks run when a loopback device exists), then Send Front Window

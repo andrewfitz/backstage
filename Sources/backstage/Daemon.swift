@@ -170,6 +170,10 @@ final class Daemon {
     var creatingDisplay = false
     var nextExtrasCheck = 0.0
     var nextRemovalCheck = 0.0
+    private var displayStateDirty = false
+    private var requestDirectoryVersion: FileVersion?
+    private var nextRequestRescan = 0.0
+    private var nextReplyExpiry = Double.infinity
 
     /// Every display this daemon runs, the primary first.
     var allDisplays: [AgentDisplay] { [display] + extras.keys.sorted().compactMap { extras[$0] } }
@@ -234,8 +238,7 @@ final class Daemon {
         NSWorkspace.shared.notificationCenter.addObserver(forName: NSWorkspace.didActivateApplicationNotification, object: nil, queue: .main) { [weak self] n in
             guard let self, let app = n.userInfo?[NSWorkspace.applicationUserInfoKey] as? NSRunningApplication else { return }
             if self.managed.contains(app.processIdentifier) {
-                self.log("managed app \(app.processIdentifier) took focus; handing focus back to \(self.lastUserApp?.bundleIdentifier ?? "?")")
-                if let back = self.lastUserApp, !back.isTerminated { back.activate() }
+                self.restoreUserFocus(after: app)
             } else {
                 self.lastUserApp = app
                 self.inputGuard.updateUser(app.processIdentifier)
@@ -288,14 +291,37 @@ final class Daemon {
         exit(0)
     }
 
+    private func restoreUserFocus(after app: NSRunningApplication) {
+        guard app.isActive, let back = lastUserApp, !back.isTerminated,
+              back.processIdentifier != getpid(), !managed.contains(back.processIdentifier),
+              let birth = processBirth(back.processIdentifier),
+              let managedBirth = processBirth(app.processIdentifier) else { return }
+        back.activate()
+        log("managed app \(app.processIdentifier) took focus; handing focus back to \(back.bundleIdentifier ?? "?")")
+        // Cooperative activation can be refused. Retry once through AX only if the same
+        // managed app still has focus and the user hasn't switched apps in the meantime.
+        DispatchQueue.main.asyncAfter(deadline: .now() + 0.01) { [weak self] in
+            guard let self, !self.stopping, self.lastUserApp === back,
+                  self.managed.contains(app.processIdentifier), !self.managed.contains(back.processIdentifier),
+                  app.isActive, processBirth(app.processIdentifier) == managedBirth,
+                  !back.isTerminated, processBirth(back.processIdentifier) == birth else { return }
+            let target = AXUIElementCreateApplication(back.processIdentifier)
+            AXUIElementSetMessagingTimeout(target, guardAXTimeout)
+            AXUIElementSetAttributeValue(target, kAXFrontmostAttribute as CFString, kCFBooleanTrue)
+        }
+    }
+
     static var shared: Daemon?
 
     /// The user's displays, and every backstage display but ours (other homes' daemons).
     var otherAgentScreens: [CGRect] = []
-    func refreshScreens(from ids: [CGDirectDisplayID] = activeDisplays()) {
-        screens = userDisplayBounds(from: ids)
+    @discardableResult
+    func refreshScreens(from geometry: DisplayGeometry = DisplayGeometry()) -> (users: [CGRect], agents: [CGDirectDisplayID: CGRect]) {
+        let classified = geometry.classified()
+        screens = classified.users
         let own = ownDisplayIDs
-        otherAgentScreens = ids.filter { isOurDisplay($0) && !own.contains($0) }.map { CGDisplayBounds($0) }
+        otherAgentScreens = classified.agents.compactMap { own.contains($0.key) ? nil : $0.value }
+        return classified
     }
 
     var reparkPending = false
@@ -312,12 +338,13 @@ final class Daemon {
     }
     func repark() {
         guard !stopping else { return }
+        if creatingDisplay { scheduleRepark(); return }
         // Monitor unplugged / turned off: the agent display would become the user's only screen
         // and their windows would migrate onto it. Bail out so it disappears.
-        refreshScreens()
+        var geometry = refreshScreens()
         if screens.isEmpty { shutdown(reason: "no user display left"); return }
         var failed = false
-        for d in allDisplays where !d.isParked {
+        for d in allDisplays where !d.isParked(users: geometry.users, agents: geometry.agents) {
             let was = d.bounds
             if d.park() {
                 if d.bounds != was { log("re-parked display \(d.slot) from \(was) to \(d.bounds)") }
@@ -325,7 +352,7 @@ final class Daemon {
                 failed = true
                 log("could not re-park display \(d.slot) (at \(d.bounds)); retrying")
             }
-            refreshScreens()
+            geometry = refreshScreens()
         }
         if failed {
             // Another (older) daemon may be moving its display right now: try again shortly,
@@ -361,54 +388,100 @@ final class Daemon {
         guard !creatingDisplay else { return }
         let wall = Date().timeIntervalSince1970
         var changed = false
+        var answerToPublish: (url: URL, reply: DisplayReply)?
         for (slot, r) in reservations where r.until <= wall {
             reservations[slot] = nil
             log("display \(slot): reservation for session \(r.session) expired")
             changed = true
         }
-        if let names = try? FileManager.default.contentsOfDirectory(atPath: Paths.requests.path) {
+        if let names = displayRequestNames(now: now, wall: wall) {
             for name in names.sorted() {
                 let url = Paths.requests.appendingPathComponent(name)
                 // Only <uuid>.json requests and <uuid>.reply answers belong here; the reply's name
                 // comes from the request's file name, never from its contents.
                 let parts = name.split(separator: ".", maxSplits: 1).map(String.init)
                 guard parts.count == 2, let uuid = UUID(uuidString: parts[0]), uuid.uuidString == parts[0],
-                      parts[1] == "json" || parts[1] == "reply" else { try? FileManager.default.removeItem(at: url); continue }
+                      parts[1] == "json" || parts[1] == "reply" else { continue }
+                var metadata = stat()
+                guard lstat(url.path, &metadata) == 0 else {
+                    if errno != ENOENT { requestDirectoryVersion = nil }
+                    continue
+                }
+                guard metadata.st_mode & S_IFMT == S_IFREG else { continue }
                 if parts[1] == "reply" {
                     // A CLI that gave up leaves its answer: drop it after a minute.
-                    let age = (try? FileManager.default.attributesOfItem(atPath: url.path)[.modificationDate] as? Date).map { -$0.timeIntervalSinceNow } ?? 0
-                    if age > 60 { try? FileManager.default.removeItem(at: url) }
+                    let expiresAt = Double(metadata.st_mtimespec.tv_sec)
+                        + Double(metadata.st_mtimespec.tv_nsec) / 1e9 + 60
+                    if wall >= expiresAt {
+                        if unlink(url.path) != 0, errno != ENOENT { requestDirectoryVersion = nil }
+                    } else {
+                        nextReplyExpiry = min(nextReplyExpiry, expiresAt)
+                    }
                     continue
                 }
                 let decoded = readJSON(url, DisplayRequest.self)
-                try? FileManager.default.removeItem(at: url)
-                guard var request = decoded, wall - request.at < 30 else { continue }   // malformed, or its CLI gave up long ago
-                request.id = parts[0]
-                let reply = answer(request, wall: wall)
-                do { try writeJSON(Paths.requests.appendingPathComponent("\(parts[0]).reply"), reply) }
-                catch { log("cannot answer display request \(parts[0]): \(error)") }
-                changed = true
+                guard unlink(url.path) == 0 else {
+                    if errno != ENOENT { requestDirectoryVersion = nil }
+                    continue
+                }
+                let received = Date().timeIntervalSince1970
+                guard let request = decoded, abs(received - request.at) < 30 else { continue }
+                let reply = answer(request, wall: received)
+                answerToPublish = (Paths.requests.appendingPathComponent("\(parts[0]).reply"), reply)
+                changed = changed || reply.ok
+                // Display creation can block for seconds. Return to the window guard between requests.
+                requestDirectoryVersion = nil
+                break
             }
         }
-        if now >= nextRemovalCheck || changed {
+        if !extras.isEmpty, now >= nextRemovalCheck {
             nextRemovalCheck = now + 1
             let pending = Launching.records()
-            let apps = AppStore.load()   // fresh: a launch may have just moved from pending to registered
-            for slot in extras.keys.sorted() {
-                guard !apps.contains(where: { $0.display == slot && $0.matchesProcess }),
-                      !pending.contains(where: { $0.display == slot }),
-                      now - (extraCreated[slot] ?? now) >= extraGraceSeconds else { continue }
-                extras[slot] = nil
-                extraCreated[slot] = nil
-                reservations[slot] = nil
-                log("display \(slot) removed: no apps left on it")
-                changed = true
+            // Read pending first: a launch may have just moved from pending to registered.
+            if let apps = try? AppStore.read(allowMissing: !registryUnreadable && registry.isEmpty) {
+                for slot in extras.keys.sorted() {
+                    guard answerToPublish?.reply.slot != slot,
+                          !apps.contains(where: { $0.display == slot }),
+                          !pending.contains(where: { $0.display == slot }),
+                          now - (extraCreated[slot] ?? now) >= extraGraceSeconds else { continue }
+                    extras[slot] = nil
+                    extraCreated[slot] = nil
+                    reservations[slot] = nil
+                    log("display \(slot) removed: no apps left on it")
+                    changed = true
+                }
             }
         }
-        if changed {
-            refreshScreens()
-            do { try writeInfo() } catch { log("cannot update display state: \(error)") }
+        if changed { refreshScreens(); displayStateDirty = true }
+        if displayStateDirty {
+            do {
+                try writeInfo()
+                displayStateDirty = false
+            } catch {
+                if changed { log("cannot update display state: \(error)") }
+            }
         }
+        if let (url, reply) = answerToPublish {
+            let result = reply.ok && displayStateDirty
+                ? DisplayReply(ok: false, slot: nil, error: "could not publish display state") : reply
+            do { try writeJSON(url, result) }
+            catch { log("cannot answer display request \(url.lastPathComponent): \(error)") }
+        }
+    }
+
+    private func displayRequestNames(now: Double, wall: Double) -> [String]? {
+        let path = Paths.requests.path
+        let version = FileVersion(path)
+        // Atomic request publication changes the directory. Rescan periodically too, in case
+        // the filesystem coalesced timestamps or an entry was modified in place.
+        guard version == nil || version != requestDirectoryVersion || now >= nextRequestRescan
+                || wall >= nextReplyExpiry else { return nil }
+        requestDirectoryVersion = nil
+        guard let names = try? FileManager.default.contentsOfDirectory(atPath: path) else { return nil }
+        requestDirectoryVersion = version   // sampled before listing, so a concurrent write triggers another scan
+        nextRequestRescan = now + 5
+        nextReplyExpiry = .infinity
+        return names
     }
 
     func answer(_ request: DisplayRequest, wall: Double) -> DisplayReply {
@@ -418,7 +491,7 @@ final class Daemon {
             guard !free.isEmpty else { return refuse("no free display left: this daemon runs \(allDisplays.count) (\(allDisplays.map { String($0.slot) }.joined(separator: ", ")))") }
             do {
                 let d = try makeExtraDisplay(.lowestFree(free))
-                reservations[d.slot] = (request.session, wall + reservationSeconds)
+                reservations[d.slot] = (request.session, Date().timeIntervalSince1970 + reservationSeconds)
                 log("display \(d.slot) reserved for session \(request.session) for \(Int(reservationSeconds))s")
                 return DisplayReply(ok: true, slot: d.slot, error: nil)
             } catch { return refuse("\(error)") }
@@ -478,8 +551,12 @@ final class Daemon {
     /// without a restart). Publishes the result in daemon.json.
     func applySettings() {
         let stamp = settingsStamp()
+        let updated = Settings.load()
+        // A concurrent CLI write may replace the file between the stamp and the read.
+        // Leave the previous result published so the next poll can try again.
+        guard settingsStamp() == stamp else { return }
         let old = settings
-        settings = Settings.load()
+        settings = updated
         let first = settingsApplied == nil
         settingsApplied = stamp
         if first || old.keep != settings.keep {
@@ -518,35 +595,78 @@ final class Daemon {
     func quitAllApps() {
         let records = registry.filter { $0.matchesProcess }
         log("quitting all \(records.count) app(s) from the menu bar (keep in menu bar is on)")
-        for record in records { try? record.requestTermination(force: false) }
-        DispatchQueue.main.asyncAfter(deadline: .now() + 3) { [weak self] in
-            guard let self, !self.stopping else { return }
-            for record in records where record.matchesProcess {
-                if Session.isUser(record.session) { releaseToUser(record, log: self.log) }
-                else { try? record.requestTermination(force: true) }
+        for record in records {
+            performOnRegistration(record) { [weak self] current in
+                try? current.requestTermination(force: false)
+                DispatchQueue.main.asyncAfter(deadline: .now() + 3) { [weak self] in
+                    guard let self else { return }
+                    self.performOnRegistration(current, movingWindows: Session.isUser(current.session)) { [weak self] remaining in
+                        guard let self else { return }
+                        if Session.isUser(remaining.session) { releaseToUser(remaining, log: self.log) }
+                        else { try? remaining.requestTermination(force: true) }
+                    }
+                }
             }
         }
     }
 
-    // Each registry update atomically replaces the file. Read and decode it only after replacement.
-    struct RegistryVersion: Equatable {
-        let inode: ino_t
-        let seconds: Int
-        let nanoseconds: Int
-
-        init?() {
-            var metadata = stat()
-            guard stat(Paths.apps.path, &metadata) == 0 else { return nil }
-            inode = metadata.st_ino
-            seconds = metadata.st_mtimespec.tv_sec
-            nanoseconds = metadata.st_mtimespec.tv_nsec
+    func quitFromMenu(_ record: ManagedApp, force: Bool) {
+        performOnRegistration(record) { [weak self] current in
+            do { try current.requestTermination(force: force) }
+            catch { self?.log("menu \(force ? "force quit" : "quit") failed: \(error)") }
         }
     }
-    var registryVersion: RegistryVersion?
+
+    /// Serialize termination with the registry removal in show. A failed mute can then
+    /// trigger termination even during an input command. Window moves still take the app
+    /// lock because giving an app back also updates the registry itself.
+    private func performOnRegistration(_ record: ManagedApp, movingWindows: Bool = false,
+                                       action: @escaping (ManagedApp) -> Void) {
+        guard !stopping, record.matchesProcess else { return }
+        do {
+            let lock = try movingWindows ? Locks.app(record, nonblocking: true) : Locks.registry(nonblocking: true)
+            defer { lock.release() }
+            let current = try AppStore.read(matching: {
+                $0.pid == record.pid && $0.processStart == record.processStart && $0.launchedAt == record.launchedAt
+                    && Session.sameID($0.session, record.session)
+            }).first
+            if let current { action(current) }
+        } catch {
+            if StateLock.isBusy(error) {
+                DispatchQueue.main.asyncAfter(deadline: .now() + 0.25) { [weak self] in
+                    self?.performOnRegistration(record, movingWindows: movingWindows, action: action)
+                }
+            } else {
+                log("couldn't check registration for pid \(record.pid): \(error)")
+            }
+        }
+    }
+
+    private struct FileVersion: Equatable {
+        let device: dev_t
+        let inode: ino_t
+        let modifiedSeconds: Int
+        let modifiedNanoseconds: Int
+        let changedSeconds: Int
+        let changedNanoseconds: Int
+
+        init?(_ path: String) {
+            var metadata = stat()
+            guard stat(path, &metadata) == 0 else { return nil }
+            device = metadata.st_dev
+            inode = metadata.st_ino
+            modifiedSeconds = metadata.st_mtimespec.tv_sec
+            modifiedNanoseconds = metadata.st_mtimespec.tv_nsec
+            changedSeconds = metadata.st_ctimespec.tv_sec
+            changedNanoseconds = metadata.st_ctimespec.tv_nsec
+        }
+    }
+    // Each registry update atomically replaces the file. Read and decode it only after replacement.
+    private var registryVersion: FileVersion?
     var registryUnreadable = false
     var registry: [ManagedApp] = []
     func reloadManaged(now: Double) {
-        let version = RegistryVersion()
+        let version = FileVersion(Paths.apps.path)
         if version != registryVersion || ((registryUnreadable || nextReload == 0) && now >= nextReload) {
             do {
                 registry = try AppStore.read(allowMissing: !registryUnreadable && !registry.contains { $0.matchesProcess })
@@ -636,14 +756,19 @@ final class Daemon {
     var launchesPending = false
     var orphanSince: [String: Double] = [:]
 
-    func registered(_ pid: pid_t, _ birth: UInt64) -> Bool {
-        AppStore.load().contains { $0.pid == pid && $0.processStart == birth }
+    func registered(_ pid: pid_t, _ birth: UInt64) throws -> Bool {
+        let expectRegistry = registry.contains { $0.pid == pid && $0.matchesProcess }
+        return try AppStore.read(allowMissing: !expectRegistry, matching: { $0.pid == pid }).contains {
+            ($0.processStart ?? $0.liveProcessBirth) == birth
+        }
     }
 
     /// Once a second: quit apps whose launch died before registering them, and register those
     /// whose launch gave up waiting for them (see LaunchRecord).
     func reapLaunches(now: Double) {
-        guard now >= nextReap else { return }
+        // A missing or invalid registry cannot tell us whether a provisional process was
+        // already registered before the CLI died. Leave those records for the next good read.
+        guard !registryUnreadable, now >= nextReap else { return }
         nextReap = now + 1
         reapOrphanLaunches(deadSince: &orphanSince, registered: registered,
                            didRegister: { pid, birth in self.toReveal[pid] = (birth, now + 15) }, log: log)
@@ -657,8 +782,16 @@ final class Daemon {
     func revealRegistered(now: Double) {
         for (pid, entry) in toReveal {
             guard processBirth(pid) == entry.birth else { toReveal[pid] = nil; continue }
-            // Registered a moment ago: the cached registry may not have it yet.
-            let slot = AppStore.load().first { $0.pid == pid }?.display
+            // The per-process lock serializes placement with show and move. Read the
+            // record after taking it, since either command may already have changed it.
+            guard let lock = try? StateLock("locks/app-\(pid)-\(entry.birth)", nonblocking: true),
+                  let records = try? AppStore.read(matching: { $0.pid == pid && $0.processStart == entry.birth }) else {
+                if now >= entry.until { toReveal[pid] = nil }
+                continue
+            }
+            defer { lock.release() }
+            guard let record = records.first else { toReveal[pid] = nil; continue }
+            let slot = record.display
             let b = (slot.flatMap { extras[$0] } ?? display).bounds
             let app = AXUIElementCreateApplication(pid)
             AXUIElementSetMessagingTimeout(app, 0.25)   // never stall the guard loop on a busy app
@@ -684,37 +817,33 @@ final class Daemon {
     }
 
     var nextGuardLog = 0.0
+    private var ticking = false
     func tick() {
-        guard !stopping else { return }
+        guard !stopping, !ticking else { return }
+        ticking = true
+        defer { ticking = false }
         let now = ProcessInfo.processInfo.systemUptime
         // The lifecycle lock may still be held by a launch. Keep guarding while we wait.
         if let reason = pendingShutdown { shutdown(reason: reason) }
         reloadManaged(now: now)
-        if now >= nextGuardLog { nextGuardLog = now + 1; inputGuard.logActivity(log) }
-        if now >= nextSettingsCheck {
-            nextSettingsCheck = now + 0.5
-            if settingsStamp() != settingsApplied { applySettings() }
-            if testSendRequests { checkTestSendRequest() }
+        var geometry: DisplayGeometry?
+        if now >= nextArrangementCheck {
+            nextArrangementCheck = now + 0.25
+            let current = DisplayGeometry()
+            checkArrangement(current)
+            geometry = current
         }
-        // Keep in Menu Bar: never idle. Turning it off starts the idle timeout from then.
-        if keepActive { idleSince = now }
-        if let m = statusMenu, now >= nextMenuUpdate {
-            nextMenuUpdate = now + 0.5
-            m.update(apps: managed.count)
-        }
-        if now >= nextArrangementCheck { nextArrangementCheck = now + 0.25; checkArrangement() }
-        let own = allDisplays.map { (slot: $0.slot, bounds: $0.bounds) }
-        if now >= nextDockCheck { nextDockCheck = now + 1; guardDock(own: own.map { $0.bounds }) }
-        if now >= nextExtrasCheck { nextExtrasCheck = now + 0.1; handleDisplayRequests(now: now) }
+        let own = allDisplays.map { (slot: $0.slot, bounds: geometry?.bounds[$0.id] ?? $0.bounds) }
+        let windows = managed.isEmpty ? nil : onscreenWindows()
 
         // 1. Keep managed windows off the user's screens, and off other homes' backstage
         //    displays (an app restoring a window to where it last was can land there).
-        if !managed.isEmpty {
+        if let windows {
             idleSince = ProcessInfo.processInfo.systemUptime
             // An app's windows belong on its own display: one on a sibling display counts too.
             let slotOf = Dictionary(registry.map { ($0.pid, $0.display ?? display.slot) }, uniquingKeysWith: { a, _ in a })
             var offenders: Set<pid_t> = []
-            for w in onscreenWindows() {
+            for w in windows {
                 guard let pid = w[kCGWindowOwnerPID as String] as? pid_t, managed.contains(pid),
                       let layer = w[kCGWindowLayer as String] as? Int, layer < 1000 else { continue }
                 let f = cgBounds(w)
@@ -743,12 +872,30 @@ final class Daemon {
             }
         }
 
+        if now >= nextDockCheck {
+            nextDockCheck = now + 1
+            guardDock(own: own.map { $0.bounds }, windows: windows, geometry: geometry)
+        }
+        if now >= nextGuardLog { nextGuardLog = now + 1; inputGuard.logActivity(log) }
+        if now >= nextSettingsCheck {
+            nextSettingsCheck = now + 0.5
+            if settingsStamp() != settingsApplied { applySettings() }
+            if testSendRequests { checkTestSendRequest() }
+        }
+        // Keep in Menu Bar: never idle. Turning it off starts the idle timeout from then.
+        if keepActive { idleSince = now }
+        if let m = statusMenu, now >= nextMenuUpdate {
+            nextMenuUpdate = now + 0.5
+            m.update(apps: managed.count)
+        }
+
         // Accessibility registration and deferred launch recovery can block on another app.
         // Do them after moving visible offenders, and attempt at most one registration per tick.
         if let pid = managed.first(where: { observers[$0] == nil && now >= observeAfter[$0, default: 0] }) {
             observe(pid, now: now)
         }
         reapLaunches(now: now)
+        if now >= nextExtrasCheck { nextExtrasCheck = now + 0.1; handleDisplayRequests(now: now) }
         if launchesPending { idleSince = ProcessInfo.processInfo.systemUptime }
         if managed.isEmpty && !launchesPending && pendingShutdown == nil && !registryUnreadable && now - idleSince > idleTimeout {
             shutdown(reason: "idle for \(Int(idleTimeout))s with no managed apps")
@@ -759,12 +906,10 @@ final class Daemon {
     /// so watch the arrangement here too.
     var nextArrangementCheck = 0.0
     var arrangement: [CGDirectDisplayID: CGRect] = [:]
-    func checkArrangement() {
-        let ids = activeDisplays()
-        let now = Dictionary(uniqueKeysWithValues: ids.map { ($0, CGDisplayBounds($0)) })
-        guard now != arrangement else { return }
-        arrangement = now
-        refreshScreens(from: ids)
+    func checkArrangement(_ geometry: DisplayGeometry) {
+        guard geometry.bounds != arrangement else { return }
+        arrangement = geometry.bounds
+        refreshScreens(from: geometry)
         scheduleRepark()
     }
 
@@ -772,8 +917,8 @@ final class Daemon {
     var dockAway: CGRect?
     /// The Dock must stay on the user's screens. Parking (corner contact only) keeps macOS from
     /// moving it to a backstage display; this catches it if that ever happens anyway.
-    func guardDock(own: [CGRect]) {
-        guard let dock = dockWindowBounds() else { return }
+    func guardDock(own: [CGRect], windows: [[String: Any]]?, geometry: DisplayGeometry?) {
+        guard let dock = dockWindowBounds(from: windows) else { return }
         let onto = own.first { contact(dock, $0) == .overlap }
         let ours = onto != nil
         let theirs = otherAgentScreens.contains { contact(dock, $0) == .overlap }
@@ -781,13 +926,18 @@ final class Daemon {
             if let away = dockAway { log("the Dock is back on the user's screen (was at \(away))"); dockAway = nil }
             return
         }
+        var needsPark = false
+        if ours {
+            let (users, agents) = (geometry ?? DisplayGeometry()).classified()
+            needsPark = allDisplays.contains { !$0.isParked(users: users, agents: agents) }
+        }
         if dockAway == nil {
             // macOS moves the Dock to a display arranged right below its own. Re-parking (which
             // runs on any arrangement change) brings it back by itself ~0.1 s after the move.
             log("the Dock moved onto \(ours ? "this daemon's" : "another backstage") display at \(dock)"
-                + (ours && allDisplays.allSatisfy({ $0.isParked }) ? " though parked: not moving it (no undisruptive way known)" : ""))
+                + (ours && !needsPark ? " though parked: not moving it (no undisruptive way known)" : ""))
         }
-        if ours, !allDisplays.allSatisfy({ $0.isParked }) { scheduleRepark() }
+        if needsPark { scheduleRepark() }
         dockAway = dock
     }
 
@@ -812,7 +962,7 @@ final class Daemon {
     /// Hand the registry to the tap manager when it changes (only after a good read), and keep
     /// the crash handler's PID table current.
     func pushAudioRegistry() {
-        let entries = registry.map(AudioRegistryEntry.init)
+        let entries = registry.compactMap(AudioRegistryEntry.init)
         guard entries != audioRegistry else { return }
         audioRegistry = entries
         // A crash kills agent apps, never apps the user sent here: those come back to the
@@ -824,16 +974,23 @@ final class Daemon {
 
     /// The tap manager couldn't mute an app: quit it at once, like `stop` (gracefully, then forcefully).
     func quitOverAudio(pid: pid_t, birth: UInt64, registered: Bool) {
-        if registered, let record = registry.first(where: { $0.pid == pid && $0.processStart == birth }) {
-            // The user's own app is given back, audible, rather than quit.
-            if Session.isUser(record.session) { releaseToUser(record, log: log); return }
-            try? record.requestTermination(force: false)
-            DispatchQueue.main.asyncAfter(deadline: .now() + 1) { if record.matchesProcess { try? record.requestTermination(force: true) } }
+        if registered {
+            // Use the registration that caused the audio failure. It may have been shown since.
+            guard let record = registry.first(where: { $0.pid == pid && ($0.processStart ?? $0.liveProcessBirth) == birth }) else { return }
+            performOnRegistration(record, movingWindows: Session.isUser(record.session)) { [weak self] current in
+                guard let self else { return }
+                guard processBirth(pid) == birth else { return }
+                if Session.isUser(current.session) { releaseToUser(current, log: self.log); return }
+                try? current.requestTermination(force: false)
+                DispatchQueue.main.asyncAfter(deadline: .now() + 1) { [weak self] in
+                    self?.performOnRegistration(current) {
+                        guard processBirth(pid) == birth else { return }
+                        try? $0.requestTermination(force: true)
+                    }
+                }
+            }
             return
         }
-        // Registered, but no longer in the registry: handed over (Show on My Screen) a moment ago.
-        // It left management, so it's not quit here.
-        if registered { return }
         guard processBirth(pid) == birth else { return }
         kill(pid, SIGTERM)
         DispatchQueue.main.asyncAfter(deadline: .now() + 1) { if processBirth(pid) == birth { kill(pid, SIGKILL) } }
@@ -867,7 +1024,9 @@ final class Daemon {
         log("shutting down: \(reason)")
         // No launch can be running (lifecycle.lock is ours), so every provisional record is an
         // orphan: quit what it started before the display goes.
-        let orphans = reapOrphanLaunches(deadSince: &orphanSince, registered: { _, _ in false }, final: true, log: log)
+        let orphans = reapOrphanLaunches(deadSince: &orphanSince, registered: { pid, birth in
+            records.contains { $0.pid == pid && ($0.processStart ?? $0.liveProcessBirth) == birth }
+        }, final: true, log: log)
         // Apps the user sent here are quit only when the user asked for it (`stop --all`, a
         // signal, the menu). Any other shutdown (the last monitor unplugged, the display couldn't
         // be parked) gives them back instead: their windows follow the display's to the user's screen.
@@ -904,7 +1063,7 @@ final class Daemon {
         }
         // The apps are gone: now their taps can go.
         audioTaps?.shutdown()
-        try? FileManager.default.removeItem(at: Paths.daemon)
+        unlink(Paths.daemon.path)
         inputGuard.logActivity(log, force: true)
         log("bye")
         exit(0)
@@ -966,7 +1125,13 @@ private func settleDaemon() throws {
 }
 
 private func startDaemon() throws -> DaemonInfo {
-    if let d = liveDaemon() { return d }
+    func compatibleDaemon() throws -> DaemonInfo? {
+        guard let daemon = liveDaemon() else { return nil }
+        guard !daemon.protocolMismatch else { throw daemonVersionError(daemon) }
+        guard daemon.stopping != true else { throw CLIError("the backstage daemon is shutting down; try again") }
+        return daemon
+    }
+    if let d = try compatibleDaemon() { return d }
     try Paths.ensure()
     // The running binary itself. Not argv[0]: invoked by bare name through PATH, that resolves
     // against the working directory, which may hold an unrelated `backstage` (a checkout).
@@ -974,25 +1139,28 @@ private func startDaemon() throws -> DaemonInfo {
 
     _ = try requestedDisplaySlot()   // a bad BACKSTAGE_DISPLAY is reported here, not as a failed start
     let logStart = (try? FileManager.default.attributesOfItem(atPath: Paths.log.path)[.size] as? UInt64) ?? 0
+    func checkSpawn(_ status: Int32) throws {
+        guard status == 0 else { throw CLIError("failed to spawn daemon: \(String(cString: strerror(status)))") }
+    }
     var attr: posix_spawnattr_t?
-    posix_spawnattr_init(&attr)
-    posix_spawnattr_setflags(&attr, Int16(POSIX_SPAWN_SETSID))
+    try checkSpawn(posix_spawnattr_init(&attr))
+    defer { posix_spawnattr_destroy(&attr) }
+    try checkSpawn(posix_spawnattr_setflags(&attr, Int16(POSIX_SPAWN_SETSID)))
     var fa: posix_spawn_file_actions_t?
-    posix_spawn_file_actions_init(&fa)
-    posix_spawn_file_actions_addopen(&fa, 0, "/dev/null", O_RDONLY, 0)
-    posix_spawn_file_actions_addopen(&fa, 1, Paths.log.path, O_WRONLY | O_CREAT | O_APPEND, 0o600)
-    posix_spawn_file_actions_addopen(&fa, 2, Paths.log.path, O_WRONLY | O_CREAT | O_APPEND, 0o600)
+    try checkSpawn(posix_spawn_file_actions_init(&fa))
+    defer { posix_spawn_file_actions_destroy(&fa) }
+    try checkSpawn(posix_spawn_file_actions_addopen(&fa, 0, "/dev/null", O_RDONLY, 0))
+    try checkSpawn(posix_spawn_file_actions_addopen(&fa, 1, Paths.log.path, O_WRONLY | O_CREAT | O_APPEND, 0o600))
+    try checkSpawn(posix_spawn_file_actions_addopen(&fa, 2, Paths.log.path, O_WRONLY | O_CREAT | O_APPEND, 0o600))
     var pid: pid_t = 0
     let argv: [UnsafeMutablePointer<CChar>?] = [strdup(selfPath), strdup("__daemon"), nil]
     defer { for pointer in argv { free(pointer) } }
-    let rc = posix_spawn(&pid, selfPath, &fa, &attr, argv, environ)
-    posix_spawn_file_actions_destroy(&fa)
-    posix_spawnattr_destroy(&attr)
-    guard rc == 0 else { throw CLIError("failed to spawn daemon: \(String(cString: strerror(rc)))") }
+    guard argv[0] != nil, argv[1] != nil else { throw POSIXError(.ENOMEM) }
+    try checkSpawn(posix_spawn(&pid, selfPath, &fa, &attr, argv, environ))
     var status: Int32 = 0
     let deadline = ProcessInfo.processInfo.systemUptime + 10
     repeat {
-        if let info = liveDaemon() { return info }
+        if let info = try compatibleDaemon() { return info }
         if waitpid(pid, &status, WNOHANG) == pid {
             if let why = lastLoggedError(since: logStart) { throw CLIError(why) }
             throw CLIError("daemon exited during startup; see \(Paths.log.path)")
@@ -1032,6 +1200,7 @@ func quitApps(_ records: [ManagedApp]) -> Bool {
 /// too, as a single agent would expect. Other sessions' and legacy apps are never touched.
 func stopSession() throws -> [String: Any] {
     let session = try Session.current()
+    try rejectIncompatibleDaemon()
     var quit: [Int32] = []
     var allGone = true
     do {

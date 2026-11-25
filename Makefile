@@ -1,9 +1,13 @@
 PREFIX ?= /opt/homebrew
-BIN := $(shell swift build -c release --show-bin-path)/backstage
+BIN_DIR := $(shell swift build -c release --show-bin-path)
+ifeq ($(strip $(BIN_DIR)),)
+$(error SwiftPM could not resolve the release build directory)
+endif
+BIN := $(BIN_DIR)/backstage
 # Injected into the dev builds and test runners `launch` starts (Sources/BackstageInaudible).
 # backstage looks for it next to itself, then in ../lib/backstage.
 DYLIB_NAME = libbackstage-inaudible.dylib
-DYLIB = $(dir $(BIN))$(DYLIB_NAME)
+DYLIB = $(BIN_DIR)/$(DYLIB_NAME)
 LIBDIR = $(PREFIX)/lib/backstage
 # GUI suites run a fresh copy of the build at a new path each time (see the install rule:
 # ScreenCaptureKit can stop answering one executable path for good).
@@ -14,42 +18,55 @@ endef
 .PHONY: build install uninstall dist test test-cli test-agents test-multi test-concurrency test-focus test-computer-use test-audio test-dock test-launch test-send test-displays test-multidisplay load
 
 build:
-	swift build -c release
+	swift build -c release --product backstage
 	# The injected library, rebuilt universal: an injected app's x86_64 (Rosetta) child would
 	# otherwise fail to start (dyld terminates a process whose inserted library can't load).
 	# Replaced by rename, never in place: running apps have it mapped.
+	@set -e; if [ "$(DYLIB)" -nt Sources/BackstageInaudible/inaudible.c ] && [ "$(DYLIB)" -nt Makefile ] \
+		&& xcrun lipo "$(DYLIB)" -verify_arch arm64 && xcrun lipo "$(DYLIB)" -verify_arch x86_64 \
+		&& codesign --verify --all-architectures "$(DYLIB)"; then exit 0; fi; \
+	staging=$$(mktemp -d "$(BIN_DIR)/.backstage-build.XXXXXX"); \
+	trap 'rm -f "$$staging/$(DYLIB_NAME)"; rmdir "$$staging"' EXIT; \
 	xcrun clang -dynamiclib -O2 -arch arm64 -arch x86_64 -mmacosx-version-min=14.0 -framework CoreAudio \
-		-install_name @rpath/$(DYLIB_NAME) -Wl,-headerpad_max_install_names -o "$(DYLIB).new" Sources/BackstageInaudible/inaudible.c
-	codesign -f -s - "$(DYLIB).new" 2>/dev/null
-	mv -f "$(DYLIB).new" "$(DYLIB)"
+		-install_name @rpath/$(DYLIB_NAME) -Wl,-headerpad_max_install_names -o "$$staging/$(DYLIB_NAME)" Sources/BackstageInaudible/inaudible.c; \
+	codesign -f -s - "$$staging/$(DYLIB_NAME)"; \
+	mv -f "$$staging/$(DYLIB_NAME)" "$(DYLIB)"
 
 install: build
-	mkdir -p "$(PREFIX)/bin"
+	mkdir -p "$(PREFIX)/bin" "$(LIBDIR)"
 	# A real copy, not a symlink into .build: ScreenCaptureKit (replayd) has been seen to stop
 	# answering one executable path for good after many rebuilds and timed-out captures, while
 	# a copy of the same bytes elsewhere works. A copy also keeps running daemons off the build dir.
-	rm -f "$(PREFIX)/bin/backstage.new"
-	cp "$(BIN)" "$(PREFIX)/bin/backstage.new"
-	mv -f "$(PREFIX)/bin/backstage.new" "$(PREFIX)/bin/backstage"
 	# Replaced by rename: apps launched inaudible have the old one mapped, and their children
 	# load it by path.
-	mkdir -p "$(LIBDIR)"
-	rm -f "$(LIBDIR)/$(DYLIB_NAME).new"
-	cp "$(DYLIB)" "$(LIBDIR)/$(DYLIB_NAME).new"
-	mv -f "$(LIBDIR)/$(DYLIB_NAME).new" "$(LIBDIR)/$(DYLIB_NAME)"
+	@set -e; lib=$$(mktemp "$(LIBDIR)/.backstage-lib.XXXXXX"); \
+	trap 'rm -f "$$lib"' EXIT; \
+	stage=$$(mktemp -d "$(PREFIX)/bin/.backstage-bin.XXXXXX"); bin="$$stage/backstage"; \
+	trap 'rm -f "$$lib" "$$bin"; rmdir "$$stage"' EXIT; \
+	cp -p "$(DYLIB)" "$$lib"; cp -p "$(BIN)" "$$bin"; \
+	xcrun strip -S -x "$$bin"; codesign --verify "$$bin"; \
+	mv -f "$$lib" "$(LIBDIR)/$(DYLIB_NAME)"; mv -f "$$bin" "$(PREFIX)/bin/backstage"
 
 uninstall:
-	@if [ -L "$(PREFIX)/bin/backstage" ] && [ "$(PREFIX)/bin/backstage" -ef "$(BIN)" ]; then \
+	@set -e; if [ -L "$(PREFIX)/bin/backstage" ] && [ "$(PREFIX)/bin/backstage" -ef "$(BIN)" ]; then \
 		"$(BIN)" stop --all && rm "$(PREFIX)/bin/backstage"; \
-	elif [ -f "$(PREFIX)/bin/backstage" ] && cmp -s "$(PREFIX)/bin/backstage" "$(BIN)"; then \
+	elif [ ! -L "$(PREFIX)/bin/backstage" ] && [ -f "$(PREFIX)/bin/backstage" ] && [ -f "$(BIN)" ]; then \
+		if ! cmp -s "$(PREFIX)/bin/backstage" "$(BIN)"; then \
+			tmp=$$(mktemp -d); trap 'rm -f "$$tmp/backstage"; rmdir "$$tmp"' EXIT; \
+			xcrun strip -S -x -o "$$tmp/backstage" "$(BIN)"; \
+			cmp -s "$(PREFIX)/bin/backstage" "$$tmp/backstage" || exit 0; \
+		fi; \
 		"$(PREFIX)/bin/backstage" stop --all && rm "$(PREFIX)/bin/backstage" \
-			&& rm -f "$(LIBDIR)/$(DYLIB_NAME)" && { rmdir "$(LIBDIR)" 2>/dev/null || true; }; \
+			&& if [ ! -L "$(LIBDIR)/$(DYLIB_NAME)" ] && cmp -s "$(DYLIB)" "$(LIBDIR)/$(DYLIB_NAME)"; then \
+				rm -f "$(LIBDIR)/$(DYLIB_NAME)" && { rmdir "$(LIBDIR)" 2>/dev/null || true; }; \
+			fi; \
 	fi
 
 # The skill's source of truth is Sources/backstage/Skill.swift; dist/ is generated for packaging.
 dist: build
 	mkdir -p dist/skills/backstage
-	"$(BIN)" skill > dist/skills/backstage/SKILL.md
+	@set -e; tmp=$$(mktemp dist/skills/backstage/.skill.XXXXXX); trap 'rm -f "$$tmp"' EXIT; \
+	"$(BIN)" skill > "$$tmp"; chmod 644 "$$tmp"; mv -f "$$tmp" dist/skills/backstage/SKILL.md
 
 test-cli: build
 	BACKSTAGE_BIN="$(BIN)" bash tests/cli.sh

@@ -44,10 +44,18 @@ cleanup() {
     local result=$?
     trap - EXIT
     [[ -n "$HOLD" ]] && { touch "$WORK/hold.stop"; wait "$HOLD" 2>/dev/null || true; }
-    [[ -n "$WATCH" ]] && { touch "$WORK/watch.stop"; wait "$WATCH" || true; }
-    [[ -n "$SLEEPER" ]] && { kill "$SLEEPER" 2>/dev/null || true; }
+    if [[ -n "$SLEEPER" && " $(jobs -pr | tr '\n' ' ') " == *" $SLEEPER "* ]]; then
+        kill "$SLEEPER" 2>/dev/null || true
+        wait "$SLEEPER" 2>/dev/null || true
+    fi
     if [[ -f "$BACKSTAGE_HOME/daemon.json" || -f "$BACKSTAGE_HOME/apps.json" ]]; then "$BS" stop --all > /dev/null || result=1; fi
-    for p in $PID $RPID; do kill "$p" 2>/dev/null || true; done
+    if [[ -n "$PID" ]]; then "$WORK/sendhelper" terminate "$PID" "$WORK/$NAME.app" || result=1; fi
+    if [[ -n "$RPID" ]]; then "$WORK/sendhelper" terminate "$RPID" "$WORK/$RNAME.app" || result=1; fi
+    if [[ -n "$WATCH" ]]; then
+        touch "$WORK/watch.stop"
+        wait "$WATCH" || result=1
+        tail -5 "$WORK/watch.out"
+    fi
     local lsregister=/System/Library/Frameworks/CoreServices.framework/Frameworks/LaunchServices.framework/Support/lsregister
     for bundle in "$WORK/$NAME.app" "$WORK/$RNAME.app"; do
         [[ -d "$bundle" ]] && "$lsregister" -u "$bundle" > /dev/null 2>&1 || true
@@ -77,17 +85,16 @@ for pair in "$NAME:$BID" "$RNAME:$RBID"; do
 <key>CFBundleExecutable</key><string>$n</string><key>CFBundleIdentifier</key><string>$id</string><key>CFBundleName</key><string>$n</string><key>CFBundlePackageType</key><string>APPL</string><key>NSPrincipalClass</key><string>NSApplication</string></dict></plist>
 PLIST
 done
-swiftc -O sendhelper.swift -o "$WORK/sendhelper"
-swiftc -O watch.swift -o "$WORK/watch"
-swiftc -O audioprobe.swift -o "$WORK/audioprobe"
+swiftc -O sendhelper.swift -o "$WORK/sendhelper" || exit 1
+swiftc -O watch.swift -o "$WORK/watch" || exit 1
+swiftc -O audioprobe.swift -o "$WORK/audioprobe" || exit 1
 # An output-only device for the fixture's silent tone (it makes the fixture a Core Audio client,
 # so it gets a tap; a device with inputs would make macOS ask for the Microphone).
 "$WORK/audioprobe" devices > "$WORK/devices.json"
 DEV=$(jq -r '([.[] | select(.out > 0 and .in == 0 and .default)] + [.[] | select(.out > 0 and .in == 0)])[0].uid // empty' "$WORK/devices.json")
 
-"$WORK/watch" "$BID" 120 "$WORK/watch.stop" > "$WORK/watch.out" 2>&1 &
-WATCH=$!
-sleep 0.3
+. ./watch.sh
+start_watch "$BID" 120 || exit 1
 
 echo "== a macOS keyboard shortcut is refused as the hotkey (checked before any daemon runs)"
 # ⌘⇧3 (screenshot) is enabled on most Macs. With no daemon, nothing is registered either way.
@@ -178,13 +185,13 @@ R=$(refusal "$PID"); [[ "$R" == *"already backstage"* ]] && pass "already manage
 R=$(refusal "$DPID"); [[ "$R" == *"backstage itself"* ]] && pass "the daemon: $R" || fail "the daemon: $R"
 /bin/sleep 60 & SLEEPER=$!
 R=$(refusal "$SLEEPER"); [[ "$R" == *"no app"* ]] && pass "not an app: $R" || fail "not an app: $R"
-kill "$SLEEPER" 2>/dev/null || true; SLEEPER=
+kill "$SLEEPER" 2>/dev/null || true; wait "$SLEEPER" 2>/dev/null || true; SLEEPER=
 RPID=$("$WORK/sendhelper" launch "$WORK/$RNAME.app" "TESTAPP_LOG=$WORK/refused.log" TESTAPP_POLICY=none)
 waitlog "launched" "$WORK/refused.log" || fail "refused fixture didn't start"
 R=$(refusal "$RPID"); [[ "$R" == *"you need it on your screen"* ]] && pass "refused bundle ID: $R" || fail "refused bundle ID: $R"
 "$BS" list --all | jq -e --argjson p "$RPID" '.apps | map(select(.pid == $p)) | length == 0' > /dev/null \
     && pass "the refused app wasn't registered" || fail "refused app registered"
-kill "$RPID" 2>/dev/null || true; RPID=
+"$WORK/sendhelper" terminate "$RPID" "$WORK/$RNAME.app" && RPID= || fail "quit refused fixture"
 grep -q "send backstage: refused pid $DPID" "$LOG" && pass "refusals are logged" || fail "refusal not logged"
 
 echo "== ownership"
@@ -199,8 +206,8 @@ sleep 1
 items | jq -e '.items | length == 1' > /dev/null && pass "with an app running the item stays when Keep is turned off" || fail "item hidden with an app running"
 "$BS" stop --all | jq -e '.ok' > /dev/null && pass "stop --all" || fail "stop --all"
 for _ in $(seq 1 30); do kill -0 "$PID" 2>/dev/null || break; sleep 0.1; done
-kill -0 "$PID" 2>/dev/null && fail "stop --all left the sent app running" || pass "stop --all quit the sent app"
-PID=
+if kill -0 "$PID" 2>/dev/null; then fail "stop --all left the sent app running"
+else pass "stop --all quit the sent app"; PID=; fi
 
 echo "== Keep in Menu Bar off: hidden with no apps, then idle exit"
 DPID=$("$BS" start | jq -r .pid)

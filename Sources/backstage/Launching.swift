@@ -113,17 +113,21 @@ struct LaunchTarget {
 
     /// The new process: an instance of the bundle carrying this launch's token or log (for a
     /// bare executable, also running that executable), found by the PID in the receipt when there
-    /// is one. `isNew` filters out processes that existed before the launch.
-    func find(isNew: (pid_t) -> Bool) -> (app: NSRunningApplication?, pid: pid_t, birth: UInt64)? {
+    /// is one. `notBefore` and `considering` filter out processes that existed before the launch.
+    func find(notBefore: Double, considering: (pid_t) -> Bool = { _ in true }) -> (app: NSRunningApplication?, pid: pid_t, birth: UInt64)? {
+        func isNew(_ pid: pid_t) -> Bool {
+            considering(pid) && (processBirth(pid).map { Double($0) / 1e6 >= notBefore } ?? false)
+        }
         if executable != nil, let reported = receiptPID() {
-            guard reported > 0, isNew(reported) else { return nil }
-            return verify(reported)
+            guard reported > 0, isNew(reported), let found = verify(reported),
+                  Double(found.birth) / 1e6 >= notBefore else { return nil }
+            return found
         }
         for app in NSWorkspace.shared.runningApplications {
             let pid = app.processIdentifier
             guard isNew(pid), !app.isTerminated,
                   app.bundleURL?.resolvingSymlinksInPath().standardizedFileURL == bundle else { continue }
-            if let found = verify(pid, app: app, bundleMatches: true) { return found }
+            if let found = verify(pid, app: app, bundleMatches: true), Double(found.birth) / 1e6 >= notBefore { return found }
         }
         // Not (yet) a registered application: LaunchServices can lag far behind the process it
         // started under heavy load, or never check it in. Look through every process for the one
@@ -134,7 +138,8 @@ struct LaunchTarget {
         guard stat(exe.path, &expected) == 0 else { return nil }
         var oldest: (app: NSRunningApplication?, pid: pid_t, birth: UInt64)?
         for pid in allProcessIDs() where isNew(pid) && runs(pid, expected) {
-            if let found = verify(pid), found.birth < oldest?.birth ?? .max { oldest = found }
+            if let found = verify(pid), Double(found.birth) / 1e6 >= notBefore,
+               found.birth < oldest?.birth ?? .max { oldest = found }
         }
         return oldest
     }
@@ -200,7 +205,7 @@ func hasLaunchToken(_ pid: pid_t, assignment: String) -> Bool {
 /// and quits everything. `registered` tells apps that made it into the registry; `didRegister`
 /// is told about apps this registered. Returns the processes it quit.
 @discardableResult
-func reapOrphanLaunches(deadSince: inout [String: Double], registered: (pid_t, UInt64) -> Bool,
+func reapOrphanLaunches(deadSince: inout [String: Double], registered: (pid_t, UInt64) throws -> Bool,
                         final: Bool = false, didRegister: (pid_t, UInt64) -> Void = { _, _ in },
                         log: (String) -> Void) -> [pid_t] {
     let now = Date().timeIntervalSince1970
@@ -212,11 +217,14 @@ func reapOrphanLaunches(deadSince: inout [String: Double], registered: (pid_t, U
         let died = deadSince[record.id] ?? now
         deadSince[record.id] = died
         let handedOver = record.handedOver == true && !final
-        let found = record.target?.find { pid in
-            processBirth(pid).map { Double($0) / 1e6 >= record.startedAt - 1 } ?? false
-        }
+        let found = record.target?.find(notBefore: record.startedAt - 1)
         if let (app, pid, birth) = found {
-            if !registered(pid, birth), processBirth(pid) == birth {
+            guard let alreadyRegistered = try? registered(pid, birth) else {
+                // The app registry may have become unreadable since the daemon last checked it.
+                // Keep the provisional record for a later retry when ownership can be verified.
+                continue
+            }
+            if !alreadyRegistered, processBirth(pid) == birth {
                 var why = "its launch (\(record.id)) ended before registering it"
                 if handedOver {
                     switch registerHandedOver(record, pid: pid, birth: birth) {
@@ -232,8 +240,14 @@ func reapOrphanLaunches(deadSince: inout [String: Double], registered: (pid_t, U
                 }
                 if !why.isEmpty {
                     log("quitting pid \(pid): \(why)")
-                    if app?.forceTerminate() != true, processBirth(pid) == birth { _ = kill(pid, SIGKILL) }
-                    quit.append(pid)
+                    if processBirth(pid) == birth {
+                        let requested = app?.forceTerminate() == true || (processBirth(pid) == birth && kill(pid, SIGKILL) == 0)
+                        if requested { quit.append(pid) }
+                        else if processBirth(pid) == birth {
+                            log("couldn't quit pid \(pid) during launch cleanup")
+                            if !final { continue }
+                        }
+                    }
                 }
             }
         } else if handedOver {
@@ -244,6 +258,7 @@ func reapOrphanLaunches(deadSince: inout [String: Double], registered: (pid_t, U
         }
         Launching.end(record.id)
         try? FileManager.default.removeItem(at: record.receipt)
+        try? FileManager.default.removeItem(at: InaudibleLibrary.ackFile(record.id))
         deadSince[record.id] = nil
     }
     return quit
@@ -269,26 +284,18 @@ func registerHandedOver(_ launch: LaunchRecord, pid: pid_t, birth: UInt64) -> Ha
     let url = URL(fileURLWithPath: launch.bundle)
     let bundle = Bundle(url: url)
     var mode = AudioMode(launch.audio)
-    let ack = InaudibleLibrary.ackFile(launch.id)
-    if mode == .inaudible {
-        let parts = ((try? String(contentsOf: ack, encoding: .utf8)) ?? "").split(whereSeparator: { $0 == " " || $0 == "\n" })
-        let status = parts.count >= 2 && pid_t(parts[0]) == pid ? Int32(parts[1]) : nil
-        let confirmed: Bool = status.map { $0 == 0 }
-            ?? InaudibleLibrary.locate().map { processMaps(pid, $0) }
-            ?? false
-        if !confirmed {
-            if launch.forcedInaudible == true {
-                try? FileManager.default.removeItem(at: ack)
-                return .refused("couldn't confirm that its launch (\(launch.id)) made it inaudible")
-            }
-            mode = .muted
+    if mode == .inaudible, readInaudibleAcknowledgement(pid: pid, launchID: launch.id) != 0 {
+        // Give a process that just appeared time to write its startup acknowledgement.
+        if Date().timeIntervalSince1970 - Double(birth) / 1e6 < 2 { return .busy }
+        if launch.forcedInaudible == true {
+            return .refused("couldn't confirm that its launch (\(launch.id)) made it inaudible")
         }
+        mode = .muted
     }
     let record = ManagedApp(pid: pid, name: (bundle?.infoDictionary?["CFBundleName"] as? String) ?? url.deletingPathExtension().lastPathComponent,
                             bundleID: bundle?.bundleIdentifier, path: launch.bundle, launchedAt: Date().timeIntervalSince1970,
                             stdout: launch.log, processStart: birth, agent: launch.agent, agentPID: launch.agentPID,
                             session: launch.session, audio: mode.rawValue, display: launch.display)
     do { try AppStore.add(record) } catch { return processBirth(pid) == birth ? .busy : .gone }
-    try? FileManager.default.removeItem(at: ack)
     return .registered
 }
