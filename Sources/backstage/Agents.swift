@@ -219,6 +219,7 @@ func handOver(_ record: ManagedApp, wait: Bool = true) throws -> (unmuted: Bool,
     }
     try checkProcess()
     try AppStore.update { $0.removeAll(where: same) }
+    Placement.set(record, slot: nil)   // before its windows move: the app's own hook mustn't pull new ones back
     pump(0.2) // the daemon re-reads the app list on change; give it a beat so it stops pulling windows back
     // The daemon sees the handover and destroys the app's tap: from then on the user hears it.
     let status = record.processStart.map { AudioFiles.status(pid, $0) }

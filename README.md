@@ -97,7 +97,7 @@ What changed in each version: [CHANGELOG.md](CHANGELOG.md).
 | Invisible screen | A background daemon creates a private Retina (2x) `CGVirtualDisplay` (the API DeskPad/BetterDisplay use), the same size in points as your main display, and parks it touching only the bottom-right corner of your desktop (never along an edge, so neither your cursor nor the Dock can drift onto it). If the cursor ever gets onto it, the cursor is warped back. |
 | Launch without popping up | LaunchServices' own open call (the one behind `open -g -j -n`): background, hidden, fresh instance. The windows are moved to the virtual display while still hidden, then unhidden there. |
 | No Dock tile | The same call passes a private LaunchServices option that starts the app as a UIElement, the way menu bar apps run: no Dock tile, not in ⌘-Tab, no change to the app's bundle. `launch` reports `"dock": "hidden"`, or `"visible (app made itself a regular app)"` for an app that undoes it (see [Limits](#limits-read-these)). `show` makes the app a regular app again before handing it over. |
-| Windows the app opens later | An AX observer (with 50 ms polling as backup) moves them to the virtual display as soon as they're created. |
+| Windows the app opens later | Dev builds and test runners place their own: the injected library (below) moves each window onto the virtual display just before AppKit first shows it, so a new window never appears on your screen. For other apps, and for a window an app itself moves onto your screen while it's shown, an AX observer (with 50 ms polling as backup) moves it back as soon as it's seen, which can show it on your screen for a moment. |
 | Your windows that wander backstage | An app you relaunch can reopen a window where it last was, which may be a hidden display (macOS remembers backstage's fixed displays like any monitor). The daemon returns windows of apps it doesn't run to your main screen after 3 s, moving them without taking focus; **Recover Lost Windows** and `backstage recover` do it at once. Apps an agent launched are never put on your screen this way. |
 | Focus stealing | The app is never activated. If it activates itself, the daemon hands focus back to your app. |
 | Screenshots | ScreenCaptureKit, filtered to that app's windows (menus, sheets and popovers included). Captures take turns across all sessions: on macOS 27, two processes capturing at once both hang. Each takes about 0.1–0.2 s. |
@@ -485,7 +485,8 @@ make test           # all of the above, then a GUI fixture app driven through ev
                     # `make test-multidisplay`), and stray windows coming back
                     # (tests/strays.sh; `make test-strays`), and restarts that keep the
                     # display: zero display reconfigurations (tests/restart.sh;
-                    # `make test-restart`). GUI suites use displays 7-8 only
+                    # `make test-restart`), and windows placed before they're shown
+                    # (tests/placement.sh; `make test-placement`). GUI suites use displays 7-8 only
 tests/audio-leak.sh --dedicated   # audio leak suite: dedicated Mac with a loopback as default output
 make dist           # regenerate dist/skills/backstage/SKILL.md from Sources/backstage/Skill.swift
 make load           # load harness, 2-session smoke (not in `make test`); full runs need a

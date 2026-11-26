@@ -587,6 +587,7 @@ final class Daemon {
         try AppStore.update { list in
             for i in list.indices where list[i].display == slot && pids.contains(list[i].pid) { list[i].display = nil }
         }
+        for app in apps { Placement.set(app, slot: display.slot) }
         reloadManaged(now: ProcessInfo.processInfo.systemUptime)
         // Windows first, display after: windows left on a display that goes are moved by macOS,
         // possibly onto the user's screen.
@@ -668,6 +669,7 @@ final class Daemon {
             }
         } catch { return "couldn't update the app registry: \(error)" }
         guard updated > 0 else { return "\(record.name) is no longer managed" }
+        Placement.set(record, slot: slot)
         reloadManaged(now: ProcessInfo.processInfo.systemUptime)
         var placed: [CGRect] = []
         for w in axApp(record.pid).windows where (w.attr(kAXMinimizedAttribute) as? Bool) != true {
@@ -910,7 +912,9 @@ final class Daemon {
         // Get the window off the user's screen before calculating a tidy spot.
         guard w.setPosition(inset) == .success else { return }
         placeBeside(w, display: b)
-        log("observer moved new window of pid \(pid)")
+        // Apps that accept the injected library place their own windows before they appear
+        // (Placement), so this line means a window was drawn off the display first.
+        log("observer moved \(created ? "new" : "a") window of pid \(pid) from \(state.frame.integral)")
     }
 
     var nextReload = 0.0

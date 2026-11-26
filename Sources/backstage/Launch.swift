@@ -176,8 +176,9 @@ private func launchResolved(_ url: URL, bareExecutable: URL?, args: Args, info: 
     guard !env.contains(where: { $0 == tokenKey || $0.hasPrefix(tokenKey + "=") }) else {
         throw CLIError("\(tokenKey) is reserved for launch identification")
     }
-    guard !env.contains(where: { $0 == InaudibleLibrary.ackKey || $0.hasPrefix(InaudibleLibrary.ackKey + "=") }) else {
-        throw CLIError("\(InaudibleLibrary.ackKey) is reserved for inaudible launches")
+    for key in [InaudibleLibrary.ackKey, InaudibleLibrary.audibleKey, Placement.envKey]
+    where env.contains(where: { $0 == key || $0.hasPrefix(key + "=") }) {
+        throw CLIError("\(key) is reserved for backstage's injected library")
     }
     let logURL = Paths.appLogs.appendingPathComponent("\(launchID).log")
     let fd = open(logURL.path, O_CREAT | O_EXCL | O_RDWR | O_CLOEXEC, 0o600)
@@ -219,12 +220,16 @@ private func launchResolved(_ url: URL, bareExecutable: URL?, args: Args, info: 
     // Qt makes its apps regular (Dock) apps at startup unless this is set.
     let qtKey = "QT_MAC_DISABLE_FOREGROUND_APPLICATION_TRANSFORM"
     if hideFromDock, environment[qtKey] == nil, usesQt(url, executable: bareExecutable) { environment[qtKey] = "1" }
-    // Inaudible: dyld loads the library into the app before its own code runs (and into every
-    // child that inherits the variable and accepts it). LaunchServices passes DYLD_* through.
-    if audio.mode == .inaudible, let library = audio.library {
+    // dyld loads the library into the app before its own code runs (and into every child that
+    // inherits the variable and accepts it). LaunchServices passes DYLD_* through. It makes the
+    // app inaudible, unless --audio, and puts its windows on the display (Placement).
+    let placement = Placement.file(launchLog: logURL.path)
+    if let library = audio.library, audio.mode == .inaudible || audio.mode == .metered {
         let insert = "DYLD_INSERT_LIBRARIES"
         environment[insert] = ([library.path] + (environment[insert].map { [$0] } ?? [])).filter { !$0.isEmpty }.joined(separator: ":")
-        environment[InaudibleLibrary.ackKey] = ack.path
+        if audio.mode == .inaudible { environment[InaudibleLibrary.ackKey] = ack.path } else { environment[InaudibleLibrary.audibleKey] = "1" }
+        try Placement.begin(placement, slot: slot)
+        environment[Placement.envKey] = placement.path
     }
 
     let clock = ProcessInfo.processInfo

@@ -229,6 +229,7 @@ func releaseToUser(_ record: ManagedApp, log: (String) -> Void) {
         }
     } catch { log("couldn't release pid \(record.pid) to the user: \(error)"); return }
     guard removed else { return }
+    Placement.set(record, slot: nil)
     if record.matchesProcess, let target = userDisplayBounds().first {
         for (i, w) in axApp(record.pid).windows.enumerated() {
             guard record.matchesProcess else { break }

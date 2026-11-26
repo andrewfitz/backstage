@@ -1,5 +1,17 @@
 # Changelog
 
+## 1.3.6
+
+- **New windows no longer flash on your screen.** A window an agent's dev build or test runner
+  opened appeared on your screen for a moment before the daemon moved it backstage (a test
+  suite showing windows could flash dozens). The injected library now moves each window onto
+  the hidden display just before it's first shown, for every way of showing a window and in test
+  bundles that load AppKit late. `--audio` launches get this too. Signed, hardened and Apple
+  apps can't take the library, and a window an app moves onto your screen while it's shown is
+  still moved back after the fact, as before. An app that puts a window on another screen on
+  purpose (a second-monitor feature) gets it on its own hidden display instead.
+- The daemon's log says what kind of move the window observer made and from where.
+
 ## 1.3.5
 
 - **Restarts no longer blink your monitor.** Adding or removing a display makes macOS reconfigure

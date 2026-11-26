@@ -119,6 +119,7 @@ func cmdMove(_ args: Args) throws -> [String: Any] {
         throw CLIError("pid \(app.pid) is no longer a managed app (it was shown on the user's screen or quit)")
     }
     if slot == from { return ["pid": app.pid, "display": slot, "moved": 0] }
+    Placement.set(app, slot: slot)
     // Place its windows on the new display; the daemon's guard keeps them there from now on.
     var placed: [CGRect] = []
     var moved = 0

@@ -156,6 +156,18 @@ If your session runs `stop` in the meantime, the daemon quits the app instead.
   is missing or reports failure, a default launch reports `muted` and includes the reason.
   A `DYLD_INSERT_LIBRARIES` you pass with `--env` is kept
   (the library is put first).
+- **The same library places the app's windows.** Just before AppKit shows a window for the first
+  time, it moves the window onto the app's backstage display, keeping its size and its position
+  relative to the screen it would have opened on, so a new window never appears on the user's
+  screen. (A window the app itself moves onto the user's screen while it's shown is moved back
+  by the daemon's observer, after the fact.) Sheets, popovers, child windows and windows already on a backstage display are left
+  alone. This works for every way of showing a window, including in test bundles that load
+  AppKit late (`xctest`). `--audio` launches of qualifying targets get the library for this
+  alone (they stay audible). `move`, closing a display and `show --pid` update where new windows
+  go before moving anything. Apps that don't qualify (signed, hardened, Apple) rely on the
+  daemon's observer, which moves a window after it appeared and can show it on the user's
+  screen for a moment. An app that puts a window on "another screen" on purpose sees it land on
+  its own display instead.
 - **Which targets qualify:** the process's real executable (a bundle's `CFBundleExecutable`, or
   the bare executable itself) must be a Mach-O that dyld honours DYLD variables for: not
   SIP-protected (`/System`, `/usr`, `/bin`, `/sbin`), not an Apple platform binary, not
@@ -770,4 +782,4 @@ variables only reorder the advice: nothing extra is allowed.
 | `BACKSTAGE_TEST_AUDIO` | — | Tests only (set before the daemon starts): `mute-fail`, `tap-fail` or `no-capture` simulate those failures |
 | `BACKSTAGE_INAUDIBLE_DYLIB` | next to the binary, else `../lib/backstage/` | Path of `libbackstage-inaudible.dylib` for `launch`; empty means none (tests: the fallback to muted) |
 
-`BACKSTAGE_LAUNCH_ID`, `BACKSTAGE_INAUDIBLE_ACK` and `BACKSTAGE_CAPTURE_RETRY` are internal (set by backstage for the processes it starts); `launch` refuses the first two in `--env`.
+`BACKSTAGE_LAUNCH_ID`, `BACKSTAGE_INAUDIBLE_ACK`, `BACKSTAGE_AUDIBLE`, `BACKSTAGE_PLACEMENT` and `BACKSTAGE_CAPTURE_RETRY` are internal (set by backstage for the processes it starts); `launch` refuses all but the last in `--env`.

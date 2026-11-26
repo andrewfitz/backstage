@@ -49,6 +49,41 @@ enum InaudibleLibrary {
     }
 
     static func ackFile(_ launchID: String) -> URL { Paths.appLogs.appendingPathComponent("\(launchID).inaudible") }
+    /// Set (to "1") when the library is inserted only for window placement (`launch --audio`).
+    static let audibleKey = "BACKSTAGE_AUDIBLE"
+}
+
+/// Window placement from inside the app. The library `launch` inserts also keeps an app's windows
+/// off the user's screen: just before a window first appears, it moves it onto the backstage
+/// display named in the launch's placement file, so the window is never drawn anywhere else. (The
+/// daemon's Accessibility observer moves windows only after they appeared, which can flash them on
+/// the user's screen; it remains for apps that don't accept the library.) Whatever changes an app's
+/// display rewrites the file first: `move`, Move to, closing a display, and handing the app to the
+/// user ("off").
+enum Placement {
+    static let envKey = "BACKSTAGE_PLACEMENT"
+
+    static func file(launchLog: String) -> URL {
+        URL(fileURLWithPath: launchLog).deletingPathExtension().appendingPathExtension("place")
+    }
+
+    /// Writes the file for a new launch.
+    static func begin(_ url: URL, slot: Int) throws {
+        try contents(slot).write(to: url, atomically: true, encoding: .utf8)
+    }
+
+    /// The app's windows belong on `slot` from now on; nil: nowhere (it was handed to the user).
+    /// Only for apps launched with placement (their file exists).
+    static func set(_ record: ManagedApp, slot: Int?) {
+        guard let log = record.stdout else { return }
+        let url = file(launchLog: log)
+        guard FileManager.default.fileExists(atPath: url.path) else { return }
+        try? contents(slot).write(to: url, atomically: true, encoding: .utf8)
+    }
+
+    private static func contents(_ slot: Int?) -> String {
+        slot.map { "serial \(displaySerial(slot: $0))\n" } ?? "off\n"
+    }
 }
 
 /// What `launch` will do about an app's sound.
@@ -66,8 +101,10 @@ func planAudio(_ args: Args, executable: URL, name: String) throws -> AudioPlan 
     let wantsAudio = args.has("audio"), forced = args.has("inaudible")
     if wantsAudio && forced { throw CLIError("--audio and --inaudible exclude each other") }
     if wantsAudio {
+        // Audible, but the library still keeps its windows off the user's screen (Placement).
+        let library = InaudibleLibrary.locate().flatMap { inaudibleEligibility(executable, library: $0).eligible ? $0 : nil }
         return AudioPlan(mode: .metered, reason: "--audio: muted on this Mac's outputs and measured; screen sharing, remote desktop and recordings of the Mac can still hear it",
-                         library: nil, forced: false)
+                         library: library, forced: false)
     }
     guard let library = InaudibleLibrary.locate() else {
         let missing = "\(InaudibleLibrary.fileName) wasn't found next to the backstage binary or in ../lib/backstage (reinstall with `make install`)"
