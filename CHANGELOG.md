@@ -1,6 +1,6 @@
 # Changelog
 
-## Unreleased
+## 1.3.4
 
 - **Fix: test runners launched through a script escaped.** A script that `exec`s another binary
   (`exec xctest …` with its output sent elsewhere) was never recognised as the launch's process:
