@@ -70,7 +70,8 @@ struct Args {
                                 "audio", "inaudible", "dry-run"]
         let values: Set<String> = ["pid", "app", "env", "timeout", "lines", "scale", "o", "out",
                                    "window", "depth", "role", "text", "ref", "steps", "dx", "dy", "since", "min-db", "seconds",
-                                   "focus-to", "bundle-id", "name", "path", "display", "displays", "page", "appearance"]
+                                   "focus-to", "bundle-id", "name", "path", "display", "displays", "page", "appearance",
+                                   "id", "width", "height", "choice"]
         var i = 0
         while i < raw.count {
             let token = raw[i]
@@ -188,6 +189,7 @@ struct Args {
         case "drag": allowed = target + ["scale", "steps"]; arity = 4...4
         case "__menu-thumbnail": allowed = []; arity = 4...4
         case "__menu-render": allowed = ["displays", "page", "o", "appearance"]; arity = 0...0
+        case "__display-host": allowed = ["id", "width", "height", "scale", "choice", "role"]; arity = 0...0
         case "move":
             allowed = target + ["display"]; arity = 0...0
             if let d = opt("display"), d != "new", !(Int(d).map { displaySlots.contains($0) } ?? false) {

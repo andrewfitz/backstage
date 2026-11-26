@@ -210,8 +210,19 @@ final class Daemon {
             throw CLIError("BACKSTAGE_IDLE_TIMEOUT must be a finite nonnegative number of seconds")
         }
         idleTimeout = timeout
-        display = try AgentDisplay(width: w, height: h, scale: scale)
+        // The previous daemon's display, if its host is still lingering: a restart then changes
+        // nothing on the user's screens (see DisplayHost.swift).
+        let linger = DisplayHosts.homeLinger()
+        var early: [String] = []
+        if let host = adoptHomeDisplayHost(width: w, height: h, scale: scale, linger: linger, log: { early.append($0) }) {
+            display = AgentDisplay(adopting: host)
+        } else {
+            display = try AgentDisplay(width: w, height: h, scale: scale, linger: linger)
+        }
+        startupNotes = early
     }
+    /// Lines from before the log is set up (display adoption), logged once the daemon is up.
+    private var startupNotes: [String] = []
 
     private let logLock = NSLock()
     private let logDateFormatter = ISO8601DateFormatter()
@@ -228,7 +239,9 @@ final class Daemon {
         guard waitFor(timeout: 5, { activeDisplays().contains(display.id) ? true : nil }) != nil else {
             throw CLIError("could not bring the agent display online")
         }
-        guard display.park(force: true) else { throw CLIError("could not park the agent display") }
+        for note in startupNotes { log(note) }
+        // An adopted display is already parked: moving it would reconfigure the user's displays.
+        guard display.park(force: !display.adopted) else { throw CLIError("could not park the agent display") }
         guard display.selectMode() else {
             throw CLIError("could not set the agent display to \(display.size.width)x\(display.size.height) points at \(display.size.scale)x")
         }
@@ -966,6 +979,28 @@ final class Daemon {
         }
     }
 
+    /// Once a second: a display whose host died is gone. The primary one takes the daemon with it
+    /// (as a display the system removed always has); an extra one is dropped.
+    var nextHostCheck = 0.0
+    func checkDisplayHosts(now: Double) {
+        guard now >= nextHostCheck, !stopping else { return }
+        nextHostCheck = now + 1
+        if !display.hostAlive {
+            log("the display host (pid \(display.hostPID)) exited")
+            shutdown(reason: "its display went away (display host exited)")
+            return
+        }
+        for (slot, d) in extras where !d.hostAlive {
+            log("display \(slot) went away: its host (pid \(d.hostPID)) exited")
+            extras[slot] = nil
+            extraCreated[slot] = nil
+            reservations[slot] = nil
+            refreshScreens()
+            try? writeInfo()
+            statusMenu?.displaysChanged()
+        }
+    }
+
     var nextGuardLog = 0.0
     private var ticking = false
     func tick() {
@@ -975,6 +1010,7 @@ final class Daemon {
         let now = ProcessInfo.processInfo.systemUptime
         // The lifecycle lock may still be held by a launch. Keep guarding while we wait.
         if let reason = pendingShutdown { shutdown(reason: reason) }
+        checkDisplayHosts(now: now)
         reloadManaged(now: now)
         var geometry: DisplayGeometry?
         if now >= nextArrangementCheck {
@@ -1268,6 +1304,15 @@ final class Daemon {
         }
         // The apps are gone: now their taps can go.
         audioTaps?.shutdown()
+        // Extra displays go now. The primary one stays a few seconds for the next daemon after a
+        // `stop` (a signal), so a restart doesn't reconfigure the user's displays; any other
+        // shutdown (the last monitor unplugged, the display couldn't be parked) removes it.
+        for slot in extras.keys.sorted() { extras[slot]?.remove() }
+        if !reason.hasPrefix("signal") || DisplayHosts.homeLinger() == 0 {
+            display.remove()
+        } else {
+            log("leaving display \(display.slot) to its host for \(Int(DisplayHosts.homeLinger())) s, for the next daemon")
+        }
         unlink(Paths.daemon.path)
         inputGuard.logActivity(log, force: true)
         log("bye")

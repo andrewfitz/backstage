@@ -1,5 +1,14 @@
 # Changelog
 
+## Unreleased
+
+- **Restarts no longer blink your monitor.** Adding or removing a display makes macOS reconfigure
+  every display (10 reconfigurations for one restart, measured), and some monitors blank for it.
+  Displays now live in a small helper process, the display host, and after `stop`/`stop --all`
+  the primary display stays 15 s for the next daemon to take over: `stop --all && start` and
+  upgrades change nothing on your screens (0 reconfigurations). `BACKSTAGE_DISPLAY_LINGER` sets
+  the time; other homes default to 0. The upgrade to this version still blinks once.
+
 ## 1.3.4
 
 - **Fix: test runners launched through a script escaped.** A script that `exec`s another binary

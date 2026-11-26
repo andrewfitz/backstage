@@ -274,6 +274,16 @@ daemon also exits by itself after `BACKSTAGE_IDLE_TIMEOUT` seconds (default 1800
 session has managed apps (only with Auto-Hide When Idle on; the timeout starts over when it's
 turned on), or when no physical display is left.
 
+**Restarts don't touch your monitor.** Each display lives in a small helper process, the display
+host (`backstage __display-host`), not in the daemon, because adding or removing a display makes
+macOS reconfigure every display, and some monitors blank for that. After `stop` or `stop --all`
+in `~/.backstage`, the primary display stays for `BACKSTAGE_DISPLAY_LINGER` seconds (default 15;
+0 in any other home, so tests' displays go with their daemon), and a daemon started meanwhile
+takes it over: `stop --all && start`, or an upgrade between them, changes nothing on your
+screens. Nothing is on it meanwhile (its apps were quit first), and it's parked at your
+desktop's corner as usual. Extra displays, an idle exit and any other shutdown remove displays at
+once. If a display's host dies, its display goes; for the primary, the daemon shuts down with it.
+
 ### `settings`
 
 ```
@@ -748,6 +758,7 @@ variables only reorder the advice: nothing extra is allowed.
 | `BACKSTAGE_WIDTH` / `BACKSTAGE_HEIGHT` | main display's size | Agent display size in points (set before the daemon starts) |
 | `BACKSTAGE_SCALE` | 2 | Agent display backing scale: `2` is Retina, `1` gives a 1x display (set before the daemon starts) |
 | `BACKSTAGE_IDLE_TIMEOUT` | 1800 | Seconds with no managed apps before the daemon exits (only with Auto-Hide When Idle on) |
+| `BACKSTAGE_DISPLAY_LINGER` | 15 in `~/.backstage`, else 0 | Seconds the primary display outlives a stopped daemon, for the next one to take over without a display change (at most 300) |
 | `BACKSTAGE_MENUBAR` | on | `off` hides the menu bar indicator, and with it the hotkey and Auto-Hide When Idle (set before the daemon starts) |
 | `BACKSTAGE_TEST_HOOKS` | — | Tests only: `1` allows `backstage __send-backstage --pid P`, the Send Front Window Backstage path the menu and hotkey run |
 | `BACKSTAGE_TEST_REFUSE` | — | Tests only: one more bundle-ID prefix Send Front Window Backstage refuses |

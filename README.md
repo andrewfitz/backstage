@@ -358,7 +358,8 @@ backstage quit
 
 Settings (environment for the daemon): `BACKSTAGE_WIDTH`/`BACKSTAGE_HEIGHT` (points, default: your main display's size),
 `BACKSTAGE_SCALE` (default 2, Retina; `1` for a 1x display),
-`BACKSTAGE_IDLE_TIMEOUT` (seconds, default 1800), `BACKSTAGE_HOME` (default `~/.backstage`),
+`BACKSTAGE_IDLE_TIMEOUT` (seconds, default 1800), `BACKSTAGE_DISPLAY_LINGER` (seconds the display
+outlives a stopped daemon so a restart doesn't blink your monitor, default 15), `BACKSTAGE_HOME` (default `~/.backstage`),
 `BACKSTAGE_MENUBAR=off` (no menu bar icon). Per command: `BACKSTAGE_SESSION=<name>` picks the session.
 Your settings: `backstage settings auto-hide on|off` and `backstage settings hotkey <combo|off>`
 (see [Menu bar indicator](#menu-bar-indicator)); `backstage settings` and `status` show them.
@@ -482,7 +483,9 @@ make test           # all of the above, then a GUI fixture app driven through ev
                     # several displays per daemon: --display new, reservations, move,
                     # close-display, the menu's layouts (tests/multidisplay.sh;
                     # `make test-multidisplay`), and stray windows coming back
-                    # (tests/strays.sh; `make test-strays`). GUI suites use displays 7-8 only
+                    # (tests/strays.sh; `make test-strays`), and restarts that keep the
+                    # display: zero display reconfigurations (tests/restart.sh;
+                    # `make test-restart`). GUI suites use displays 7-8 only
 tests/audio-leak.sh --dedicated   # audio leak suite: dedicated Mac with a loopback as default output
 make dist           # regenerate dist/skills/backstage/SKILL.md from Sources/backstage/Skill.swift
 make load           # load harness, 2-session smoke (not in `make test`); full runs need a

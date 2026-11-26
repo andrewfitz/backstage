@@ -693,6 +693,7 @@ func run() throws {
         // Tests: give a managed app its Dock tile back as `show` does, without moving or activating it.
         let app = try managedApp(args)
         emit(["ok": true, "pid": app.pid, "dock": restoreDock(app.pid), "type": LaunchServices.applicationType(app.pid) ?? "unknown"])
+    case "__display-host": runDisplayHost(args)
     case "__daemon":
         try Paths.ensure()
         let d = try Daemon()

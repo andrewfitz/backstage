@@ -192,11 +192,17 @@ func dockWindowBounds(from onscreen: [[String: Any]]?) -> CGRect? {
     return dockBounds(in: windows)
 }
 
-/// Holds the private CGVirtualDisplay alive. Dropping it removes the display.
+/// A backstage display, held by its display host process (DisplayHost.swift). Dropping it
+/// ends the host, which removes the display; a daemon that exits leaves its primary display's
+/// host to linger for the next daemon (`DisplayHosts.homeLinger`).
 final class AgentDisplay {
-    let display: CGVirtualDisplay
-    var id: CGDirectDisplayID { display.displayID }
+    let id: CGDirectDisplayID
     var bounds: CGRect { CGDisplayBounds(id) }
+    let hostID: String
+    let hostPID: pid_t
+    let hostStart: UInt64
+    /// Taken over from the previous daemon's host: already online, parked and sized.
+    let adopted: Bool
 
     /// `width`×`height` is the size in points; `scale` (1 or 2) is the backing scale factor.
     /// Which slot to take: the home's (BACKSTAGE_DISPLAY, or 1 for the default home, else the
@@ -204,87 +210,43 @@ final class AgentDisplay {
     /// lowest free of some (`launch --display new`).
     enum SlotChoice { case home, exactly(Int), lowestFree([Int]) }
 
-    init(width: UInt32, height: UInt32, scale: UInt32, choice: SlotChoice = .home) throws {
-        // One display identity per slot: choose and create under a lock shared by every home,
-        // held until the new display is online, so two daemons can't take the same slot.
-        // Each attempt locks only while it chooses and creates; a successful one keeps the lock
-        // until the display is online. Waiting for a busy slot never holds it, so other homes
-        // and the daemon's own extra displays aren't stalled meanwhile.
-        var held: UserLock?
-        defer { held?.release() }
-        func locked(_ body: () throws -> (CGVirtualDisplay, Int)?) throws -> (CGVirtualDisplay, Int)? {
-            guard let lock = UserLock("displays.lock") else { throw CLIError("cannot lock the backstage displays for this user") }
-            let result = try body()
-            if result != nil { held = lock } else { lock.release() }
-            return result
-        }
-        func make(_ slot: Int) -> CGVirtualDisplay? {
-            let d = CGVirtualDisplayDescriptor()
-            d.queue = DispatchQueue.main
-            d.name = DisplayRegistry.displayName
-            d.maxPixelsWide = width * scale
-            d.maxPixelsHigh = height * scale
-            // 100 points per inch, whatever the scale
-            d.sizeInMillimeters = CGSize(width: Double(width) * 0.254, height: Double(height) * 0.254)
-            d.vendorID = kVendor
-            d.productID = kProduct
-            d.serialNum = displaySerial(slot: slot)
-            d.terminationHandler = { _, _ in eprint("virtual display terminated by system") }
-            return CGVirtualDisplay(descriptor: d)
-        }
-        func lowestFree(_ slots: [Int]) throws -> (CGVirtualDisplay, Int)? {
-            try locked {
-                guard let inUse = displaySlotsInUse() else { throw CLIError("cannot list the online displays") }
-                for slot in slots where !inUse.contains(slot) { if let vd = make(slot) { return (vd, slot) } }
-                return nil
-            }
-        }
-        func exactly(_ wanted: Int, wait: Double) throws -> (CGVirtualDisplay, Int)? {
-            // Right after a stop, the old display can still be online for a moment.
-            try waitFor(timeout: wait, interval: 0.25) { () throws -> (CGVirtualDisplay, Int)? in
-                try locked {
-                    guard let inUse = displaySlotsInUse() else { throw CLIError("cannot list the online displays") }
-                    guard !inUse.contains(wanted), let vd = make(wanted) else { return nil }
-                    return (vd, wanted)
-                }
-            }
-        }
-        var created: (CGVirtualDisplay, Int)?
-        switch choice {
-        case .home:
-            if let wanted = try requestedDisplaySlot() {
-                created = try exactly(wanted, wait: 5)
-                guard created != nil else { throw CLIError("display \(wanted) is in use") }
-            } else {
-                created = try lowestFree(Array(sharedDisplaySlots))
-                guard created != nil else {
-                    throw CLIError("displays \(sharedDisplaySlots.lowerBound)-\(sharedDisplaySlots.upperBound) are all in use (BACKSTAGE_DISPLAY picks one)")
-                }
-            }
-        case .exactly(let wanted):
-            created = try exactly(wanted, wait: 0)
-            guard created != nil else { throw CLIError("display \(wanted) is in use") }
-        case .lowestFree(let slots):
-            created = try lowestFree(slots)
-            guard created != nil else { throw CLIError("no free display left (\(slots.map(String.init).joined(separator: ", ")) are in use)") }
-        }
-        guard let (vd, slot) = created else { throw CLIError("CGVirtualDisplay init failed") }
-        guard let mode = CGVirtualDisplayMode(width: width, height: height, refreshRate: 30) else {
-            throw CLIError("CGVirtualDisplay mode init failed")
-        }
-        let s = CGVirtualDisplaySettings()
-        s.hiDPI = scale > 1 ? 1 : 0
-        s.modes = [mode]
-        guard vd.apply(s) else { throw CLIError("CGVirtualDisplay applySettings failed") }
-        // A virtual display comes online once it has a mode; only then can others see the slot taken.
-        guard waitFor(timeout: 5, { (onlineDisplays() ?? []).contains(vd.displayID) ? true : nil }) != nil else {
-            throw CLIError("could not bring the agent display online")
-        }
-        display = vd
-        self.slot = slot
-        self.serial = displaySerial(slot: slot)
+    /// A new display, in a new host. `linger`: how long the host keeps it once this daemon is gone.
+    init(width: UInt32, height: UInt32, scale: UInt32, choice: SlotChoice = .home, linger: Double = 0) throws {
+        let (info, pid) = try spawnDisplayHost(width: width, height: height, scale: scale, choice: choice,
+                                               role: { if case .home = choice { return "home" } else { return "extra" } }(), linger: linger)
+        id = info.displayID
+        hostID = info.id
+        hostPID = pid
+        hostStart = info.start
+        adopted = false
+        slot = info.slot
+        serial = displaySerial(slot: info.slot)
         size = (width, height, scale)
     }
+
+    /// The display of a host the previous daemon left (adoptHomeDisplayHost).
+    init(adopting info: DisplayHostInfo) {
+        id = info.displayID
+        hostID = info.id
+        hostPID = info.pid
+        hostStart = info.start
+        adopted = true
+        slot = info.slot
+        serial = displaySerial(slot: info.slot)
+        size = (info.width, info.height, info.scale)
+    }
+
+    /// The host is running (reaping it if it exited as this process's child).
+    var hostAlive: Bool {
+        var status: Int32 = 0
+        _ = waitpid(hostPID, &status, WNOHANG)
+        return processBirth(hostPID) == hostStart
+    }
+
+    /// Remove the display now: end its host and wait for the display to go.
+    func remove() { DisplayHosts.end((hostPID, hostStart), id: hostID, displayID: id) }
+
+    deinit { remove() }
     let size: (width: UInt32, height: UInt32, scale: UInt32)
     let slot: Int
     let serial: UInt32
