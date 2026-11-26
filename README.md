@@ -52,13 +52,14 @@ backstage show                        # you asked to see it: hand it over, state
 With [Homebrew](https://brew.sh):
 
 ```bash
-brew install andrewfitz/backstage/backstage
+brew tap andrewfitz/backstage
+brew install backstage
 backstage doctor              # check permissions
 backstage install --hooks     # optional: skill + hook for Claude Code / Codex / Grok
 ```
 
 Prebuilt for macOS 15 and later on Apple Silicon; elsewhere Homebrew builds it from source
-(needs Xcode). Installing by the full name trusts the tap's formula. After
+(needs Xcode). After
 `brew upgrade backstage`, run `backstage stop --all && backstage start` so the daemon runs the
 new version (this quits the apps agents have open backstage).
 
