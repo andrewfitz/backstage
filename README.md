@@ -97,6 +97,7 @@ What changed in each version: [CHANGELOG.md](CHANGELOG.md).
 | Launch without popping up | LaunchServices' own open call (the one behind `open -g -j -n`): background, hidden, fresh instance. The windows are moved to the virtual display while still hidden, then unhidden there. |
 | No Dock tile | The same call passes a private LaunchServices option that starts the app as a UIElement, the way menu bar apps run: no Dock tile, not in ⌘-Tab, no change to the app's bundle. `launch` reports `"dock": "hidden"`, or `"visible (app made itself a regular app)"` for an app that undoes it (see [Limits](#limits-read-these)). `show` makes the app a regular app again before handing it over. |
 | Windows the app opens later | An AX observer (with 50 ms polling as backup) moves them to the virtual display as soon as they're created. |
+| Your windows that wander backstage | An app you relaunch can reopen a window where it last was, which may be a hidden display (macOS remembers backstage's fixed displays like any monitor). The daemon returns windows of apps it doesn't run to your main screen after 3 s, moving them without taking focus; **Recover Lost Windows** and `backstage recover` do it at once. Apps an agent launched are never put on your screen this way. |
 | Focus stealing | The app is never activated. If it activates itself, the daemon hands focus back to your app. |
 | Screenshots | ScreenCaptureKit, filtered to that app's windows (menus, sheets and popovers included). Captures take turns across all sessions: on macOS 27, two processes capturing at once both hang. Each takes about 0.1–0.2 s. |
 | Input | AX actions (press/set/focus/menus), plus keyboard and mouse events posted straight to the app's process (`CGEventPostToPid`). Mouse events get window-local coordinates. A private "you are active" event goes to the app only, so AppKit doesn't swallow the click as a focus click. Nothing goes through the HID system, so your real cursor and keyboard are never touched. Every event backstage posts is tagged (event source user data). |
@@ -104,7 +105,7 @@ What changed in each version: [CHANGELOG.md](CHANGELOG.md).
 | Silence | Every agent app is muted the moment it first uses Core Audio: a private, muted process tap per app (helper processes included), inside a private tap-only aggregate device. Nothing reaches your speakers, whatever device the app picks; your apps, output device and volume aren't touched. If an app can't be muted, it isn't launched, or is quit. Dev builds and test runners are also made inaudible from inside (a small injected library), so they're silent in screen sharing, remote desktop and recordings too. Only apps launched with `--audio` are measured (`backstage audio`, `wait --sound`). |
 | Teardown | `backstage stop` quits the calling session's apps, and stops the daemon when no session has apps left. `backstage stop --all` (or the daemon getting SIGTERM/SIGINT/SIGHUP) quits every app *before* removing the display, so nothing lands on your screen. After 30 min with no managed apps in any session, the daemon exits by itself, unless Keep in Menu Bar is on. |
 | Several agents | Each agent session owns the apps it launches, so concurrent agents never pick up, type into, screenshot or stop each other's apps. Commands on one app are serialized with a per-app lock. See [Sessions](docs/USAGE.md#concepts). |
-| More room | An agent can take a hidden display of its own with `launch --display new` (reserved for its session for 30 minutes, removed 30 minutes after its last app leaves), and a launch says `"crowded": true` when its window found no free spot. Backstage only ever uses eight fixed display identities, so macOS's display registry doesn't grow. See [Displays](docs/USAGE.md#displays). |
+| More room | An agent can take a hidden display of its own with `launch --display new` (reserved for its session for 30 minutes, removed 30 minutes after its last app leaves, or right away with `close-display` or the menu's ⓧ), and a launch says `"crowded": true` when its window found no free spot. Backstage only ever uses eight fixed display identities, so macOS's display registry doesn't grow. See [Displays](docs/USAGE.md#displays). |
 
 ## Sound
 
@@ -473,7 +474,12 @@ make test           # all of the above, then a GUI fixture app driven through ev
                     # (tests/computer-use.sh; `make test-computer-use`), then audio: muting, levels, sounds, show, refusals, and `audio record`'s
                     # WAVs checked by tests/wavcheck.swift (tests/audio.sh; `make test-audio`;
                     # leak checks run when a loopback device exists), then Send Front Window
-                    # Backstage and Keep in Menu Bar (tests/send.sh; `make test-send`)
+                    # Backstage and Keep in Menu Bar (tests/send.sh; `make test-send`), then
+                    # the fixed display serials (tests/displays.sh; `make test-displays`),
+                    # several displays per daemon: --display new, reservations, move,
+                    # close-display, the menu's layouts (tests/multidisplay.sh;
+                    # `make test-multidisplay`), and stray windows coming back
+                    # (tests/strays.sh; `make test-strays`). GUI suites use displays 7-8 only
 tests/audio-leak.sh --dedicated   # audio leak suite: dedicated Mac with a loopback as default output
 make dist           # regenerate dist/skills/backstage/SKILL.md from Sources/backstage/Skill.swift
 make load           # load harness, 2-session smoke (not in `make test`); full runs need a

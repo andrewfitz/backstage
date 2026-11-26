@@ -118,6 +118,9 @@ test: test-cli test-agents
 	$(fresh_bin) && BACKSTAGE_BIN="$$testdir/backstage" tests/audio.sh
 	$(fresh_bin) && BACKSTAGE_BIN="$$testdir/backstage" tests/dock.sh
 	$(fresh_bin) && BACKSTAGE_BIN="$$testdir/backstage" tests/send.sh
+	$(fresh_bin) && BACKSTAGE_BIN="$$testdir/backstage" tests/displays.sh
+	$(fresh_bin) && BACKSTAGE_BIN="$$testdir/backstage" tests/multidisplay.sh
+	$(fresh_bin) && BACKSTAGE_BIN="$$testdir/backstage" tests/strays.sh
 
 # Load harness (docs/LOAD_TESTING.md), not part of `make test`. Defaults to a short 2-session
 # smoke run. Full runs (8/16/32 sessions, with --dedicated) belong on a separate macOS user

@@ -609,7 +609,8 @@ waiting up to 5 s (a display that just stopped can linger a moment).
 - `launch --display new` creates a display and **reserves** it for the caller's session for
   30 minutes: other sessions can't launch on it, `move` onto it, or get it from Send Front Window
   Backstage. The display itself is removed 30 minutes after the last app or pending launch left
-  it (`BACKSTAGE_EXTRA_DISPLAY_GRACE`): every display that comes or goes can briefly blip the
+  it (`BACKSTAGE_EXTRA_DISPLAY_GRACE`), or right away with [`close-display`](#close-display-n---force)
+  (the menu's ⓧ): every display that comes or goes can briefly blip the
   user's monitor, so an empty one is kept for the next send, move or launch. An empty display
   costs memory (its framebuffer, roughly 33–100 MB at 3840×2160) but no CPU or GPU.
 - `launch --display N` uses display N, creating it if this daemon may run it (2–6 for the
@@ -647,7 +648,7 @@ Creating or removing one is a normal display reconfiguration (`CGDisplayRegister
 fires, and ColorSync registers the display). Backstage keeps churn low: a daemon's primary display
 lives as long as the daemon (which stays up 30 minutes after its last app, or always with Keep in
 Menu Bar), and an extra display (`launch --display new`) is removed only after it has been empty for
-30 minutes. Its size is the main display's in points at 2x; `BACKSTAGE_WIDTH`, `BACKSTAGE_HEIGHT`
+30 minutes, or when someone closes it. Its size is the main display's in points at 2x; `BACKSTAGE_WIDTH`, `BACKSTAGE_HEIGHT`
 and `BACKSTAGE_SCALE=1` make it smaller.
 
 ### `move --display N|new [--pid P]`
