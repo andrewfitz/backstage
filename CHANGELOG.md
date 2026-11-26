@@ -1,6 +1,6 @@
 # Changelog
 
-## Unreleased
+## 1.3.5
 
 - **Restarts no longer blink your monitor.** Adding or removing a display makes macOS reconfigure
   every display (10 reconfigurations for one restart, measured), and some monitors blank for it.
