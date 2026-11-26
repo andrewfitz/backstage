@@ -97,7 +97,9 @@ Starts the daemon if needed, then launches `target` hidden on the agent display.
 be an `.app` path, a bundle id (`com.apple.calculator`), an app name (`Calculator`), or a bare
 executable such as a `swift build` product. A bare executable is wrapped in a throwaway
 `.app` so it can launch hidden; it starts in `/` (not its own directory), so give it absolute
-paths. Every launch is a new instance (like `open -n`), so an existing copy of the app is never
+paths. A script (`#!`) that `exec`s the real binary (`exec xctest …`) works too: the process is
+found by its launch token and kept out of the Dock, and `show` can't give it a Dock tile. (A
+script that runs it without `exec` registers the shell, not the app; launch the binary directly.) Every launch is a new instance (like `open -n`), so an existing copy of the app is never
 touched.
 
 ```json
@@ -264,19 +266,19 @@ included, and stops the daemon. Both forms are safe to run twice. Apps the user 
 are quit gracefully only: one that doesn't quit within 3 s (an unsaved-changes dialog) is given
 back to the user's screen instead of being forced.
 
-With Keep in Menu Bar on, plain `stop` never stops the daemon (`daemon` says so); `stop --all`
+With Auto-Hide When Idle off (the default in `~/.backstage`), plain `stop` never stops the daemon (`daemon` says so); `stop --all`
 still does.
 
 Apps are always quit *before* the display is removed, so nothing falls onto your screen. The
 daemon also exits by itself after `BACKSTAGE_IDLE_TIMEOUT` seconds (default 1800) once no
-session has managed apps (never while Keep in Menu Bar is on; the timeout starts over when it's
-turned off), or when no physical display is left.
+session has managed apps (only with Auto-Hide When Idle on; the timeout starts over when it's
+turned on), or when no physical display is left.
 
 ### `settings`
 
 ```
 backstage settings                          # show them
-backstage settings keep-in-menu-bar on|off  # keep the menu bar icon (and the daemon) with no apps
+backstage settings auto-hide on|off         # hide the menu bar icon (and stop the daemon) with no apps
 backstage settings hotkey <combo|off>       # the Send Front Window Backstage shortcut
 ```
 Stored in `$BACKSTAGE_HOME/settings.json`. The running daemon applies a change within half a
@@ -284,10 +286,12 @@ second, without a restart; the command waits for it and reports `hotkeyRegistere
 `hotkeyError`, e.g. when the combo is a macOS keyboard shortcut). With no daemon, `daemon` is
 `"not running"`: `backstage start` brings up the icon after a restart (nothing starts at login).
 
-- **keep-in-menu-bar** (default off): the icon stays with no apps (icon only, no count), the
-  daemon doesn't exit when idle, plain `stop` leaves it running, and the menu's Quit All quits
-  the apps but keeps it. Off again with no apps: the idle timeout runs from then. Ignored with
-  `BACKSTAGE_MENUBAR=off`.
+- **auto-hide** (the menu's Auto-Hide When Idle; default off in `~/.backstage`, on in any other
+  home so test and agent homes don't keep a display forever). Off: the icon stays with no apps
+  (icon only, no count), the daemon doesn't exit when idle, plain `stop` leaves it running, and
+  the menu's Quit All quits the apps but keeps it. On: with no apps the icon goes and the idle
+  timeout runs from then. Ignored with `BACKSTAGE_MENUBAR=off`. `keep-in-menu-bar on|off` is the
+  older, opposite spelling; `settings` reports both `autoHide` and `keepInMenuBar`.
 - **hotkey** (default `ctrl+opt+cmd+b`, ⌃⌥⌘B): two or more of `ctrl`/`control`, `opt`/`option`/
   `alt`, `shift`, `cmd`/`command`, one of them `cmd` or `ctrl`, then a letter, digit or `f1`–`f12`
   (keys by their place on a US keyboard). `default` restores ⌃⌥⌘B; `off` turns it off. It's
@@ -743,8 +747,8 @@ variables only reorder the advice: nothing extra is allowed.
 | `BACKSTAGE_SESSION` | derived | The session this command belongs to (see Sessions); `legacy` and `user` are reserved |
 | `BACKSTAGE_WIDTH` / `BACKSTAGE_HEIGHT` | main display's size | Agent display size in points (set before the daemon starts) |
 | `BACKSTAGE_SCALE` | 2 | Agent display backing scale: `2` is Retina, `1` gives a 1x display (set before the daemon starts) |
-| `BACKSTAGE_IDLE_TIMEOUT` | 1800 | Seconds with no managed apps before the daemon exits (not while Keep in Menu Bar is on) |
-| `BACKSTAGE_MENUBAR` | on | `off` hides the menu bar indicator, and with it the hotkey and Keep in Menu Bar (set before the daemon starts) |
+| `BACKSTAGE_IDLE_TIMEOUT` | 1800 | Seconds with no managed apps before the daemon exits (only with Auto-Hide When Idle on) |
+| `BACKSTAGE_MENUBAR` | on | `off` hides the menu bar indicator, and with it the hotkey and Auto-Hide When Idle (set before the daemon starts) |
 | `BACKSTAGE_TEST_HOOKS` | — | Tests only: `1` allows `backstage __send-backstage --pid P`, the Send Front Window Backstage path the menu and hotkey run |
 | `BACKSTAGE_TEST_REFUSE` | — | Tests only: one more bundle-ID prefix Send Front Window Backstage refuses |
 | `BACKSTAGE_TEST_SEND_REQUESTS` | — | Tests only (set before the daemon starts): `1` makes the daemon send a pid written to `$BACKSTAGE_HOME/send-request` (`PID`, or `PID DISPLAY` for Send Front Window To) through its hotkey path, in place of the frontmost app, and move a managed app as the menu's Move to does for `PID DISPLAY` in `move-request` (result in `move-result`) |

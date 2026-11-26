@@ -7,7 +7,7 @@ import ImageIO
 import UniformTypeIdentifiers
 
 /// Menu bar indicator owned by the daemon. Visible while apps are running backstage, or always
-/// with Keep in Menu Bar on.
+/// with Auto-Hide When Idle off.
 ///
 /// The menu answers, in this order: what is going on back there (a sentence and a live picture
 /// of this daemon's agent display), who is doing it (apps grouped by agent session), and what
@@ -72,10 +72,10 @@ final class StatusMenu: NSObject, NSMenuDelegate {
         fakeAudio = FakeAudioSource(daemon: daemon, spec: ProcessInfo.processInfo.environment["BACKSTAGE_FAKE_AUDIO"])
         if fakeAudio != nil { daemon.log("audio meter: using the test-only fake audio source (BACKSTAGE_FAKE_AUDIO)") }
         if let button = item.button {
-            // A display behind a display, the one behind dashed: the hidden one. Drawn into a
+            // A display behind a display, the one behind dashed and 70% transparent: the hidden one. Drawn into a
             // plain image, like every meter frame, so the icon's box never changes; the number of
             // running apps sits beside it (the width changes only when the count gains a digit).
-            let img = AudioMeter.symbolImage("rectangle.on.rectangle.dashed", description: "Backstage")
+            let img = AudioMeter.symbolImage("rectangle.on.rectangle.dashed", description: "Backstage", secondaryOpacity: 0.3)
                 ?? AudioMeter.symbolImage("rectangle.on.rectangle", description: "Backstage")
             button.image = img
             button.imagePosition = .imageLeading
@@ -103,7 +103,7 @@ final class StatusMenu: NSObject, NSMenuDelegate {
         meter?.setActive(visible && (fakeAudio != nil || daemon?.registry.contains { $0.audioMode.metered } == true))
         if visible {
             // Set only on change: touching the button redraws every copy of the item. With no
-            // apps (Keep in Menu Bar), the icon stands alone: no "0".
+            // apps (Auto-Hide When Idle off), the icon stands alone: no "0".
             let title = apps > 0 ? " \(apps)" : ""
             if let button = item.button, button.title != title { button.title = title; meter?.layoutChanged() }
             updateLabel()
@@ -534,15 +534,16 @@ final class StatusMenu: NSObject, NSMenuDelegate {
             + " Apps on your screen aren't touched."
         menu.addItem(stop)
         menu.addItem(.separator())
-        let keepItem = NSMenuItem(title: "Keep in Menu Bar", action: #selector(toggleKeep), keyEquivalent: "")
+        let keepItem = NSMenuItem(title: "Auto-Hide When Idle", action: #selector(toggleKeep), keyEquivalent: "")
         keepItem.target = self
         // A trailing checkmark, not the item's state: a state image makes the menu reserve a
         // checkmark column, which indents every row and unbalances the menu.
-        let kept = daemon?.settings.keep == true
-        if kept { keepItem.badge = NSMenuItemBadge(string: "✓") }
-        keepItem.setAccessibilityValue(kept ? "on" : "off")
-        keepItem.toolTip = "Keeps Backstage here with no apps running, so Send Front Window Backstage and its shortcut are always at hand. "
-            + "After a restart, `backstage start` brings it back."
+        let autoHide = daemon?.settings.autoHide == true
+        if autoHide { keepItem.badge = NSMenuItemBadge(string: "✓") }
+        keepItem.setAccessibilityValue(autoHide ? "on" : "off")
+        keepItem.toolTip = autoHide
+            ? "Backstage leaves the menu bar when no apps are running, and quits after a while idle. Uncheck to keep it here, with Send Front Window Backstage and its shortcut always at hand."
+            : "Backstage stays here with no apps running, so Send Front Window Backstage and its shortcut are always at hand. Check to hide it when no apps are running."
         menu.addItem(keepItem)
         menu.addItem(.separator())
         let footer = NSMenuItem()
@@ -930,7 +931,7 @@ final class StatusMenu: NSObject, NSMenuDelegate {
 
     @objc private func stopAll() {
         guard let d = daemon else { return }
-        // With Keep in Menu Bar on, the apps go but Backstage stays.
+        // With Auto-Hide When Idle off, the apps go but Backstage stays.
         if d.keepActive { d.quitAllApps() } else { d.shutdown(reason: "stopped from the menu bar") }
     }
 }

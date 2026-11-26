@@ -133,11 +133,13 @@ struct LaunchTarget {
         // started under heavy load, or never check it in. Look through every process for the one
         // running the app's executable with this launch's token or log. Its children (test
         // runners re-exec themselves) inherit both, so take the oldest.
+        // A bare executable that is a script or execs another binary runs something else: look
+        // at the processes launchd started too (LaunchServices' are its children), for its root.
         guard let exe = processExecutable else { return nil }
         var expected = stat()
         guard stat(exe.path, &expected) == 0 else { return nil }
         var oldest: (app: NSRunningApplication?, pid: pid_t, birth: UInt64)?
-        for pid in allProcessIDs() where isNew(pid) && runs(pid, expected) {
+        for pid in allProcessIDs() where isNew(pid) && (runs(pid, expected) || (executable != nil && parentPid(pid) == 1)) {
             if let found = verify(pid), Double(found.birth) / 1e6 >= notBefore,
                found.birth < oldest?.birth ?? .max { oldest = found }
         }
@@ -145,9 +147,17 @@ struct LaunchTarget {
     }
 
     /// `pid` is this launch's process: it carries the token or owns the log (and, for a bare
-    /// executable, runs it). The receipt, when there is one, names it.
+    /// executable, runs it or is the launch's root process). The receipt, when there is one, names it.
     func verify(_ pid: pid_t) -> (app: NSRunningApplication?, pid: pid_t, birth: UInt64)? {
         verify(pid, app: NSRunningApplication(processIdentifier: pid), bundleMatches: false)
+    }
+
+    /// The process carries this launch's token and its parent doesn't: the process the launch
+    /// started, not one of its children (they inherit the token).
+    private func isLaunchRoot(_ pid: pid_t) -> Bool {
+        guard hasLaunchToken(pid, assignment: assignment) else { return false }
+        guard let parent = parentPid(pid), parent > 1 else { return true }
+        return !hasLaunchToken(parent, assignment: assignment)
     }
 
     private func verify(_ pid: pid_t, app candidate: NSRunningApplication?,
@@ -155,7 +165,10 @@ struct LaunchTarget {
         guard let birth = processBirth(pid) else { return nil }
         let app = candidate.flatMap { $0.processIdentifier == pid && !$0.isTerminated ? $0 : nil }
         if let target = executable {
-            guard receiptPID().map({ $0 == pid }) ?? true, matchesExecutable(pid, target) else { return nil }
+            // A script, or a shim that execs another binary (`exec xctest ...`), no longer runs
+            // the executable it was launched as: then it's the launch's root process instead.
+            guard receiptPID().map({ $0 == pid }) ?? true,
+                  matchesExecutable(pid, target) || isLaunchRoot(pid) else { return nil }
         } else if !(bundleMatches || app?.bundleURL?.resolvingSymlinksInPath().standardizedFileURL == bundle) {
             // No application object yet (LaunchServices hasn't checked it in): the process runs
             // the bundle's executable.

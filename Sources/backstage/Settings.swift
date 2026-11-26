@@ -5,7 +5,8 @@ import Carbon.HIToolbox
 /// The user's settings, in BACKSTAGE_HOME/settings.json. Written by `backstage settings` and the
 /// menu bar; the daemon watches the file and applies changes while it runs.
 struct Settings: Codable, Equatable {
-    /// Keep the status item (and the daemon) up with no apps running.
+    /// Keep the status item (and the daemon) up with no apps running: the opposite of the menu's
+    /// Auto-Hide When Idle (`settings auto-hide`). nil: the default (`keep`).
     var keepInMenuBar: Bool?
     /// The Send Front Window Backstage hotkey: a combo such as "ctrl+opt+cmd+b", or "off".
     /// nil: the default (`HotKeyCombo.defaultSpec`), except in a non-default BACKSTAGE_HOME (see
@@ -38,7 +39,10 @@ struct Settings: Codable, Equatable {
         return (updated, settingsStamp())
     }
 
-    var keep: Bool { keepInMenuBar ?? false }
+    /// On by default in ~/.backstage, so the icon (and the hotkey) stays; off elsewhere, so a test's
+    /// or another home's daemon exits when idle instead of keeping its display forever.
+    var keep: Bool { keepInMenuBar ?? Paths.isDefaultHome }
+    var autoHide: Bool { !keep }
 
     /// The hotkey this home's daemon registers, or nil for none. A daemon in another
     /// BACKSTAGE_HOME (tests, a second login's agents) registers only a hotkey its own settings
@@ -51,7 +55,7 @@ struct Settings: Codable, Equatable {
 
     /// For `status` and `settings`.
     func json() -> [String: Any] {
-        var out: [String: Any] = ["keepInMenuBar": keep, "hotkey": effectiveHotKey ?? "off"]
+        var out: [String: Any] = ["autoHide": autoHide, "keepInMenuBar": keep, "hotkey": effectiveHotKey ?? "off"]
         if let spec = effectiveHotKey, let combo = try? HotKeyCombo(spec) { out["hotkeySymbols"] = combo.symbols }
         if hotkey == nil, !Paths.isDefaultHome { out["hotkeyNote"] = "off by default outside ~/.backstage; set one with `backstage settings hotkey <combo>`" }
         return out
@@ -195,17 +199,21 @@ final class GlobalHotKey {
     }
 }
 
-/// `backstage settings` / `settings keep-in-menu-bar on|off` / `settings hotkey <combo|off>`.
+/// `backstage settings` / `settings auto-hide on|off` / `settings hotkey <combo|off>`.
+/// `keep-in-menu-bar on|off` is the older, opposite spelling of auto-hide.
 func cmdSettings(_ args: Args) throws -> [String: Any] {
     let change: ((inout Settings) -> Void)?
     switch (args.pos(0), args.pos(1)) {
     case (nil, nil): change = nil
-    case ("keep-in-menu-bar", let value?):
+    case (let name?, let value?) where name == "auto-hide" || name == "keep-in-menu-bar":
+        let on: Bool
         switch value.lowercased() {
-        case "on", "true", "yes", "1": change = { $0.keepInMenuBar = true }
-        case "off", "false", "no", "0": change = { $0.keepInMenuBar = false }
-        default: throw CLIError("usage: backstage settings keep-in-menu-bar on|off")
+        case "on", "true", "yes", "1": on = true
+        case "off", "false", "no", "0": on = false
+        default: throw CLIError("usage: backstage settings \(name) on|off")
         }
+        let keep = name == "auto-hide" ? !on : on
+        change = { $0.keepInMenuBar = keep }
     case ("hotkey", let value?):
         if value.lowercased() == "off" || value.lowercased() == "none" { change = { $0.hotkey = "off" } }
         else if value.lowercased() == "default" { change = { $0.hotkey = HotKeyCombo.defaultSpec } }
@@ -217,7 +225,7 @@ func cmdSettings(_ args: Args) throws -> [String: Any] {
             change = { $0.hotkey = combo.spec }
         }
     default:
-        throw CLIError("usage: backstage settings [keep-in-menu-bar on|off | hotkey <combo|off>]  (combo e.g. ctrl+opt+cmd+b)")
+        throw CLIError("usage: backstage settings [auto-hide on|off | hotkey <combo|off>]  (combo e.g. ctrl+opt+cmd+b)")
     }
     let update = try change.map(Settings.update)
     let settings = update?.settings ?? Settings.load()

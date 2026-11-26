@@ -21,14 +21,21 @@ func resolveApp(_ arg: String) throws -> URL {
 /// LaunchServices can only launch-hidden a bundle, so wrap bare executables (e.g. `swift build`
 /// products) in a throwaway .app. For `launch`, the wrapper's executable is a symlink to the
 /// binary: LaunchServices starts the binary itself, so it keeps the UIElement type `launch` asks
-/// for (an exec'ing shim makes it a regular app again). The process starts in `/`, like any app
-/// LaunchServices opens. `show` uses a separate wrapper (its own bundle ID, so LaunchServices never
+/// for. A script's wrapper (`-script.app`) also declares LSUIElement: a script that execs a binary
+/// (`exec xctest ...`) checks in again as that binary, and would otherwise become a regular app
+/// (Dock tile, ⌘-Tab). Not for compiled binaries, since LaunchServices then refuses the Dock tile
+/// `show` gives back; `--dock` (`dock`) uses a wrapper of its own without it. The process starts
+/// in `/`, like any app LaunchServices opens. `show` uses a separate wrapper (its own bundle ID, so LaunchServices never
 /// routes it to an instance `launch` runs hidden) whose shell shim runs the binary from its directory.
-func wrapExecutable(_ exe: URL, shown: Bool = false) throws -> URL {
+func wrapExecutable(_ exe: URL, shown: Bool = false, dock: Bool = false) throws -> URL {
     try Paths.ensure()
     let name = exe.lastPathComponent
     let hash = SHA256.hash(data: Data(exe.path.utf8)).map { String(format: "%02x", $0) }.joined()
-    let app = Paths.wrappers.appendingPathComponent(shown ? "\(hash)-shown.app" : "\(hash).app")
+    // A script's wrapper has a name and bundle ID of its own, so LaunchServices never reuses
+    // what it cached about a wrapper from before LSUIElement (or of a binary at the same path).
+    let script = !shown && !dock && isScript(exe)
+    let flavor = shown ? "shown" : dock ? "dock" : script ? "script" : nil
+    let app = Paths.wrappers.appendingPathComponent(flavor.map { "\(hash)-\($0).app" } ?? "\(hash).app")
     let macos = app.appendingPathComponent("Contents/MacOS")
     let fm = FileManager.default
     try fm.createDirectory(at: macos, withIntermediateDirectories: true)
@@ -67,18 +74,27 @@ func wrapExecutable(_ exe: URL, shown: Bool = false) throws -> URL {
             }
         }
     }
-    let plist: [String: Any] = [
+    var plist: [String: Any] = [
         "CFBundleExecutable": name,
-        "CFBundleIdentifier": shown ? "dev.backstage.shown.\(hash)" : "dev.backstage.wrapped.\(hash)",
+        "CFBundleIdentifier": shown ? "dev.backstage.shown.\(hash)" : dock ? "dev.backstage.docked.\(hash)"
+            : script ? "dev.backstage.script.\(hash)" : "dev.backstage.wrapped.\(hash)",
         "CFBundleName": name,
         "CFBundlePackageType": "APPL",
         "NSPrincipalClass": "NSApplication",
         "NSHighResolutionCapable": true,
     ]
+    if script { plist["LSUIElement"] = true }
     let data = try PropertyListSerialization.data(fromPropertyList: plist, format: .xml, options: 0)
     let info = app.appendingPathComponent("Contents/Info.plist")
     if (try? Data(contentsOf: info)) != data { try data.write(to: info, options: .atomic) }
     return app
+}
+
+/// The file starts with `#!`.
+func isScript(_ file: URL) -> Bool {
+    guard let handle = try? FileHandle(forReadingFrom: file) else { return false }
+    defer { try? handle.close() }
+    return (try? handle.read(upToCount: 2)) == Data("#!".utf8)
 }
 
 /// The app is built on Qt, which makes itself a regular (Dock) app at startup unless told not to.
@@ -112,7 +128,7 @@ func launch(_ args: Args) throws -> [String: Any] {
     let bareExecutable = isDir.boolValue ? nil : url.resolvingSymlinksInPath().standardizedFileURL
     if !isDir.boolValue {
         guard FileManager.default.isExecutableFile(atPath: url.path) else { throw CLIError("\(url.path) is not an app bundle or executable") }
-        url = try wrapExecutable(url)
+        url = try wrapExecutable(url, dock: args.has("dock"))
     }
     guard let bundleExecutable = Bundle(url: url)?.executableURL else { throw CLIError("missing app executable at \(url.path)") }
     // The process LaunchServices starts: the bundle's executable, or (through the wrapper's

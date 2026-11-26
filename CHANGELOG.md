@@ -1,5 +1,19 @@
 # Changelog
 
+## Unreleased
+
+- **Fix: test runners launched through a script escaped.** A script that `exec`s another binary
+  (`exec xctest …` with its output sent elsewhere) was never recognised as the launch's process:
+  `launch` gave up, the daemon dropped the launch after 10 minutes, and the runner kept running
+  unmanaged, with a Dock tile and ⌘-Tab entry. It's now identified by its launch token, and a
+  script's wrapper keeps it out of the Dock across the `exec`.
+- **Menu bar:** the icon's dashed back rectangle is 70% transparent.
+- **Auto-Hide When Idle** replaces Keep in Menu Bar, with the opposite meaning, and is off by
+  default: the icon (and the hotkey) now stays with no apps running unless you check it
+  (`backstage settings auto-hide on|off`; `keep-in-menu-bar` still works). Only in
+  `~/.backstage`: other homes (tests, other agents) still hide and exit when idle. A setting you
+  saved before is kept.
+
 ## 1.3.3
 
 - The hidden displays are now named just **Backstage** (in System Settings › Displays and

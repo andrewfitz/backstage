@@ -136,6 +136,44 @@ for target in "$APP" "$BARE"; do
     fi
 done
 
+# A script that execs another binary (an agent's `exec xctest ...` shim), with its output sent
+# elsewhere: the process runs neither the script nor writes the launch log, so only its launch
+# token identifies it. It must be registered (directly, and after `launch` gave up), and stay
+# out of the Dock though the exec'd binary checks in with LaunchServices as a new app.
+cp "$APP/Contents/MacOS/BackstageTestApp" "$WORK/bin/execd"
+cat > "$WORK/bin/run.sh" <<SH
+#!/bin/sh
+exec "$WORK/bin/execd" >> "$WORK/run-output.log" 2>&1
+SH
+chmod +x "$WORK/bin/run.sh"
+apptype() { lsappinfo info "$1" 2>/dev/null | sed -n 's/.* type="\([^"]*\)".*/\1/p' | head -1; }
+for variant in direct "after launch gave up"; do
+    echo "== a script that execs another binary, $variant: registered, and kept out of the Dock"
+    LOGF="$WORK/exec-${variant// /-}.log"
+    if [[ $variant == direct ]]; then
+        OUT=$("$BS" launch "$WORK/bin/run.sh" --timeout 5 --env "TESTAPP_LOG=$LOGF" --env TESTAPP_POLICY=none 2>&1)
+        P=$(echo "$OUT" | jget "['pid']")
+        [[ -n "$P" ]] && pass "launch identified pid $P" || fail "launch: $OUT"
+    else
+        BACKSTAGE_TEST_LS=no-callback,no-find BACKSTAGE_LAUNCH_DEADLINE=2 "$BS" launch "$WORK/bin/run.sh" \
+            --env "TESTAPP_LOG=$LOGF" --env TESTAPP_POLICY=none > "$WORK/h.json" 2>&1
+        APPLOG=$(python3 -c "import sys,re; m=re.search(r'Launch log: (\S+\.log)', open(sys.argv[1]).read()); print(m.group(1) if m else '')" "$WORK/h.json")
+        P=$(pid_for_log "$APPLOG" 15)
+        [[ -n "$P" ]] && pass "the daemon registered pid $P" || fail "not registered: $(head -5 "$WORK/h.json"); pending: $("$BS" list | jq -c .pendingLaunches)"
+    fi
+    [[ -n "$P" ]] || continue
+    [[ " $(listed) " == *" $P "* ]] && pass "list shows it" || fail "list: $(listed)"
+    [[ $(ps -o comm= -p "$P") == */execd ]] && pass "the process exec'd into the other binary" || fail "process runs $(ps -o comm= -p "$P")"
+    for _ in $(seq 1 30); do grep -q "Window" "$LOGF" 2>/dev/null && break; sleep 0.1; done
+    sleep 1   # the exec'd binary checks in with LaunchServices again
+    TYPE=$(apptype "$P")
+    [[ -n $TYPE && $TYPE != Foreground ]] && pass "no Dock tile ($TYPE)" || fail "it has a Dock tile (ApplicationType $TYPE)"
+    "$BS" screenshot --pid "$P" -o "$WORK/exec-${variant// /-}.png" > /dev/null 2>&1 && pass "screenshot works (windows on the agent display)" \
+        || fail "screenshot of pid $P"
+    "$BS" quit --pid "$P" > /dev/null && gone "$P" && pass "quit reached it" || fail "quit pid $P"
+    [[ $(records) == 0 ]] && pass "no launch record left" || fail "launch record left behind"
+done
+
 echo "== launch --display new gives up: the daemon registers the app on that display"
 LOGF="$WORK/handover-display.log"
 BACKSTAGE_TEST_LS=no-callback,no-find BACKSTAGE_LAUNCH_DEADLINE=2 "$BS" launch "$APP" --display new --env "TESTAPP_LOG=$LOGF" > "$WORK/h.json" 2>&1

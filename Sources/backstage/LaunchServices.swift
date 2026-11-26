@@ -158,6 +158,7 @@ enum LaunchServices {
     }
 }
 
+
 /// Whether a launched app is in the Dock, for `launch`'s `dock` field. Waits until `deadline`
 /// (system uptime) for an app that promotes itself to a regular app shortly after launch.
 func dockState(_ pid: pid_t, requested: Bool, hidden: Bool, until deadline: TimeInterval) -> String {
@@ -180,7 +181,9 @@ func restoreDock(_ pid: pid_t) -> String {
     guard let type = LaunchServices.applicationType(pid) else { return "unknown (LaunchServices has no record of the app)" }
     if type == LaunchServices.foreground { return "visible" }
     guard type == LaunchServices.uiElement else { return "not restored: the app is a background-only app" }
+    let script = "not restored: launched from a script, which backstage keeps out of the Dock for good (a script's exec would otherwise give it a Dock tile)"
     guard LaunchServices.typeToRestore(pid) == LaunchServices.foreground else {
+        if launchedFromScript(pid) { return script }
         return "not restored: the app is a menu bar or agent app (its Info.plist sets LSUIElement), so it never has a Dock tile"
     }
     // A brief retry: the set can race the app's own launch-time check-in.
@@ -188,5 +191,12 @@ func restoreDock(_ pid: pid_t) -> String {
         if LaunchServices.setApplicationType(pid, LaunchServices.foreground) { return "restored" }
         if attempt < 2 { pump(0.1) }
     }
-    return "not restored: LaunchServices refused to make the app a regular app"
+    return launchedFromScript(pid) ? script : "not restored: LaunchServices refused to make the app a regular app"
+}
+
+/// `launch` started it from a script, through a wrapper that declares LSUIElement (wrapExecutable).
+private func launchedFromScript(_ pid: pid_t) -> Bool {
+    guard let wrapper = NSRunningApplication(processIdentifier: pid)?.bundleURL?.resolvingSymlinksInPath().standardizedFileURL else { return false }
+    return wrapper.deletingLastPathComponent() == Paths.wrappers.resolvingSymlinksInPath().standardizedFileURL
+        && wrapper.lastPathComponent.hasSuffix("-script.app")
 }

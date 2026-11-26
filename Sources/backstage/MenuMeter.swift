@@ -352,9 +352,15 @@ final class AudioMeter {
     /// An SF Symbol drawn into a plain template image of `box` size (its own size if nil). The
     /// status item uses only such images, idle icon included: the button lays out a symbol image
     /// differently from a drawn one (half a point wider), so mixing them would move the item.
-    static func symbolImage(_ name: String, box: NSSize? = nil, description: String? = nil) -> NSImage? {
+    /// `secondaryOpacity`: the symbol's secondary layer at that opacity (a template image keeps
+    /// only alpha, so the menu bar still tints both layers).
+    static func symbolImage(_ name: String, box: NSSize? = nil, description: String? = nil, secondaryOpacity: CGFloat? = nil) -> NSImage? {
+        var configuration = symbolConfiguration
+        if let secondaryOpacity {
+            configuration = configuration.applying(NSImage.SymbolConfiguration(paletteColors: [.black, .black.withAlphaComponent(secondaryOpacity)]))
+        }
         guard let symbol = NSImage(systemSymbolName: name, accessibilityDescription: nil)?
-            .withSymbolConfiguration(symbolConfiguration) else { return nil }
+            .withSymbolConfiguration(configuration) else { return nil }
         let box = box ?? symbol.size
         let img = NSImage(size: box, flipped: false) { rect in
             guard symbol.size.width > 0, symbol.size.height > 0 else { return true }

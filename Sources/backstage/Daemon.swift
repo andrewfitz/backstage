@@ -144,7 +144,7 @@ final class Daemon {
     /// The hotkey settings asked for when last applied, and why it couldn't be registered.
     var hotkeyWanted: String??
     var hotkeyError: String?
-    /// Keep in Menu Bar is on and there is a menu bar item to keep: no idle exit.
+    /// Auto-Hide When Idle is off and there is a menu bar item to keep: no idle exit.
     var keepActive: Bool { settings.keep && statusMenu != nil }
     let testSendRequests = ProcessInfo.processInfo.environment["BACKSTAGE_TEST_SEND_REQUESTS"] == "1"
 
@@ -697,7 +697,7 @@ final class Daemon {
         do { try writeInfo() } catch { log("cannot update display state: \(error)") }
     }
 
-    /// Read settings.json and apply what changed: Keep in Menu Bar, and the hotkey (re-registered
+    /// Read settings.json and apply what changed: Auto-Hide When Idle, and the hotkey (re-registered
     /// without a restart). Publishes the result in daemon.json.
     func applySettings() {
         let stamp = settingsStamp()
@@ -710,7 +710,7 @@ final class Daemon {
         let first = settingsApplied == nil
         settingsApplied = stamp
         if first || old.keep != settings.keep {
-            log("keep in menu bar: \(settings.keep ? "on" : "off")" + (settings.keep && statusMenu == nil ? " (ignored: BACKSTAGE_MENUBAR=off)" : ""))
+            log("auto-hide when idle: \(settings.autoHide ? "on" : "off")" + (settings.keep && statusMenu == nil ? " (ignored: BACKSTAGE_MENUBAR=off)" : ""))
             if !settings.keep { idleSince = ProcessInfo.processInfo.systemUptime }
         }
         let want = settings.effectiveHotKey
@@ -739,12 +739,12 @@ final class Daemon {
         statusMenu?.update(apps: managed.count)
     }
 
-    /// The menu's Quit All while Keep in Menu Bar is on: quit every app (agents' gracefully then
+    /// The menu's Quit All while Auto-Hide When Idle is off: quit every app (agents' gracefully then
     /// forcefully; the user's own apps gracefully, given back if they don't quit), but keep the
     /// daemon and its icon.
     func quitAllApps() {
         let records = registry.filter { $0.matchesProcess }
-        log("quitting all \(records.count) app(s) from the menu bar (keep in menu bar is on)")
+        log("quitting all \(records.count) app(s) from the menu bar (auto-hide when idle is off)")
         for record in records {
             performOnRegistration(record) { [weak self] current in
                 try? current.requestTermination(force: false)
@@ -1036,7 +1036,7 @@ final class Daemon {
             if settingsStamp() != settingsApplied { applySettings() }
             if testSendRequests { checkTestSendRequest(); checkTestMoveRequest() }
         }
-        // Keep in Menu Bar: never idle. Turning it off starts the idle timeout from then.
+        // Auto-Hide When Idle off: never idle. Turning it on starts the idle timeout from then.
         if keepActive { idleSince = now }
         if let m = statusMenu, now >= nextMenuUpdate {
             nextMenuUpdate = now + 0.5
@@ -1466,7 +1466,7 @@ private func stopDaemonIfIdle(session: String) throws -> String {
         }
         guard let d = readJSON(Paths.daemon, DaemonInfo.self), d.matchesProcess else { return "not running" }
         // The user pinned the icon: only `stop --all` (or the menu) takes it down.
-        if Settings.load().keep { return "running (Keep in Menu Bar is on; `backstage stop --all` stops it)" }
+        if Settings.load().keep { return "running (Auto-Hide When Idle is off; `backstage stop --all` stops it)" }
         if !Launching.records().isEmpty { return "running (a launch is being cleaned up)" }
         guard kill(d.pid, SIGTERM) == 0 || errno == ESRCH else { throw CLIError("failed to signal daemon") }
         daemon = d

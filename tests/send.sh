@@ -107,8 +107,8 @@ else
     echo "$R" | jq -e '.error | test("macOS keyboard shortcut")' > /dev/null && pass "⌘⇧3 refused: $(echo "$R" | jq -r .error)" || fail "⌘⇧3: $R"
 fi
 
-echo "== daemon with Keep in Menu Bar on and the hotkey set"
-"$BS" settings keep-in-menu-bar on > /dev/null
+echo "== daemon with Auto-Hide When Idle off and the hotkey set"
+"$BS" settings auto-hide off > /dev/null
 "$BS" settings hotkey default | jq -e '.hotkey == "ctrl+opt+cmd+b" and .daemon == "not running"' > /dev/null \
     && pass "settings saved before the daemon starts" || fail "settings before start"
 # The daemon runs without BACKSTAGE_TEST_HOOKS (its child passes the parent-is-daemon gate
@@ -230,7 +230,7 @@ BACKSTAGE_SESSION=send-other "$BS" windows > /dev/null 2>&1 && fail "it became a
 S=$("$BS" stop)
 echo "$S" | jq -e '.quit == [] and (.daemon | test("user sent backstage"))' > /dev/null && kill -0 "$PID" \
     && pass "plain stop leaves it: $(echo "$S" | jq -r .daemon)" || fail "plain stop: $S"
-"$BS" settings keep-in-menu-bar off > /dev/null
+"$BS" settings auto-hide on > /dev/null
 sleep 1
 items | jq -e '.items | length == 1' > /dev/null && pass "with an app running the item stays when Keep is turned off" || fail "item hidden with an app running"
 "$BS" stop --all | jq -e '.ok' > /dev/null && pass "stop --all" || fail "stop --all"
@@ -238,13 +238,13 @@ for _ in $(seq 1 30); do kill -0 "$PID" 2>/dev/null || break; sleep 0.1; done
 if kill -0 "$PID" 2>/dev/null; then fail "stop --all left the sent app running"
 else pass "stop --all quit the sent app"; PID=; fi
 
-echo "== Keep in Menu Bar off: hidden with no apps, then idle exit"
+echo "== Auto-Hide When Idle on: hidden with no apps, then idle exit"
 DPID=$("$BS" start | jq -r .pid)
 sleep 1
 wait_items 0 && pass "no status item with no apps and Keep off" || fail "item shown with Keep off: $(items)"
-"$BS" settings keep-in-menu-bar on > /dev/null
+"$BS" settings auto-hide off > /dev/null
 wait_items 1 && pass "turning Keep on shows it at once (no restart)" || fail "Keep on didn't show the item"
-"$BS" settings keep-in-menu-bar off > /dev/null
+"$BS" settings auto-hide on > /dev/null
 wait_items 0 && pass "turning Keep off hides it" || fail "Keep off didn't hide the item"
 for _ in $(seq 1 80); do kill -0 "$DPID" 2>/dev/null || break; sleep 0.1; done
 kill -0 "$DPID" 2>/dev/null && fail "daemon didn't idle-exit after Keep was turned off" || pass "idle exit resumed once Keep was off"

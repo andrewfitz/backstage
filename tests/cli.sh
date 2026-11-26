@@ -376,8 +376,8 @@ reject 'internal command' __send-backstage --pid 1
 reject 'focus-to' __send-backstage --pid 1 --focus-to 0
 
 # Settings: round trip through settings.json, validation, and `status`.
-"$bin" settings | jq -e '.keepInMenuBar == false and .hotkey == "off" and (.hotkeyNote | test("off by default")) and .daemon == "not running"' >/dev/null
-"$bin" settings keep-in-menu-bar on | jq -e '.ok and .keepInMenuBar == true and (.note | test("backstage start"))' >/dev/null
+"$bin" settings | jq -e '.autoHide == true and .keepInMenuBar == false and .hotkey == "off" and (.hotkeyNote | test("off by default")) and .daemon == "not running"' >/dev/null
+"$bin" settings auto-hide off | jq -e '.ok and .autoHide == false and .keepInMenuBar == true and (.note | test("backstage start"))' >/dev/null
 jq -e '.keepInMenuBar == true' "$BACKSTAGE_HOME/settings.json" >/dev/null
 "$bin" settings hotkey cmd+opt+b | jq -e '.hotkey == "opt+cmd+b" and .hotkeySymbols == "⌥⌘B" and .keepInMenuBar == true' >/dev/null
 "$bin" settings hotkey Control+Option+Command+F5 | jq -e '.hotkey == "ctrl+opt+cmd+f5"' >/dev/null
@@ -388,10 +388,14 @@ reject 'letter, a digit or F1' settings hotkey ctrl+opt+tab
 reject 'letter, a digit or F1' settings hotkey ctrl+opt+f13
 reject 'more than one key' settings hotkey ctrl+opt+a+b
 reject 'no key' settings hotkey ctrl+opt
+reject 'usage' settings auto-hide maybe
 reject 'usage' settings keep-in-menu-bar maybe
 reject 'usage' settings colour blue
 "$bin" status | jq -e '.settings.keepInMenuBar == true and .settings.hotkey == "ctrl+opt+cmd+b"' >/dev/null
 "$bin" settings hotkey off | jq -e '.hotkey == "off" and (.hotkeySymbols | not)' >/dev/null
-"$bin" settings keep-in-menu-bar off | jq -e '.keepInMenuBar == false' >/dev/null
+"$bin" settings auto-hide on | jq -e '.autoHide == true and .keepInMenuBar == false' >/dev/null
 jq -e '.keepInMenuBar == false and .hotkey == "off"' "$BACKSTAGE_HOME/settings.json" >/dev/null
+# The older, opposite spelling still works.
+"$bin" settings keep-in-menu-bar on | jq -e '.autoHide == false' >/dev/null
+"$bin" settings keep-in-menu-bar off | jq -e '.autoHide == true' >/dev/null
 echo "CLI regression checks passed"

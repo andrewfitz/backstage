@@ -103,6 +103,26 @@ for _ in $(seq 1 30); do [[ $("$WORK/dockwatch" has "$NAME") == yes ]] && break;
 [[ $("$WORK/dockwatch" has "$NAME") == yes ]] && pass "Dock tile appeared after restore" || fail "no Dock tile after restore"
 "$BS" quit --pid "$PID" > /dev/null
 
+echo "== restore of a bare executable (a compiled one: only a script's wrapper declares LSUIElement)"
+OUT=$("$BS" launch "$WORK/bare/$BARE_NAME" --env TESTAPP_POLICY=none --env "TESTAPP_LOG=$WORK/bare.log")
+BPID=$(echo "$OUT" | jget "['pid']")
+R=$("$BS" __dock-restore --pid "$BPID")
+[[ $(echo "$R" | jget "['dock']") == restored && $(echo "$R" | jget "['type']") == Foreground ]] \
+    && pass "bare restore: restored (Foreground)" || fail "bare restore: $R"
+"$BS" quit --pid "$BPID" > /dev/null
+
+echo "== a script that execs the binary: no Dock tile, and show can't give it one"
+printf '#!/bin/sh\nexec "%s" "$@"\n' "$WORK/bare/$BARE_NAME" > "$WORK/bare/run.sh"
+chmod +x "$WORK/bare/run.sh"
+OUT=$("$BS" launch "$WORK/bare/run.sh" --env TESTAPP_POLICY=none --env "TESTAPP_LOG=$WORK/script.log")
+SPID=$(echo "$OUT" | jget "['pid']")
+sleep 1
+[[ -n "$SPID" && $("$WORK/dockwatch" type "$SPID") == UIElement ]] && pass "script launch is a UIElement after the exec" \
+    || fail "script launch: $(echo "$OUT" | head -3) / $("$WORK/dockwatch" type "$SPID")"
+"$BS" __dock-restore --pid "$SPID" | jget "['dock']" | grep -q "launched from a script" && pass "restore explains why not" \
+    || fail "script restore: $("$BS" __dock-restore --pid "$SPID")"
+"$BS" quit --pid "$SPID" > /dev/null
+
 echo "== self-promoting app is reported"
 OUT=$("$BS" launch "$APP" --env "TESTAPP_LOG=$WORK/app.log")
 PID=$(echo "$OUT" | jget "['pid']")
@@ -117,6 +137,12 @@ PID=$(echo "$OUT" | jget "['pid']")
 [[ $(echo "$OUT" | jget "['dock']") == "visible (--dock)" && $("$WORK/dockwatch" type "$PID") == Foreground ]] \
     && pass "--dock launches a regular app" || fail "--dock: $(echo "$OUT" | jget "['dock']") / $("$WORK/dockwatch" type "$PID")"
 "$BS" quit --pid "$PID" > /dev/null
+
+OUT=$("$BS" launch "$WORK/bare/$BARE_NAME" --dock --env TESTAPP_POLICY=none --env "TESTAPP_LOG=$WORK/bare.log")
+BPID=$(echo "$OUT" | jget "['pid']")
+[[ $(echo "$OUT" | jget "['dock']") == "visible (--dock)" && $("$WORK/dockwatch" type "$BPID") == Foreground ]] \
+    && pass "--dock launches a bare executable as a regular app" || fail "bare --dock: $(echo "$OUT" | jget "['dock']") / $("$WORK/dockwatch" type "$BPID")"
+"$BS" quit --pid "$BPID" > /dev/null
 
 [[ $("$BS" stop | jget "['ok']") == True ]] && pass "stop" || fail "stop"
 [ $FAIL = 0 ] && echo "ALL PASSED" || { echo "SOME CHECKS FAILED"; exit 1; }

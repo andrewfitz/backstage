@@ -103,7 +103,7 @@ What changed in each version: [CHANGELOG.md](CHANGELOG.md).
 | Input | AX actions (press/set/focus/menus), plus keyboard and mouse events posted straight to the app's process (`CGEventPostToPid`). Mouse events get window-local coordinates. A private "you are active" event goes to the app only, so AppKit doesn't swallow the click as a focus click. Nothing goes through the HID system, so your real cursor and keyboard are never touched. Every event backstage posts is tagged (event source user data). |
 | Your input stays yours | An app with an open menu (a context menu, a menu bar menu, a pop-up button's list) takes macOS's keyboard focus, even in the background, so your typing would go to the hidden app. The daemon runs an event tap on its own thread that sees every key, click and scroll after macOS has picked the receiving app: untagged input headed for a managed app is yours, so keys are handed to your frontmost app instead and clicks and scrolls are dropped. It costs a few microseconds per event. If macOS disables the tap, it is re-enabled at once; if the tap can't be installed, input commands refuse to run and `backstage status` says why. |
 | Silence | Every agent app is muted the moment it first uses Core Audio: a private, muted process tap per app (helper processes included), inside a private tap-only aggregate device. Nothing reaches your speakers, whatever device the app picks; your apps, output device and volume aren't touched. If an app can't be muted, it isn't launched, or is quit. Dev builds and test runners are also made inaudible from inside (a small injected library), so they're silent in screen sharing, remote desktop and recordings too. Only apps launched with `--audio` are measured (`backstage audio`, `wait --sound`). |
-| Teardown | `backstage stop` quits the calling session's apps, and stops the daemon when no session has apps left. `backstage stop --all` (or the daemon getting SIGTERM/SIGINT/SIGHUP) quits every app *before* removing the display, so nothing lands on your screen. After 30 min with no managed apps in any session, the daemon exits by itself, unless Keep in Menu Bar is on. |
+| Teardown | `backstage stop` quits the calling session's apps, and stops the daemon when no session has apps left. `backstage stop --all` (or the daemon getting SIGTERM/SIGINT/SIGHUP) quits every app *before* removing the display, so nothing lands on your screen. After 30 min with no managed apps in any session, the daemon exits by itself, but only with Auto-Hide When Idle on (off by default in `~/.backstage`). |
 | Several agents | Each agent session owns the apps it launches, so concurrent agents never pick up, type into, screenshot or stop each other's apps. Commands on one app are serialized with a per-app lock. See [Sessions](docs/USAGE.md#concepts). |
 | More room | An agent can take a hidden display of its own with `launch --display new` (reserved for its session for 30 minutes, removed 30 minutes after its last app leaves, or right away with `close-display` or the menu's ⓧ), and a launch says `"crowded": true` when its window found no free spot. Backstage only ever uses eight fixed display identities, so macOS's display registry doesn't grow. See [Displays](docs/USAGE.md#displays). |
 
@@ -153,9 +153,9 @@ silent until it's relaunched. Measuring needs System Audio Recording (see
 
 ## Menu bar indicator
 
-While apps are running backstage, an icon sits in the menu bar: a display behind a display, with
-the number of running apps beside it. It disappears when nothing is running (unless you turn on
-**Keep in Menu Bar**), and goes away entirely when the daemon exits. Its tooltip says who is using how many apps. While an app
+While backstage runs, an icon sits in the menu bar: a display behind a faded, dashed one, with
+the number of running apps beside it. It stays with nothing running (unless you turn on
+**Auto-Hide When Idle**), and goes away entirely when the daemon exits. Its tooltip says who is using how many apps. While an app
 launched with `--audio` is making sound (muted, so you don't hear it), the icon turns into a
 small level meter, four bars of the loudest app's recent level, no wider than the icon; with Reduce Motion on, it shows
 a still waveform instead. The icon's box never changes size. The menu shows:
@@ -177,22 +177,24 @@ a still waveform instead. The icon's box never changes size. The menu shows:
   does this by itself after 3 s, and `backstage recover` from a terminal); and **Open
   Screenshots & Logs Folder**
 - **Quit All Agent Apps**: every app running here, including ones you sent backstage
-- **Keep in Menu Bar**, described below
+- **Auto-Hide When Idle**, described below
 - a quiet footer with the version and a link to this repository
 
 Long app and session names are shortened in the middle, so nothing widens the menu.
 
 The daemon runs as a menu-bar-only app: no Dock icon, and it never takes focus. Set
-`BACKSTAGE_MENUBAR=off` to run without the icon (and without the hotkey and Keep in Menu Bar).
+`BACKSTAGE_MENUBAR=off` to run without the icon (and without the hotkey and Auto-Hide When Idle).
 
-### Keep in Menu Bar
+### Auto-Hide When Idle
 
-Check **Keep in Menu Bar** (or run `backstage settings keep-in-menu-bar on`) and the icon stays
-with nothing running: icon only, no count, and the menu says "No apps running" above the live
-picture of the empty display. The daemon then doesn't exit when idle, and a session's plain
+Off by default: the icon stays with nothing running (icon only, no count, and the menu says
+"No apps running" above the live picture of the empty display), so Send Front Window Backstage
+and its shortcut are always at hand. The daemon doesn't exit when idle, and a session's plain
 `backstage stop` leaves it running (`stop --all` still stops it). **Quit All Agent Apps** quits
-the apps but keeps the icon. Turn it off and, with no apps left, the daemon exits after the usual
-idle timeout. The setting lives in `~/.backstage/settings.json`. It doesn't start anything at
+the apps but keeps the icon. Check **Auto-Hide When Idle** (or run `backstage settings auto-hide on`)
+and the icon leaves the menu bar when no apps are running, and the daemon exits after the usual
+idle timeout. Daemons in another `BACKSTAGE_HOME` (tests, other logins' agents) auto-hide unless
+their own settings say otherwise. The setting lives in `~/.backstage/settings.json`. It doesn't start anything at
 login: after a restart, `backstage start` brings the icon back (a login item may come later).
 
 ### Send Front Window Backstage
@@ -223,7 +225,7 @@ announces "Sent … backstage"; nothing else happens on your screen.
   Alacritty, WezTerm, herdr, Claude, ChatGPT/Codex, Parsec, and the terminal or agent host the
   daemon runs under. The menu item is disabled, with the reason in its tooltip, when the
   frontmost app is one of these.
-- **The shortcut** works whenever the daemon runs, so it pairs with Keep in Menu Bar. Change it
+- **The shortcut** works whenever the daemon runs, so it pairs with Auto-Hide When Idle off. Change it
   with `backstage settings hotkey <combo>` (two or more modifiers, one of them ⌘ or ⌃, and a
   letter, digit or F1–F12; keys are named by their place on a US keyboard), or turn it off with
   `backstage settings hotkey off`. The running daemon picks the change up at once. The menu shows
@@ -357,7 +359,7 @@ Settings (environment for the daemon): `BACKSTAGE_WIDTH`/`BACKSTAGE_HEIGHT` (poi
 `BACKSTAGE_SCALE` (default 2, Retina; `1` for a 1x display),
 `BACKSTAGE_IDLE_TIMEOUT` (seconds, default 1800), `BACKSTAGE_HOME` (default `~/.backstage`),
 `BACKSTAGE_MENUBAR=off` (no menu bar icon). Per command: `BACKSTAGE_SESSION=<name>` picks the session.
-Your settings: `backstage settings keep-in-menu-bar on|off` and `backstage settings hotkey <combo|off>`
+Your settings: `backstage settings auto-hide on|off` and `backstage settings hotkey <combo|off>`
 (see [Menu bar indicator](#menu-bar-indicator)); `backstage settings` and `status` show them.
 
 ## Limits (read these)
@@ -474,7 +476,7 @@ make test           # all of the above, then a GUI fixture app driven through ev
                     # (tests/computer-use.sh; `make test-computer-use`), then audio: muting, levels, sounds, show, refusals, and `audio record`'s
                     # WAVs checked by tests/wavcheck.swift (tests/audio.sh; `make test-audio`;
                     # leak checks run when a loopback device exists), then Send Front Window
-                    # Backstage and Keep in Menu Bar (tests/send.sh; `make test-send`), then
+                    # Backstage and Auto-Hide When Idle (tests/send.sh; `make test-send`), then
                     # the fixed display serials (tests/displays.sh; `make test-displays`),
                     # several displays per daemon: --display new, reservations, move,
                     # close-display, the menu's layouts (tests/multidisplay.sh;

@@ -47,7 +47,7 @@ LIFECYCLE
   stop --all                        quit every session's apps (and apps the user sent backstage)
                                     and stop the daemon
   settings                          show settings (also in `status`)
-  settings keep-in-menu-bar on|off  keep the menu bar icon (and the daemon) up with no apps running
+  settings auto-hide on|off  hide the menu bar icon (and stop the daemon) when no apps run; off (default) keeps it
   settings hotkey <combo|off|default>   Send Front Window Backstage shortcut (off by default);
                                     default chooses ctrl+opt+cmd+b. A custom shortcut needs two or
                                     more modifiers incl. cmd or ctrl, plus a letter, digit or F-key
