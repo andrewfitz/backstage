@@ -278,7 +278,7 @@ each differently:
 
 | Tools | How they see and act | With backstage |
 |---|---|---|
-| **Screen tools**: Claude's full-screen control (`screenshot`, `left_click`, `type`, `key`, `switch_display`…) | Screenshots of a whole display; input posted to the HID system from Claude.app's own process, so the real pointer moves and keys go to the focused app | Can't see the hidden display. The app must be on your screen: the agent runs `backstage show <app>`, or `backstage show --pid P` to hand over an app it launched hidden. If it picks the monitor "Backstage (agent display)", its clicks are dropped and your pointer is pulled back |
+| **Screen tools**: Claude's full-screen control (`screenshot`, `left_click`, `type`, `key`, `switch_display`…) | Screenshots of a whole display; input posted to the HID system from Claude.app's own process, so the real pointer moves and keys go to the focused app | Can't see the hidden display. The app must be on your screen: the agent runs `backstage show <app>`, or `backstage show --pid P` to hand over an app it launched hidden. If it picks the monitor "Backstage", its clicks are dropped and your pointer is pulled back |
 | **Per-app background tools**: Claude's `app_*` tools (`app_screenshot`, `app_click`, `app_type`, `app_key`, `app_menu`…), Codex's `get_app_state`, `click`, `type_text`, `press_key`… | Capture one app's window wherever it is (ScreenCaptureKit, per window); accessibility actions, and input posted straight to the app's process (Claude: `Claude.app/Contents/Helpers/app-cu-helper`; Codex: `Codex Computer Use.app`'s `SkyComputerUseService`) | Also work on an app backstage launched, which stays hidden: the input guard lets these helpers' input into managed apps |
 
 - **The hook** still blocks `open` and friends inside these apps, because most sessions there
@@ -428,7 +428,7 @@ Your settings: `backstage settings keep-in-menu-bar on|off` and `backstage setti
   for the host terminal.
 - **Daemon killed with `kill -9`.** The display vanishes and its windows migrate to your main
   screen. Normal stops and crashes caught by signals quit the apps first.
-- **A real "Backstage (agent display)" monitor** appears in System Settings › Displays while the
+- **A real "Backstage" monitor** appears in System Settings › Displays while the
   daemon runs.
 - **Sound limits.** Details in [docs/USAGE.md](docs/USAGE.md#audio-limits).
   - **Muted isn't inaudible.** A muted app (a signed, hardened or Apple app, or any app

@@ -335,7 +335,7 @@ Computer-use tools that work on the user's screen (Claude desktop's full-screen 
 `left_click`, `type`…) can't see the hidden display: to drive an app with them, put it on the
 user's screen with `show <app>`, or `show --pid P` for one you launched hidden. After that
 backstage doesn't manage it, so its input guard and cursor guard leave it alone. Never pick the
-monitor "Backstage (agent display)" with them: clicks there are dropped and the pointer is moved
+monitor named "Backstage" with them: clicks there are dropped and the pointer is moved
 back to the user's screens.
 
 Per-app background tools (Claude's `app_*` tools, Codex's `get_app_state`, `click`,
@@ -640,7 +640,7 @@ waiting up to 5 s (a display that just stopped can linger a moment).
 Backstage's displays are virtual displays with stable identifiers, so tools that manage
 calibration, gamma or color (Redlight, f.lux, Lunar, BetterDisplay…) can recognise and skip them:
 
-- **Name:** always contains `Backstage` (today exactly `Backstage (agent display)`).
+- **Name:** always contains `Backstage` (today exactly `Backstage`; `Backstage (agent display)` up to 1.3.2).
 - **Vendor / model:** `0xB57A` / `0x0001` (`CGDisplayVendorNumber` / `CGDisplayModelNumber`).
 - **Serials:** `0x42530001`–`0x42530008` (displays 1–8).
 

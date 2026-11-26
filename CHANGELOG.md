@@ -1,5 +1,11 @@
 # Changelog
 
+## 1.3.3
+
+- The hidden displays are now named just **Backstage** (in System Settings › Displays and
+  anywhere else macOS shows a monitor's name), not "Backstage (agent display)". `doctor` and
+  `cleanup-displays` still recognise displays registered under the old name.
+
 ## 1.3.2
 
 - **Close a display:** every display but the first has an ⓧ on its picture in the menu, and

@@ -8,7 +8,10 @@ import Foundation
 /// costs CPU (docs/MULTI_DISPLAY_PLAN.md). Matched by the name backstage gives its displays and
 /// only when not attached, so the user's displays and a live backstage display never count.
 enum DisplayRegistry {
-    static let displayName = "Backstage (agent display)"
+    static let displayName = "Backstage"
+    /// Every name backstage has given its displays (1.3.2 and earlier: "Backstage (agent display)"):
+    /// leftovers registered under an old name still count.
+    static let displayNames: Set<String> = [displayName, "Backstage (agent display)"]
 
     static func attachedKeys() -> Set<String>? {
         guard let online = onlineDisplays() else { return nil }
@@ -38,7 +41,7 @@ enum DisplayRegistry {
                 guard let context, let d = info as? [String: Any] else { return true }
                 let c = Unmanaged<Collector>.fromOpaque(context).takeUnretainedValue()
                 guard (d[kColorSyncDeviceClass.takeUnretainedValue() as String] as? String) == (kColorSyncDisplayDeviceClass.takeUnretainedValue() as String),
-                      (d[kColorSyncDeviceDescription.takeUnretainedValue() as String] as? String) == DisplayRegistry.displayName,
+                      (d[kColorSyncDeviceDescription.takeUnretainedValue() as String] as? String).map(DisplayRegistry.displayNames.contains) == true,
                       let raw = d[kColorSyncDeviceID.takeUnretainedValue() as String] as CFTypeRef?,
                       CFGetTypeID(raw) == CFUUIDGetTypeID() else { return true }
                 let uuid = raw as! CFUUID

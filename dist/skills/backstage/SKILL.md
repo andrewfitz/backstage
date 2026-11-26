@@ -164,7 +164,7 @@ Agents in the Claude and Codex desktop apps can also have computer-use tools. Tw
   keyboard (Claude's `screenshot`, `left_click`, `type`, `key`…). They can't see or reach
   backstage's hidden display, so an app you drive this way must be on the user's screen:
   `backstage show <app>`, or `backstage show --pid P` to hand over one you launched hidden
-  (state included). Never pick the monitor named "Backstage (agent display)" (`switch_display`):
+  (state included). Never pick the monitor named "Backstage" (`switch_display`):
   clicks there are dropped and the pointer is pulled back to the user's screens.
 - **Per-app background tools** capture one app's window wherever it is and post input straight
   to that app (Claude's `app_screenshot`, `app_click`, `app_type`, `app_key`, `app_menu`…;
