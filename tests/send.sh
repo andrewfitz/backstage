@@ -219,14 +219,14 @@ kill "$SLEEPER" 2>/dev/null || true; wait "$SLEEPER" 2>/dev/null || true; SLEEPE
 RPID=$("$WORK/sendhelper" launch "$WORK/$RNAME.app" "TESTAPP_LOG=$WORK/refused.log" TESTAPP_POLICY=none)
 waitlog "launched" "$WORK/refused.log" || fail "refused fixture didn't start"
 # A terminal or agent host (here a test bundle ID) is sent only after the user confirms.
-OUT=$("$BS" __send-backstage --pid "$RPID")
+OUT=$("$BS" __send-backstage --pid "$RPID" || true)
 echo "$OUT" | jq -e '.ok == false and .refused == null and (.confirm | test("terminal, agents or remote control"))' > /dev/null \
     && pass "a terminal-like app asks first: $(echo "$OUT" | jq -r .confirm)" || fail "terminal-like app: $OUT"
 echo "$RPID" > "$BACKSTAGE_HOME/send-request"   # through the daemon, which answers "no" here
 waitlog "send backstage (test): .* (pid $RPID) declined by the user" "$LOG" && pass "declined: the daemon didn't send it" || fail "no decline logged"
 "$BS" list --all | jq -e --argjson p "$RPID" '.apps | map(select(.pid == $p)) | length == 0' > /dev/null \
     && pass "the declined app wasn't registered" || fail "declined app registered"
-OUT=$("$BS" __send-backstage --pid "$RPID" --confirmed)
+OUT=$("$BS" __send-backstage --pid "$RPID" --confirmed || true)
 echo "$OUT" | jq -e '.ok == true' > /dev/null && "$BS" list --all | jq -e --argjson p "$RPID" '[.apps[] | select(.pid == $p and .session == "user")] | length == 1' > /dev/null \
     && pass "confirmed: it's sent" || fail "confirmed send: $OUT"
 "$WORK/sendhelper" terminate "$RPID" "$WORK/$RNAME.app" && RPID= || fail "quit the terminal-like fixture"
