@@ -30,10 +30,10 @@ It ships with an [agent skill](dist/skills/backstage/SKILL.md) and an optional h
 hidden and to put things on your screen only when you ask.
 
 <p align="center">
-  <img src="docs/images/menu-bar.png" width="345"
-       alt="The backstage menu: a live picture of the hidden display, then the apps each agent session is running (Claude, Codex and Grok), with the version and a GitHub link at the bottom">
+  <img src="docs/images/menu-bar.png" width="343"
+       alt="The backstage menu: a live picture of the hidden display, then the apps on it grouped by who runs them (Claude, Codex and Cursor sessions, and an app sent by you), the Send Front Window Backstage items, Quit All Apps, Auto-Hide When Idle, and the version and a GitHub link at the bottom">
   <br>
-  <sub>The <a href="#menu-bar">menu bar menu</a> while three agents test apps out of sight.</sub>
+  <sub>The <a href="#menu-bar">menu bar menu</a> while three agents test apps out of sight, next to an app you sent backstage.</sub>
 </p>
 
 ## Contents
