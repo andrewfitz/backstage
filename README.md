@@ -10,7 +10,7 @@ Input goes directly to the managed app. If an app activates itself or opens a la
 on your display, it can briefly take focus or appear before Backstage moves it back.
 
 It ships with an [agent skill](dist/skills/backstage/SKILL.md) and an optional hook for
-**Claude Code, Codex and Grok**. They teach the agent to keep its own testing hidden and to
+**Claude Code, Codex, Grok, Cursor and OpenCode**. They teach the agent to keep its own testing hidden and to
 put things on your screen only when you ask to see them.
 
 ```bash
@@ -106,7 +106,7 @@ What changed in each version: [CHANGELOG.md](CHANGELOG.md).
 | Silence | Every agent app is muted the moment it first uses Core Audio: a private, muted process tap per app (helper processes included), inside a private tap-only aggregate device. Nothing reaches your speakers, whatever device the app picks; your apps, output device and volume aren't touched. If an app can't be muted, it isn't launched, or is quit. Dev builds and test runners are also made inaudible from inside (a small injected library), so they're silent in screen sharing, remote desktop and recordings too. Only apps launched with `--audio` are measured (`backstage audio`, `wait --sound`). |
 | Teardown | `backstage stop` quits the calling session's apps, and stops the daemon when no session has apps left. `backstage stop --all` (or the daemon getting SIGTERM/SIGINT/SIGHUP) quits every app *before* removing the display, so nothing lands on your screen. After 30 min with no managed apps in any session, the daemon exits by itself, but only with Auto-Hide When Idle on (off by default in `~/.backstage`). |
 | Several agents | Each agent session owns the apps it launches, so concurrent agents never pick up, type into, screenshot or stop each other's apps. Commands on one app are serialized with a per-app lock. See [Sessions](docs/USAGE.md#concepts). |
-| More room | An agent can take a hidden display of its own with `launch --display new` (reserved for its session for 30 minutes, removed 30 minutes after its last app leaves, or right away with `close-display` or the menu's ⓧ), and a launch says `"crowded": true` when its window found no free spot. Backstage only ever uses eight fixed display identities, so macOS's display registry doesn't grow. See [Displays](docs/USAGE.md#displays). |
+| More room | An agent can take a hidden display of its own with `launch --display new` when it needs one: whole-display screenshots or recordings, full-screen apps, multi-monitor testing, or launches that keep saying `"crowded": true` (no free spot). The skill tells agents not to for anything else, since a display coming or going can blink your monitor. It's reserved for the session for 30 minutes, and asking again while it's empty gives back the same one; it's removed 30 minutes after it was last used, or right away with `close-display` or the menu's ⓧ. Backstage only ever uses eight fixed display identities, so macOS's display registry doesn't grow. See [Displays](docs/USAGE.md#displays). |
 
 ## Sound
 
@@ -244,11 +244,15 @@ backstage uninstall
 make dist                      # regenerate dist/skills/backstage/SKILL.md for packaging
 ```
 
-- **Skill:** written to `~/.claude/skills/backstage/`, `~/.codex/skills/backstage/` and
-  `~/.grok/skills/backstage/`. All three read the standard `SKILL.md` format. The source of
-  truth is `Sources/backstage/Skill.swift`; `dist/skills/backstage/SKILL.md` is generated from it.
-- **Hook (`--hooks`):** a `PreToolUse` shell hook, merged into Claude's `settings.json`, Codex's
-  `hooks.json` and Grok's `config.toml`. Your existing entries are kept, a `.backstage-bak`
+- **Skill:** written to `skills/backstage/` in `~/.claude`, `~/.codex`, `~/.grok`, `~/.cursor`
+  and `~/.config/opencode`. All of them read the standard `SKILL.md` format. (Cursor and
+  OpenCode also read `~/.claude/skills`, so with Claude installed they see the same skill twice.)
+  The source of truth is `Sources/backstage/Skill.swift`; `dist/skills/backstage/SKILL.md` is
+  generated from it.
+- **Hook (`--hooks`):** a shell hook, merged into Claude's `settings.json`, Codex's
+  `hooks.json` and Grok's `config.toml` (`PreToolUse`), and Cursor's `hooks.json`
+  (`beforeShellExecution`). For OpenCode it's a plugin, `~/.config/opencode/plugins/backstage.js`,
+  whose permission hook runs the same check. Your existing entries are kept, a `.backstage-bak`
   backup is made, and running install twice is safe. Restart agent sessions afterwards; Grok
   only runs hooks for folders you've trusted.
 
@@ -266,9 +270,11 @@ The agent decides, because it knows what you asked for. The hook makes sure it d
 The hook blocks the raw ways of popping things onto your screen and points the agent to
 `launch` or `show`. Those are `open …`, running `Foo.app/Contents/MacOS/Foo`, and `osascript`
 that activates or opens an app, including inside `bash -c`. It reads the input formats of
-Claude (`Bash`), Codex (`exec_command`/`shell`, string or argv) and Grok
-(`run_terminal_command`). Blocking means exit code 2 with a reason, which all three treat as
-"deny and tell the model".
+Claude (`Bash`), Codex (`exec_command`/`shell`, string or argv), Grok (`run_terminal_command`)
+and Cursor (`beforeShellExecution`, or `Shell` in `preToolUse`). Blocking means exit code 2 with
+a reason, which Claude, Codex and Grok treat as "deny and tell the model"; Cursor gets
+`{"permission": "deny"}` with the reason as JSON, and OpenCode's plugin denies the permission
+with it.
 - To get past the hook for something you asked for: `BACKSTAGE_SHOW=1 <command>`.
 - To turn it off: `BACKSTAGE_HOOK=off`.
 - Everything `show` does is logged to `~/.backstage/shown.log`.

@@ -466,7 +466,9 @@ let openCodePluginMarker = "// backstage-managed-plugin"
 /// about every shell command and denies the ones that would put something on the user's screen.
 /// (A plain `{ id, setup }` default export: OpenCode needs no package for it.)
 func openCodePlugin(binary: String) -> String {
-    let path = String(decoding: (try? JSONEncoder().encode(binary)) ?? Data("\"backstage\"".utf8), as: UTF8.self)
+    let encoder = JSONEncoder()
+    encoder.outputFormatting = .withoutEscapingSlashes
+    let path = String(decoding: (try? encoder.encode(binary)) ?? Data("\"backstage\"".utf8), as: UTF8.self)
     return """
     \(openCodePluginMarker): written by `backstage install --hooks`, removed by `backstage uninstall`.
     // Keeps the agent from opening apps on the user's screen: every shell command is checked by
@@ -662,7 +664,7 @@ func cmdInstall(_ args: Args) throws -> [String: Any] {
     if args.has("hooks") {
         out["hookCommand"] = command
         out["note"] = "Restart running agent sessions to pick up hooks. Grok only runs hooks it trusts: run /hooks-list in Grok to check. "
-            + "OpenCode loads its plugin when it starts (`opencode plugin list` shows it)."
+            + "OpenCode loads its plugin when it starts."
     } else {
         out["note"] = "Skills only. Add --hooks to also block agents from opening apps on your screen directly."
     }

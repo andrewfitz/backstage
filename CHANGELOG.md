@@ -1,5 +1,11 @@
 # Changelog
 
+## Unreleased
+
+- README and USAGE cover Cursor and OpenCode throughout. `install`'s note no longer suggests
+  `opencode plugin list` (it lists package plugins only), and the plugin writes its path
+  without escaped slashes.
+
 ## 1.3.8
 
 - **Cursor and OpenCode:** `backstage install` now writes the skill for them too

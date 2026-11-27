@@ -753,7 +753,10 @@ Prints the skill. `make dist` writes it to `dist/skills/backstage/SKILL.md`.
 ### `hook pre-tool-use`
 The hook entry point. It reads the agent's hook JSON on stdin, and for a shell command that
 would put something on the user's screen it exits 2 with the reason on stderr (a "deny" in
-Claude Code, Codex and Grok). It blocks:
+Claude Code, Codex and Grok). For Cursor's `beforeShellExecution` it always answers in JSON on
+stdout instead (`{"permission": "allow"}`, or `"deny"` with `user_message` and `agent_message`),
+and OpenCode's plugin calls it with a Claude-style payload and turns a deny into a permission
+denial. It blocks:
 - `open …`, except `open --help`
 - running `Something.app/Contents/MacOS/…` directly
 - `osascript` that activates, launches or opens an app
