@@ -1,5 +1,14 @@
 # Changelog
 
+## 1.4.0
+
+- **The menu handles any number of agents and apps.** The app list is now a scrolling list of
+  bounded height (40% of the screen): with dozens of sessions the menu keeps its size, the live
+  picture and the actions below stay in view, and the list scrolls in place with a thin
+  scroller and soft edges where more is hidden. Before, a long list made the whole menu scroll,
+  pushing the picture and the actions out of view. Each session heading shows its app count.
+  Rows work like submenus: point at one and its actions open beside it.
+
 ## 1.3.9
 
 - **No monitor? backstage keeps working, and stays hidden.** With the monitor switched off,
