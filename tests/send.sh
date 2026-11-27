@@ -38,8 +38,9 @@ NAME="BackstageSend$TAG"
 BID="dev.backstage.sendtest.$TAG"
 RNAME="BackstageSendRefused$TAG"
 RBID="dev.backstage.sendtest-refuse.$TAG"
-# Test-only: one more bundle-ID prefix the send path refuses (it reads this in the hook process).
-export BACKSTAGE_TEST_REFUSE=dev.backstage.sendtest-refuse
+# Test-only: one more bundle-ID prefix the send path asks about first (like a terminal), and the
+# answer the daemon gives instead of showing its confirmation dialog.
+export BACKSTAGE_TEST_REFUSE=dev.backstage.sendtest-refuse BACKSTAGE_TEST_CONFIRM=no
 WATCH= HOLD= PID= RPID= SLEEPER= PID2=
 cleanup() {
     local result=$?
@@ -217,10 +218,18 @@ R=$(refusal "$SLEEPER"); [[ "$R" == *"no app"* ]] && pass "not an app: $R" || fa
 kill "$SLEEPER" 2>/dev/null || true; wait "$SLEEPER" 2>/dev/null || true; SLEEPER=
 RPID=$("$WORK/sendhelper" launch "$WORK/$RNAME.app" "TESTAPP_LOG=$WORK/refused.log" TESTAPP_POLICY=none)
 waitlog "launched" "$WORK/refused.log" || fail "refused fixture didn't start"
-R=$(refusal "$RPID"); [[ "$R" == *"you need it on your screen"* ]] && pass "refused bundle ID: $R" || fail "refused bundle ID: $R"
+# A terminal or agent host (here a test bundle ID) is sent only after the user confirms.
+OUT=$("$BS" __send-backstage --pid "$RPID")
+echo "$OUT" | jq -e '.ok == false and .refused == null and (.confirm | test("terminal, agents or remote control"))' > /dev/null \
+    && pass "a terminal-like app asks first: $(echo "$OUT" | jq -r .confirm)" || fail "terminal-like app: $OUT"
+echo "$RPID" > "$BACKSTAGE_HOME/send-request"   # through the daemon, which answers "no" here
+waitlog "send backstage (test): .* (pid $RPID) declined by the user" "$LOG" && pass "declined: the daemon didn't send it" || fail "no decline logged"
 "$BS" list --all | jq -e --argjson p "$RPID" '.apps | map(select(.pid == $p)) | length == 0' > /dev/null \
-    && pass "the refused app wasn't registered" || fail "refused app registered"
-"$WORK/sendhelper" terminate "$RPID" "$WORK/$RNAME.app" && RPID= || fail "quit refused fixture"
+    && pass "the declined app wasn't registered" || fail "declined app registered"
+OUT=$("$BS" __send-backstage --pid "$RPID" --confirmed)
+echo "$OUT" | jq -e '.ok == true' > /dev/null && "$BS" list --all | jq -e --argjson p "$RPID" '[.apps[] | select(.pid == $p and .session == "user")] | length == 1' > /dev/null \
+    && pass "confirmed: it's sent" || fail "confirmed send: $OUT"
+"$WORK/sendhelper" terminate "$RPID" "$WORK/$RNAME.app" && RPID= || fail "quit the terminal-like fixture"
 grep -q "send backstage: refused pid $DPID" "$LOG" && pass "refusals are logged" || fail "refusal not logged"
 
 echo "== ownership"

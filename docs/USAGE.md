@@ -16,10 +16,9 @@ messages say what to do next.
 
 ## Concepts
 
-**Hidden display.** A virtual monitor that only backstage's daemon can see (the CLI's help
-calls it the agent display). It's created when the daemon starts and parked touching only the
-bottom-right corner of your desktop, never along an edge, so neither your cursor nor the Dock
-can drift onto it. Apps agents launch through backstage live there, and so do apps you send
+**Hidden display.** A virtual monitor that only backstage's daemon can see. It's created when
+the daemon starts and parked touching only the bottom-right corner of your desktop, never along
+an edge, so neither your cursor nor the Dock can drift onto it. Apps agents launch through backstage live there, and so do apps you send
 backstage. By default it's the size of your main display in points, so
 screenshots have its shape (a 4K monitor at the usual 2x is 1920×1080 points), and it's a
 Retina display, drawn at 2x (3840×2160 pixels for that size), so apps render as they would on
@@ -398,7 +397,7 @@ backstage](../README.md#sending-your-own-apps-backstage). For the CLI and for ag
   drive it, or `move --display N` it. It's never a default target, and a session's plain `stop`
   leaves it alone. `quit --pid P` works, but it holds the user's work: quit it only when asked.
 - **Coming back.** `show --pid P` (or the menu's **Show on My Screen**) gives it back: windows on
-  the main display, focused, audible again. `stop --all`, the menu's **Quit All Agent Apps** and
+  the main display, focused, audible again. `stop --all`, the menu's **Quit All Apps** and
   the app's own **Quit** quit it, gracefully only: one that doesn't quit within 3 s (an
   unsaved-changes dialog) is given back instead. Any other shutdown (the last monitor gone, a
   display that couldn't be parked) gives it back without quitting it.
@@ -408,6 +407,11 @@ backstage](../README.md#sending-your-own-apps-backstage). For the CLI and for ag
   on, else display 1. A display you create from the menu is reserved for `user`: agents'
   automatic placement never goes there, and their `launch --display N` or `move --display N`
   onto it is refused.
+- **Asked first.** Terminals, agent hosts and remote-control tools (Terminal, Ghostty, iTerm, Warp,
+  kitty, Alacritty, WezTerm, herdr, Claude, ChatGPT/Codex, Parsec) and the host the daemon runs
+  under are sent only after the user confirms a dialog; parts of macOS, menu bar and background
+  apps, backstage itself, and apps already backstage, in full screen or without a window are
+  never sent.
 - **The shortcut** is a setting: [`settings hotkey`](#settings).
 
 ## See
@@ -826,7 +830,8 @@ variables only reorder the advice: nothing extra is allowed.
 | `BACKSTAGE_DISPLAY_LINGER` | 15 in `~/.backstage`, else 0 | Seconds the primary display outlives a stopped daemon, for the next one to take over without a display change (at most 300) |
 | `BACKSTAGE_MENUBAR` | on | `off` hides the menu bar indicator, and with it the hotkey and Auto-Hide When Idle (set before the daemon starts) |
 | `BACKSTAGE_TEST_HOOKS` | — | Tests only: `1` allows `backstage __send-backstage --pid P`, the Send Front Window Backstage path the menu and hotkey run |
-| `BACKSTAGE_TEST_REFUSE` | — | Tests only: one more bundle-ID prefix Send Front Window Backstage refuses |
+| `BACKSTAGE_TEST_REFUSE` | — | Tests only: one more bundle-ID prefix Send Front Window Backstage asks about first, like a terminal |
+| `BACKSTAGE_TEST_CONFIRM` | — | Tests only (set before the daemon starts): `yes` or `no` answers Send Front Window Backstage's confirmation without showing the dialog |
 | `BACKSTAGE_TEST_SEND_REQUESTS` | — | Tests only (set before the daemon starts): `1` makes the daemon send a pid written to `$BACKSTAGE_HOME/send-request` (`PID`, or `PID DISPLAY` for Send Front Window To) through its hotkey path, in place of the frontmost app, and move a managed app as the menu's Move to does for `PID DISPLAY` in `move-request` (result in `move-result`) |
 | `BACKSTAGE_TEST_LS` | — | Tests only: `no-callback`, `no-find` (comma-separated) simulate a LaunchServices that never answers or a process `launch` can't find |
 | `BACKSTAGE_FAKE_AUDIO` / `BACKSTAGE_REDUCE_MOTION` | — | Tests only (set before the daemon starts): a synthetic level for the menu bar meter; force Reduce Motion on (`1`) or off (`0`) |

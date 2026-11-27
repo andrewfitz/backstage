@@ -136,6 +136,8 @@ final class Daemon {
     /// The user's app switches, most recent first (Send Front Window Backstage hands focus back).
     var recentUserApps: [NSRunningApplication] = []
     var sendInFlight = false
+    /// A Send Front Window Backstage confirmation dialog is open.
+    var sendConfirming = false
     /// settings.json as last applied, and its stamp (published in daemon.json).
     var settings = Settings()
     var settingsApplied: String?
@@ -237,15 +239,15 @@ final class Daemon {
         // Wait for the display to come online, park it at once (macOS first puts a new display
         // edge to edge with the user's), give it its mode (Retina or 1x), and check it's parked.
         guard waitFor(timeout: 5, { activeDisplays().contains(display.id) ? true : nil }) != nil else {
-            throw CLIError("could not bring the agent display online")
+            throw CLIError("could not bring the hidden display online")
         }
         for note in startupNotes { log(note) }
         // An adopted display is already parked: moving it would reconfigure the user's displays.
-        guard display.park(force: !display.adopted) else { throw CLIError("could not park the agent display") }
+        guard display.park(force: !display.adopted) else { throw CLIError("could not park the hidden display") }
         guard display.selectMode() else {
-            throw CLIError("could not set the agent display to \(display.size.width)x\(display.size.height) points at \(display.size.scale)x")
+            throw CLIError("could not set the hidden display to \(display.size.width)x\(display.size.height) points at \(display.size.scale)x")
         }
-        guard display.park() else { throw CLIError("could not park the agent display") }
+        guard display.park() else { throw CLIError("could not park the hidden display") }
         pump(0.5)
         refreshScreens()
 

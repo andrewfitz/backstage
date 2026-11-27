@@ -136,7 +136,7 @@ small four-bar level meter (a still waveform with Reduce Motion on). The menu sh
   display (an app reopening a window where it was while backstage). The daemon also does this by
   itself after 3 s.
 - **Open Screenshots & Logs Folder**.
-- **Quit All Agent Apps**: every app running here, including ones you sent.
+- **Quit All Apps**: every app on the hidden displays, agents' and yours.
 - **Auto-Hide When Idle** (off by default): with it on, the icon leaves the menu bar when
   nothing is running and the daemon exits after 30 idle minutes. With it off, the icon and the
   shortcut stay, so sending an app is always one keystroke away. `backstage settings auto-hide
@@ -172,18 +172,20 @@ agent to work in while you carry on.
 - **Agents can work in it**, but only when you ask. It's listed under session `user` (`backstage
   list --all`), any agent session can drive it with an explicit `--pid` or `--app`, and it's
   never an agent's default target. A session's plain `stop` leaves it alone; only `stop --all`,
-  **Quit All Agent Apps** or its own **Quit** quit it.
+  **Quit All Apps** or its own **Quit** quit it.
 - **Your work is safe.** If it doesn't quit when the daemon stops (an unsaved-changes dialog), or
   its sound can't be muted, it comes back to your screen instead: backstage never force-quits an
   app you sent.
+- **Some apps ask first.** Terminals and agent hosts (Terminal, Ghostty, iTerm, Warp, kitty,
+  Alacritty, WezTerm, herdr, Claude, ChatGPT/Codex), Parsec, and the terminal or agent host the
+  daemon runs under are what you normally need in front of you to stay in control, so backstage
+  asks before sending one: while it's backstage you won't see it or type into it. Confirm and it
+  goes like any other app.
 - **Some apps can't be sent** (the icon gives a small shake, and the reason goes to
   `~/.backstage/daemon.log`): Finder, the Dock, Control Center, Notification Center, Spotlight,
   loginwindow and anything else in `/System/Library`; menu bar and background apps; backstage
-  itself; an app that's already backstage, in full screen, or with no open window; and apps you
-  need in front of you to stay in control: Terminal, Ghostty, iTerm, Warp, kitty, Alacritty,
-  WezTerm, herdr, Claude, ChatGPT/Codex, Parsec, and the terminal or agent host the daemon runs
-  under. The menu item is disabled, with the reason in its tooltip, when the front app is one of
-  these.
+  itself; and an app that's already backstage, in full screen, or with no open window. The menu
+  item is disabled, with the reason in its tooltip, when the front app is one of these.
 - **The shortcut** works whenever the daemon runs. Change it with `backstage settings hotkey
   <combo>` (two or more modifiers, one of them ⌘ or ⌃, and a letter, digit or F1–F12, named by
   their place on a US keyboard), or turn it off with `backstage settings hotkey off`; the running

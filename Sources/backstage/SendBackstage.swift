@@ -15,9 +15,10 @@ import ApplicationServices
 // as it does for menu thumbnails: AX calls into a busy app and lock waits never hold up its
 // guard loop, and the test hook is literally the same code path.
 
-/// Never sent backstage: parts of macOS, and apps the user needs in front of them to stay in
-/// control (the terminal or agent host that runs the agents, remote-control tools). Bundle IDs
-/// match exactly, or by prefix for entries ending in ".".
+/// Never sent backstage: parts of macOS. Apps the user normally needs in front of them to stay in
+/// control (the terminal or agent host that runs the agents, remote-control tools) are sent only
+/// after the user confirms (`sendCaution`). Bundle IDs match exactly, or by prefix for entries
+/// ending in ".".
 let sendRefusedSystemIDs = [
     "com.apple.finder", "com.apple.dock", "com.apple.systemuiserver", "com.apple.controlcenter",
     "com.apple.notificationcenterui", "com.apple.loginwindow", "com.apple.WindowManager", "com.apple.Spotlight",
@@ -39,25 +40,33 @@ private func idMatches(_ id: String, _ entries: [String]) -> Bool {
     return entries.contains { $0.hasSuffix(".") ? lower.hasPrefix($0.lowercased()) : lower == $0.lowercased() }
 }
 
-/// Why an app must not be sent backstage, from what it is (not its state), or nil.
-/// BACKSTAGE_TEST_REFUSE (tests only) adds one bundle-ID prefix to the host list.
-func sendRefusal(bundleID: String?, name: String?, path: String?,
-                 env: [String: String] = ProcessInfo.processInfo.environment) -> String? {
+/// Why an app can't be sent backstage, from what it is (not its state), or nil.
+func sendRefusal(bundleID: String?, name: String?, path: String?) -> String? {
     let display = name ?? bundleID ?? "this app"
     if let id = bundleID, idMatches(id, sendRefusedSystemIDs) { return "\(display) is part of macOS" }
     if let path, path.hasPrefix("/System/Library/") || path.hasPrefix("/usr/") || path.hasPrefix("/Library/Apple/") {
         return "\(display) is part of macOS"
     }
+    return nil
+}
+
+/// Why sending an app backstage needs the user's confirmation, or nil: it's a terminal, agent
+/// host or remote-control tool, which they normally need in front of them. Sent anyway if they
+/// confirm. BACKSTAGE_TEST_REFUSE (tests only) adds one bundle-ID prefix to the list.
+func sendCaution(bundleID: String?, name: String?,
+                 env: [String: String] = ProcessInfo.processInfo.environment) -> String? {
+    let display = name ?? bundleID ?? "this app"
     var hosts = sendRefusedHostIDs
     if let extra = env["BACKSTAGE_TEST_REFUSE"], !extra.isEmpty { hosts.append(extra.hasSuffix(".") ? extra : extra + ".") }
     let host = bundleID.map { idMatches($0, hosts) } == true || name.map { sendRefusedHostNames.contains($0.lowercased()) } == true
-    return host ? "\(display) runs your terminal, agents or remote control; you need it on your screen" : nil
+    return host ? "\(display) runs your terminal, agents or remote control." : nil
 }
 
 /// `backstage __send-refusal --bundle-id ID --name N --path P` (tests): the static rules alone.
 func cmdSendRefusal(_ args: Args) -> [String: Any] {
     let why = sendRefusal(bundleID: args.opt("bundle-id"), name: args.opt("name"), path: args.opt("path"))
-    return ["ok": true, "refused": why.map { $0 as Any } ?? NSNull()]
+    let caution = sendCaution(bundleID: args.opt("bundle-id"), name: args.opt("name"))
+    return ["ok": true, "refused": why.map { $0 as Any } ?? NSNull(), "confirm": caution.map { $0 as Any } ?? NSNull()]
 }
 
 private func sendLog(_ s: String) {
@@ -66,8 +75,10 @@ private func sendLog(_ s: String) {
 
 /// Adopt the app `pid` as a user-sent managed app. `focusTo` is the app to give keyboard focus to
 /// if `pid` is frontmost (the daemon passes the app the user used before it). Refusals come back
-/// as `ok: false` with `refused`; nothing is changed then.
-func sendBackstage(pid: pid_t, focusTo: pid_t?, display slot: Int? = nil) -> [String: Any] {
+/// as `ok: false` with `refused`; nothing is changed then. An app that needs the user's
+/// confirmation (`sendCaution`, or the host the daemon runs under) comes back as `ok: false` with
+/// `confirm` (the notice) unless `confirmed`, after every other check passed.
+func sendBackstage(pid: pid_t, focusTo: pid_t?, display slot: Int? = nil, confirmed: Bool = false) -> [String: Any] {
     var name = processPath(pid).map { ($0 as NSString).lastPathComponent } ?? "pid \(pid)"
     func refuse(_ why: String) -> [String: Any] {
         sendLog("refused pid \(pid) (\(name)): \(why)")
@@ -86,10 +97,6 @@ func sendBackstage(pid: pid_t, focusTo: pid_t?, display slot: Int? = nil) -> [St
     }
     if let why = sendRefusal(bundleID: app.bundleIdentifier, name: app.localizedName, path: path) { return refuse(why) }
     guard app.activationPolicy == .regular else { return refuse("\(name) is a menu bar or background app") }
-    // The terminal or agent host the daemon (or this command) runs under.
-    if responsiblePid(d.pid) == pid || responsiblePid(getpid()) == pid {
-        return refuse("\(name) runs backstage itself; you need it on your screen")
-    }
     if AppStore.load().contains(where: { $0.pid == pid }) { return refuse("\(name) is already backstage") }
     let own = Set([d.displayID] + (d.displays ?? []).map { $0.displayID })
     let others = activeDisplays().filter { isOurDisplay($0) && !own.contains($0) }.map { CGDisplayBounds($0) }
@@ -103,6 +110,16 @@ func sendBackstage(pid: pid_t, focusTo: pid_t?, display slot: Int? = nil) -> [St
     guard !open.isEmpty else { return refuse("\(name) has no open window") }
     if open.contains(where: { ($0.attr("AXFullScreen") as? Bool) == true }) {
         return refuse("\(name) has a full-screen window; leave full screen first")
+    }
+    // Last, so the user is only asked about an app that can actually go: a terminal, agent host
+    // or remote-control tool, or the host the daemon (or this command) runs under.
+    if !confirmed {
+        let host = responsiblePid(d.pid) == pid || responsiblePid(getpid()) == pid
+        if let notice = sendCaution(bundleID: app.bundleIdentifier, name: app.localizedName)
+            ?? (host ? "\(name) runs backstage itself." : nil) {
+            sendLog("asking before sending pid \(pid) (\(name)): \(notice)")
+            return ["ok": false, "pid": pid, "name": name, "confirm": notice]
+        }
     }
 
     // Never wait on a lock: a busy launch, stop or show elsewhere means "try again".
@@ -180,7 +197,7 @@ func sendBackstage(pid: pid_t, focusTo: pid_t?, display slot: Int? = nil) -> [St
         "dock": "visible (the app was opened normally, so its Dock tile stays)",
     ]
     if let id = app.bundleIdentifier { out["bundleID"] = id }
-    if !contained { out["warning"] = "not every window was on the agent display yet; the daemon keeps moving them" }
+    if !contained { out["warning"] = "not every window was on the hidden display yet; the daemon keeps moving them" }
     return out
 }
 
@@ -207,10 +224,11 @@ func cmdSendBackstage(_ args: Args) throws -> [String: Any] {
         throw CLIError("internal command: the menu bar's Send Front Window Backstage runs it (tests set BACKSTAGE_TEST_HOOKS=1)")
     }
     guard let pid = args.opt("pid").flatMap(pid_t.init), pid > 0 else {
-        throw CLIError("usage: backstage __send-backstage --pid P [--focus-to N]")
+        throw CLIError("usage: backstage __send-backstage --pid P [--focus-to N] [--display D] [--confirmed]")
     }
     let focusTo = args.opt("focus-to").flatMap(pid_t.init)
-    return sendBackstage(pid: pid, focusTo: focusTo, display: args.opt("display").flatMap(Int.init))
+    return sendBackstage(pid: pid, focusTo: focusTo, display: args.opt("display").flatMap(Int.init),
+                         confirmed: args.has("confirmed"))
 }
 
 /// Give a user-sent app back without quitting it: out of the registry (the daemon removes its
@@ -248,9 +266,10 @@ extension Daemon {
     /// `target` replaces the frontmost app (the daemon's test trigger only).
     /// `to`: "new" or a display number (the menu's Send Front Window To); nil: the display the
     /// user's sent apps are on, else the primary.
-    func sendFrontWindowBackstage(from origin: String, target: NSRunningApplication? = nil, to want: String? = nil) {
+    func sendFrontWindowBackstage(from origin: String, target: NSRunningApplication? = nil, to want: String? = nil,
+                                  confirmed: Bool = false) {
         guard !stopping, !shutdownRequested else { return }
-        guard !sendInFlight else { log("send backstage (\(origin)): already sending one; ignored"); return }
+        guard !sendInFlight, !sendConfirming else { log("send backstage (\(origin)): already sending one; ignored"); return }
         guard let front = target ?? NSWorkspace.shared.frontmostApplication, !front.isTerminated else {
             log("send backstage (\(origin)): refused: no frontmost app")
             statusMenu?.sendCue(text: "Nothing to send backstage", success: false)
@@ -270,6 +289,7 @@ extension Daemon {
         var arguments = ["__send-backstage", "--pid", String(front.processIdentifier)]
         if let next = nextUserApp(excluding: front.processIdentifier) { arguments += ["--focus-to", String(next.processIdentifier)] }
         if slot != display.slot { arguments += ["--display", String(slot)] }
+        if confirmed { arguments.append("--confirmed") }
         process.arguments = arguments
         let output = Pipe()
         process.standardOutput = output
@@ -296,14 +316,50 @@ extension Daemon {
                         self.log("send backstage: focus was still on pid \(now.processIdentifier); handing it to \(back.localizedName ?? "?")")
                         back.activate()
                     }
+                    // After a confirmation dialog backstage itself was frontmost: hand focus to the
+                    // app the user used before the one that was sent.
+                    if confirmed, NSWorkspace.shared.frontmostApplication?.processIdentifier == getpid() {
+                        self.nextUserApp(excluding: front.processIdentifier)?.activate()
+                    }
                     self.statusMenu?.update(apps: self.managed.count)
                     self.statusMenu?.sendCue(text: "Sent \(name) backstage", success: true)
+                } else if let notice = result["confirm"] as? String, !confirmed {
+                    self.confirmSend(front, name: name, notice: notice, origin: origin, to: want)
                 } else {
                     let why = result["refused"] as? String ?? result["error"] as? String ?? "it didn't finish"
                     self.statusMenu?.sendCue(text: "Can't send \(name) backstage: \(why)", success: false)
                 }
             }
         }
+    }
+
+    /// A terminal, agent host or remote-control tool: ask before sending it, since the user won't
+    /// see it or be able to type into it until they bring it back. BACKSTAGE_TEST_CONFIRM
+    /// (`yes`/`no`, tests only) answers without a dialog.
+    func confirmSend(_ front: NSRunningApplication, name: String, notice: String, origin: String, to want: String?) {
+        let answer: Bool
+        if let scripted = ProcessInfo.processInfo.environment["BACKSTAGE_TEST_CONFIRM"] {
+            answer = scripted == "yes"
+        } else {
+            let alert = NSAlert()
+            alert.alertStyle = .warning
+            alert.messageText = "Send \(name) backstage?"
+            alert.informativeText = notice + " While it's backstage you won't see it, and your typing won't go to it. "
+                + "To get it back, open the backstage menu in the menu bar, choose \(name), then Show on My Screen."
+            alert.addButton(withTitle: "Send Backstage")
+            alert.addButton(withTitle: "Cancel")
+            sendConfirming = true
+            NSApp.activate(ignoringOtherApps: true)
+            answer = alert.runModal() == .alertFirstButtonReturn
+            sendConfirming = false
+        }
+        log("send backstage (\(origin)): \(name) (pid \(front.processIdentifier)) \(answer ? "confirmed" : "declined") by the user")
+        guard answer, !front.isTerminated else {
+            if !front.isTerminated { front.activate() }
+            statusMenu?.sendCue(text: "Didn't send \(name) backstage", success: false)
+            return
+        }
+        sendFrontWindowBackstage(from: origin, target: front, to: want, confirmed: true)
     }
 
     /// TEST ONLY (BACKSTAGE_TEST_SEND_REQUESTS=1 in the daemon's environment): a pid written to

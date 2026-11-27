@@ -66,9 +66,9 @@ backstage quit                          # always clean up; `backstage stop` quit
   `--scale 2` gives full detail (then pass `--scale 2` to `click`, or halve the pixel).
 - **Full-display shots:** `backstage window fill` makes the window cover the display (below its
   menu bar); `backstage window size 1280 800` sets an exact size in points.
-- **Recording:** to record 10 s of the agent display, run
+- **Recording:** to record 10 s of the hidden display, run
   `screencapture -x -v -V 10 -D "$(backstage status | jq .daemon.screencaptureDisplay)" out.mov`
-  (`-x` keeps it silent). It captures the whole agent display, including other sessions'
+  (`-x` keeps it silent). It captures the whole hidden display, including other sessions'
   windows, so for a clean recording launch on a display of your own (below) and take its index
   from `backstage status | jq '.daemon.displays[] | select(.display == N) | .screencaptureDisplay'`.
   Read the index right before recording: it changes when displays come and go. Never record or

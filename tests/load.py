@@ -1188,7 +1188,7 @@ def main():
         p.error("unknown workload(s) %s; choose from %s" % (bad, WORKLOADS))
     if a.accessory and set(a.workloads) & {"capture", "mixed"}:
         p.error("--accessory can't be used with capture or mixed: screenshots of .accessory fixtures failed with "
-                "'no visible windows on the agent display'. Use idle,input,launch,cycles.")
+                "'no visible windows on the hidden display'. Use idle,input,launch,cycles.")
     if len(set(a.workloads)) != len(a.workloads):
         p.error("workloads must not be repeated")
     for option in ("duration", "scale", "op_timeout"):

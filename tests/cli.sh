@@ -355,23 +355,25 @@ wait "$sent" 2>/dev/null || :
 ! kill -0 "$sent" 2>/dev/null
 child=
 
-# Send Front Window Backstage: what is never sent (the static rules), and the test hook's gate.
-refused() { "$bin" __send-refusal "$@" | jq -e '.refused | type == "string"' >/dev/null; }
-allowed() { "$bin" __send-refusal "$@" | jq -e '.refused == null' >/dev/null; }
+# Send Front Window Backstage: what is never sent, what is sent only after the user confirms
+# (the static rules), and the test hook's gate.
+refused() { "$bin" __send-refusal "$@" | jq -e '(.refused | type == "string") and .confirm == null' >/dev/null; }
+asked()   { "$bin" __send-refusal "$@" | jq -e '.refused == null and (.confirm | type == "string")' >/dev/null; }
+allowed() { "$bin" __send-refusal "$@" | jq -e '.refused == null and .confirm == null' >/dev/null; }
 refused --bundle-id com.apple.finder --name Finder --path /System/Library/CoreServices/Finder.app
 refused --bundle-id com.apple.dock --name Dock
 refused --name WindowServer --path /System/Library/PrivateFrameworks/SkyLight.framework/Resources/WindowServer
-refused --bundle-id com.apple.Terminal --name Terminal --path /System/Applications/Utilities/Terminal.app
-refused --bundle-id com.mitchellh.ghostty --name Ghostty
-refused --bundle-id com.googlecode.iterm2 --name iTerm2
-refused --bundle-id com.anthropic.claudefordesktop --name Claude
-refused --bundle-id com.openai.codex --name ChatGPT
-refused --bundle-id tv.parsec.www --name Parsec
-refused --name herdr
+asked --bundle-id com.apple.Terminal --name Terminal --path /System/Applications/Utilities/Terminal.app
+asked --bundle-id com.mitchellh.ghostty --name Ghostty
+asked --bundle-id com.googlecode.iterm2 --name iTerm2
+asked --bundle-id com.anthropic.claudefordesktop --name Claude
+asked --bundle-id com.openai.codex --name ChatGPT
+asked --bundle-id tv.parsec.www --name Parsec
+asked --name herdr
 allowed --bundle-id com.apple.TextEdit --name TextEdit --path /System/Applications/TextEdit.app
 allowed --bundle-id com.apple.Safari --name Safari --path /Applications/Safari.app
 allowed --bundle-id dev.example.thing --name Thing --path /Applications/Thing.app
-BACKSTAGE_TEST_REFUSE=dev.example "$bin" __send-refusal --bundle-id dev.example.thing --name Thing | jq -e '.refused | type == "string"' >/dev/null
+BACKSTAGE_TEST_REFUSE=dev.example "$bin" __send-refusal --bundle-id dev.example.thing --name Thing | jq -e '.confirm | type == "string"' >/dev/null
 reject 'internal command' __send-backstage --pid 1
 reject 'focus-to' __send-backstage --pid 1 --focus-to 0
 

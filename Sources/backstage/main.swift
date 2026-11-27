@@ -6,7 +6,7 @@ let usage = """
 backstage — drive macOS apps on an invisible display, without touching the user's screen,
 cursor, keyboard focus or frontmost app. Output is JSON except for help, version, skill, logs and plain-text trees.
 
-COORDINATES: everything uses agent-display points with (0,0) at the display's top-left.
+COORDINATES: everything uses hidden-display points with (0,0) at the display's top-left.
 A default `screenshot` is cropped from (0,0), so image pixel (x,y) == click point (x,y)
 (divide by --scale if you passed one). The display is Retina: a default screenshot is
 downsampled to 1 pixel per point; --scale 2 gives the native pixels.
@@ -102,7 +102,7 @@ ACT (all delivered in the background)
   set <ref> <value>                 set an element's value (text fields, sliders…)
   focus <ref>                       focus an element (and make its window the app's key window)
   action <ref> <AXAction>           any AX action (e.g. AXIncrement, AXShowMenu, AXConfirm)
-  click <x> <y> [--right] [--double]   mouse click at agent-display point
+  click <x> <y> [--right] [--double]   mouse click at hidden-display point
   click --ref <ref> [--right] [--double]
   hover <x> <y>                     best-effort: tracking-area hover effects/tooltips won't fire
   drag <x1> <y1> <x2> <y2> [--steps N]   interpolate over 1-1000 steps (default 20)
@@ -303,7 +303,7 @@ func cmdScreenshot(_ args: Args) throws -> [String: Any] {
         let b = cgBounds(w)
         if vd.intersects(b) { union = union.union(b.intersection(vd)) }
     }
-    guard !union.isNull else { throw CLIError("app \(pid) has no visible windows on the agent display") }
+    guard !union.isNull else { throw CLIError("app \(pid) has no visible windows on the hidden display") }
     let crop = CGRect(x: vd.minX, y: vd.minY, width: union.maxX - vd.minX, height: union.maxY - vd.minY)
     let (size, origin) = try capture(.apps([app], display: d, crop: crop), to: out, scale: scale)
     return ["path": out.path, "width": Int(size.width), "height": Int(size.height), "origin": ["x": r(origin.x), "y": r(origin.y)], "scale": scale, "pid": pid]
@@ -336,7 +336,7 @@ func cmdWindow(_ args: Args, app: ManagedApp) throws -> [String: Any] {
         // Args has checked both are finite numbers >= 1.
         let width = Double(args.pos(1)!)!, height = Double(args.pos(2)!)!
         guard width <= area.width, height <= area.height else {
-            throw CLIError("\(r(width))x\(r(height)) doesn't fit the agent display's usable area (\(r(area.width))x\(r(area.height)) points); start the daemon with a larger BACKSTAGE_WIDTH/BACKSTAGE_HEIGHT")
+            throw CLIError("\(r(width))x\(r(height)) doesn't fit the hidden display's usable area (\(r(area.width))x\(r(area.height)) points); start the daemon with a larger BACKSTAGE_WIDTH/BACKSTAGE_HEIGHT")
         }
         // Keep the window where it is, moving it only as far as needed to stay on the display.
         target = CGRect(x: min(max(current.minX, area.minX), area.maxX - width),
@@ -600,7 +600,7 @@ func point(_ args: Args, _ i: Int, _ vd: CGRect) throws -> CGPoint {
     guard let xs = args.pos(i), let ys = args.pos(i + 1), let x = Double(xs), let y = Double(ys) else { throw CLIError("expected x y coordinates") }
     let s = args.double("scale") ?? 1
     let point = CGPoint(x: vd.minX + x / s, y: vd.minY + y / s)
-    guard x.isFinite, y.isFinite, vd.contains(point) else { throw CLIError("coordinates must be inside the agent display") }
+    guard x.isFinite, y.isFinite, vd.contains(point) else { throw CLIError("coordinates must be inside the hidden display") }
     return point
 }
 
@@ -784,7 +784,7 @@ func run() throws {
                AXUIElementPerformAction(e, kAXPressAction as CFString) == .success {
                 res = ["ok": true, "via": "ax-press"]
             } else {
-                guard let location, d.bounds.contains(location) else { throw CLIError("element has no clickable center on the agent display") }
+                guard let location, d.bounds.contains(location) else { throw CLIError("element has no clickable center on the hidden display") }
                 res = try doClick(global: location, pid: pid, birth: birth, args: args)
             }
         } else {

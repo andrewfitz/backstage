@@ -2,6 +2,12 @@
 
 ## Unreleased
 
+- **Send Front Window Backstage asks instead of refusing** for terminals, agent hosts and
+  remote-control tools (Terminal, Ghostty, iTerm, herdr, Claude, ChatGPT/Codex, Parsec…) and the
+  host the daemon runs under: a dialog explains you won't see or type into it while it's
+  backstage, and how to bring it back. Parts of macOS are still never sent.
+- The menu's **Quit All Agent Apps** is now **Quit All Apps** (it quits apps you sent too), and
+  `backstage help` and error messages say "hidden display" instead of "agent display".
 - **Homebrew:** backstage moved to the `andrewfitz/tap` tap (`brew tap andrewfitz/tap`), shared
   with my other apps. `brew update` moves an install from the old `andrewfitz/backstage` tap.
 - **Docs:** README and USAGE rewritten for both uses, agents testing apps and you sending your

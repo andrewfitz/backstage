@@ -526,7 +526,7 @@ final class StatusMenu: NSObject, NSMenuDelegate {
         // On its own: it ends every agent's work in progress.
         menu.addItem(.separator())
         let keep = daemon?.keepActive == true
-        let stop = NSMenuItem(title: "Quit All Agent Apps", action: #selector(stopAll), keyEquivalent: "")
+        let stop = NSMenuItem(title: "Quit All Apps", action: #selector(stopAll), keyEquivalent: "")
         stop.target = self
         stop.isEnabled = !apps.isEmpty
         stop.toolTip = "Quits every app running here, including apps you sent backstage"
@@ -806,6 +806,8 @@ final class StatusMenu: NSObject, NSMenuDelegate {
             } else if let why = sendRefusal(bundleID: front.bundleIdentifier, name: front.localizedName, path: path) {
                 send.isEnabled = false
                 tip = "Can't send \(front.localizedName ?? "the frontmost app") backstage: \(why)."
+            } else if let notice = sendCaution(bundleID: front.bundleIdentifier, name: front.localizedName) {
+                tip += "\n\(notice) Backstage asks before sending it."
             }
         }
         send.toolTip = tip

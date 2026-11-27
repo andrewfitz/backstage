@@ -163,7 +163,7 @@ func createVirtualDisplay(width: UInt32, height: UInt32, scale: UInt32, choice: 
     guard vd.apply(s) else { throw CLIError("CGVirtualDisplay applySettings failed") }
     // A virtual display comes online once it has a mode; only then can others see the slot taken.
     guard waitFor(timeout: 5, { (onlineDisplays() ?? []).contains(vd.displayID) ? true : nil }) != nil else {
-        throw CLIError("could not bring the agent display online")
+        throw CLIError("could not bring the hidden display online")
     }
     return (vd, slot)
 }
