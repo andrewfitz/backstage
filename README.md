@@ -289,6 +289,7 @@ give agents computer-use tools of two kinds:
 | Agent input | Accessibility actions (press, set, focus, menus), plus keyboard and mouse events posted straight to the app's process (`CGEventPostToPid`) with window-local coordinates. A private "you are active" event goes to the app only, so AppKit doesn't swallow the first click. Nothing goes through the HID system, so your cursor and keyboard are never touched. Every event backstage posts is tagged. |
 | Your input stays yours | An app with an open menu takes macOS's keyboard focus, even in the background. An event tap on its own thread sees every key, click and scroll after macOS picks the receiving app: untagged input headed for an app backstage manages is yours, so keys go to your frontmost app instead, and clicks and scrolls are dropped. It costs a few microseconds per event; if the tap can't be installed, agents' input commands refuse to run. |
 | Silence | Every app backstage runs is muted the moment it first uses Core Audio: a private, muted process tap per app (helper processes included). Nothing reaches your speakers, whatever device the app picks; your apps, output device and volume aren't touched. An app that can't be muted isn't launched, or is quit (an app you sent is given back to you). Agents' dev builds and test runners are also made inaudible from inside, so they're silent in screen sharing and recordings too. |
+| No monitor | When no real display is left (monitor off, headless Mac, Parsec, VNC, Screen Sharing, SSH), backstage puts up a stand-in screen as your main display, so remote sessions never see the hidden display and nothing has to quit. macOS's own fallback screen only appears when no display exists at all, which backstage's display would prevent. See [Limits](#limits). |
 | Teardown | `backstage stop` quits the calling session's apps. `stop --all` (or the daemon getting SIGTERM, SIGINT or SIGHUP) quits every app *before* the display goes, so nothing lands on your screen; apps you sent that don't quit are given back. With Auto-Hide When Idle on, the daemon also exits after 30 minutes with no apps. |
 | Several agents | Each agent session owns the apps it launches, so concurrent agents never pick up, type into, screenshot or stop each other's apps, and commands on one app are serialized. See [Sessions](docs/USAGE.md#concepts). |
 | Fixed displays | backstage only ever uses eight display identities, so macOS's display registry doesn't grow. See [Displays](docs/USAGE.md#displays). |
@@ -421,8 +422,14 @@ your main display's size), `BACKSTAGE_SCALE` (2, Retina; `1` for 1x), `BACKSTAGE
   touched, but single-instance apps that hand off to an existing instance (Safari, Mail…) aren't
   suitable. All copies of an app share its preferences, Application Support files and the
   clipboard (put text in with `set` or `type`, not ⌘C/⌘V).
-- **Monitor unplugged or asleep.** If no real display is left, the daemon shuts down, quitting the
-  apps it runs (yours are given back), so nothing is stranded on the hidden display.
+- **No monitor: switched off, unplugged, headless, remote.** With no real display, macOS would
+  make the hidden display your main screen and stream it to Parsec, VNC or Screen Sharing, agents'
+  apps and all. backstage puts up a stand-in screen instead (named "Stand-in Display"): it becomes
+  your main screen, remote sessions show a normal desktop, the hidden display stays hidden, and
+  everything keeps running. Windows of yours that macOS moved meanwhile come back to it within
+  seconds. When a real display has been back for 3 s, it's made the main screen again and the
+  stand-in goes. This works the same when backstage starts with no monitor attached, and over SSH.
+  If the stand-in can't be created, the daemon shuts down as before (apps you sent are given back).
 - **Private APIs.** `CGVirtualDisplay`, `CGEventSetWindowLocation`, `_AXUIElementGetWindow`, and
   LaunchServices' `_LSOpenURLsWithCompletionHandler` (with `_kLSOpenOptionUIElementLaunchKey`)
   and `_LSSetApplicationInformationItem`. They've been stable for years but are undocumented, so

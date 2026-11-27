@@ -2,6 +2,12 @@
 
 ## Unreleased
 
+- **No monitor? backstage keeps working, and stays hidden.** With the monitor switched off,
+  unplugged, or on a headless Mac (Parsec, VNC, Screen Sharing, SSH), macOS made the hidden
+  display the main screen, so the daemon shut down, quitting agents' apps. Now it puts up a
+  stand-in screen as your main display instead: remote sessions show a normal desktop, the
+  hidden display stays hidden, and everything keeps running. When a real display is back, it's
+  made main again and the stand-in goes. It also starts with no monitor attached.
 - **Send Front Window Backstage asks instead of refusing** for terminals, agent hosts and
   remote-control tools (Terminal, Ghostty, iTerm, herdr, Claude, ChatGPT/Codex, Parsec…) and the
   host the daemon runs under: a dialog explains you won't see or type into it while it's

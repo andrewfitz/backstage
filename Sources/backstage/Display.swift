@@ -22,6 +22,17 @@ func isOurDisplay(_ id: CGDirectDisplayID) -> Bool {
     CGDisplayVendorNumber(id) == kVendor && CGDisplayModelNumber(id) == kProduct
 }
 
+/// The stand-in screen backstage puts up while no real display is attached (the monitor off,
+/// a headless Mac, a remote desktop or VNC session). It's one of the *user's* screens, not a
+/// hidden one, so everything else treats it like a monitor: macOS makes it the main display,
+/// and remote viewers see a normal desktop instead of the hidden display. One fixed identity.
+let kStandInProduct: UInt32 = 0x0002
+let standInSerial: UInt32 = 0x4253_0100
+let standInName = "Stand-in Display"
+func isStandInDisplay(_ id: CGDirectDisplayID) -> Bool {
+    CGDisplayVendorNumber(id) == kVendor && CGDisplayModelNumber(id) == kStandInProduct
+}
+
 /// Active display bounds for one check. Refresh after changing the arrangement.
 struct DisplayGeometry {
     let ids = activeDisplays()

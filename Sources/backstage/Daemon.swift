@@ -221,6 +221,7 @@ final class Daemon {
         } else {
             display = try AgentDisplay(width: w, height: h, scale: scale, linger: linger)
         }
+        standIn = adoptStandInHost(linger: linger, log: { early.append($0) })
         startupNotes = early
     }
     /// Lines from before the log is set up (display adoption), logged once the daemon is up.
@@ -242,11 +243,20 @@ final class Daemon {
             throw CLIError("could not bring the hidden display online")
         }
         for note in startupNotes { log(note) }
+        // Started with no monitor attached (headless, a remote session): macOS's own fallback
+        // screen goes once the hidden display exists, so put up the stand-in to park against.
+        func userScreen() throws {
+            guard refreshScreens().users.isEmpty else { return }
+            if case .failed(let why) = ensureStandIn() { throw CLIError("no display attached, and no stand-in screen: \(why)") }
+            _ = waitFor(timeout: 5) { refreshScreens().users.isEmpty ? nil : true }
+        }
+        try userScreen()
         // An adopted display is already parked: moving it would reconfigure the user's displays.
         guard display.park(force: !display.adopted) else { throw CLIError("could not park the hidden display") }
         guard display.selectMode() else {
             throw CLIError("could not set the hidden display to \(display.size.width)x\(display.size.height) points at \(display.size.scale)x")
         }
+        try userScreen()
         guard display.park() else { throw CLIError("could not park the hidden display") }
         pump(0.5)
         refreshScreens()
@@ -357,10 +367,20 @@ final class Daemon {
     func repark() {
         guard !stopping else { return }
         if creatingDisplay { scheduleRepark(); return }
-        // Monitor unplugged / turned off: the agent display would become the user's only screen
-        // and their windows would migrate onto it. Bail out so it disappears.
+        // Monitor unplugged or off, a headless Mac, a remote session: the hidden display would
+        // become the user's only screen. Put up a stand-in screen for them instead (StandIn.swift);
+        // only if that fails, bail out so the hidden display disappears.
         var geometry = refreshScreens()
-        if screens.isEmpty { shutdown(reason: "no user display left"); return }
+        if screens.isEmpty {
+            switch ensureStandIn() {
+            case .ready: geometry = refreshScreens()
+            case .waiting: scheduleRepark(); return
+            case .failed(let why):
+                log("couldn't put up a stand-in screen: \(why)")
+                shutdown(reason: "no user display left")
+                return
+            }
+        }
         var failed = false
         for d in allDisplays where !d.isParked(users: geometry.users, agents: geometry.agents) {
             let was = d.bounds
@@ -1005,6 +1025,11 @@ final class Daemon {
     /// Once a second: a display whose host died is gone. The primary one takes the daemon with it
     /// (as a display the system removed always has); an extra one is dropped.
     var nextHostCheck = 0.0
+    var nextStandInCheck = 0.0
+    /// The stand-in screen's host while no real display is attached (StandIn.swift).
+    var standIn: DisplayHostInfo?
+    var standInWaitSince: Double?
+    var realDisplaySince: Double?
     func checkDisplayHosts(now: Double) {
         guard now >= nextHostCheck, !stopping else { return }
         nextHostCheck = now + 1
@@ -1034,6 +1059,7 @@ final class Daemon {
         // The lifecycle lock may still be held by a launch. Keep guarding while we wait.
         if let reason = pendingShutdown { shutdown(reason: reason) }
         checkDisplayHosts(now: now)
+        if now >= nextStandInCheck { nextStandInCheck = now + 1; checkStandIn(now: now) }
         reloadManaged(now: now)
         var geometry: DisplayGeometry?
         if now >= nextArrangementCheck {
@@ -1333,8 +1359,11 @@ final class Daemon {
         for slot in extras.keys.sorted() { extras[slot]?.remove() }
         if !reason.hasPrefix("signal") || DisplayHosts.homeLinger() == 0 {
             display.remove()
+            // Without the hidden display, macOS puts up its own fallback screen if nothing else is left.
+            if let s = standIn { DisplayHosts.end((s.pid, s.start), id: s.id, displayID: s.displayID) }
         } else {
-            log("leaving display \(display.slot) to its host for \(Int(DisplayHosts.homeLinger())) s, for the next daemon")
+            log("leaving display \(display.slot) to its host for \(Int(DisplayHosts.homeLinger())) s, for the next daemon"
+                + (standIn != nil ? ", with the stand-in screen" : ""))
         }
         unlink(Paths.daemon.path)
         inputGuard.logActivity(log, force: true)

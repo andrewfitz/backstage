@@ -168,6 +168,40 @@ func createVirtualDisplay(width: UInt32, height: UInt32, scale: UInt32, choice: 
     return (vd, slot)
 }
 
+/// Create the stand-in screen in this process (the host), unless one is already online (another
+/// home's): one per user, decided under a lock shared by every home.
+func createStandInDisplay(width: UInt32, height: UInt32, scale: UInt32) throws -> CGVirtualDisplay {
+    guard let lock = UserLock("standin.lock") else { throw CLIError("cannot lock the stand-in display for this user") }
+    defer { lock.release() }
+    guard let online = onlineDisplays() else { throw CLIError("cannot list the online displays") }
+    if online.contains(where: isStandInDisplay) { throw CLIError("a stand-in display is already up") }
+    let d = CGVirtualDisplayDescriptor()
+    d.queue = DispatchQueue.main
+    d.name = standInName
+    d.maxPixelsWide = width * scale
+    d.maxPixelsHigh = height * scale
+    d.sizeInMillimeters = CGSize(width: Double(width) * 0.254, height: Double(height) * 0.254)
+    d.vendorID = kVendor
+    d.productID = kStandInProduct
+    d.serialNum = standInSerial
+    d.terminationHandler = { _, _ in
+        eprint("virtual display terminated by system")
+        exit(1)
+    }
+    guard let vd = CGVirtualDisplay(descriptor: d),
+          let mode = CGVirtualDisplayMode(width: width, height: height, refreshRate: 60) else {
+        throw CLIError("CGVirtualDisplay init failed")
+    }
+    let s = CGVirtualDisplaySettings()
+    s.hiDPI = scale > 1 ? 1 : 0
+    s.modes = [mode]
+    guard vd.apply(s) else { throw CLIError("CGVirtualDisplay applySettings failed") }
+    guard waitFor(timeout: 5, { (onlineDisplays() ?? []).contains(vd.displayID) ? true : nil }) != nil else {
+        throw CLIError("could not bring the stand-in display online")
+    }
+    return vd
+}
+
 extension AgentDisplay.SlotChoice {
     var argument: String {
         switch self {
@@ -211,14 +245,18 @@ func runDisplayHost(_ args: Args) -> Never {
           let width = args.opt("width").flatMap({ UInt32($0) }), let height = args.opt("height").flatMap({ UInt32($0) }),
           let scale = args.opt("scale").flatMap({ UInt32($0) }),
           let choice = args.opt("choice").flatMap({ AgentDisplay.SlotChoice(argument: $0) }),
-          let role = args.opt("role"), role == "home" || role == "extra" else {
-        report(["ok": false, "error": "usage: backstage __display-host --id ID --width W --height H --scale S --choice C --role home|extra"])
+          let role = args.opt("role"), ["home", "extra", "standin"].contains(role) else {
+        report(["ok": false, "error": "usage: backstage __display-host --id ID --width W --height H --scale S --choice C --role home|extra|standin"])
         exit(2)
     }
     let display: CGVirtualDisplay
     let slot: Int
     do {
-        (display, slot) = try createVirtualDisplay(width: width, height: height, scale: scale, choice: choice)
+        if role == "standin" {
+            (display, slot) = (try createStandInDisplay(width: width, height: height, scale: scale), 0)
+        } else {
+            (display, slot) = try createVirtualDisplay(width: width, height: height, scale: scale, choice: choice)
+        }
     } catch {
         report(["ok": false, "error": "\(error)"])
         exit(1)
@@ -336,7 +374,7 @@ func adoptHomeDisplayHost(width: UInt32, height: UInt32, scale: UInt32, linger: 
     let wantedSlot = (try? requestedDisplaySlot()) ?? nil
     let me = getpid()
     var adopted: DisplayHostInfo?
-    for host in DisplayHosts.all() {
+    for host in DisplayHosts.all() where host.role != "standin" {   // adoptStandInHost's
         guard let lock = try? DisplayHosts.lock(host.id) else { continue }
         // Re-read under the lock: the host may have just decided to exit.
         guard let current = readJSON(DisplayHosts.info(host.id), DisplayHostInfo.self), DisplayHosts.alive(current) else {
@@ -367,4 +405,25 @@ func adoptHomeDisplayHost(width: UInt32, height: UInt32, scale: UInt32, linger: 
         DisplayHosts.end((current.pid, current.start), id: current.id, displayID: current.displayID)
     }
     return adopted
+}
+
+/// At startup: take over a stand-in screen the previous daemon left lingering (still online, no
+/// live owner), so a restart while no monitor is attached keeps the user's screen. Nil if none.
+func adoptStandInHost(linger: Double, log: (String) -> Void) -> DisplayHostInfo? {
+    let me = getpid()
+    for host in DisplayHosts.all() where host.role == "standin" {
+        guard let lock = try? DisplayHosts.lock(host.id) else { continue }
+        defer { lock.release() }
+        guard let current = readJSON(DisplayHosts.info(host.id), DisplayHostInfo.self), DisplayHosts.alive(current),
+              (onlineDisplays() ?? []).contains(current.displayID) else {
+            DisplayHosts.remove(host.id)
+            continue
+        }
+        if let owner = readJSON(DisplayHosts.owner(current.id), DisplayHostOwner.self),
+           owner.pid != me, processBirth(owner.pid) == owner.start { continue }
+        guard (try? writeJSON(DisplayHosts.owner(current.id), DisplayHostOwner(pid: me, start: processBirth(me) ?? 0, linger: linger))) != nil else { continue }
+        log("adopted the stand-in display (id \(current.displayID)) from display host pid \(current.pid)")
+        return current
+    }
+    return nil
 }

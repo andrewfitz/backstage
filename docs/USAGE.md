@@ -294,7 +294,20 @@ daemon (`daemon` says so); `stop --all` still does.
 Apps are always quit *before* the display is removed, so nothing falls onto your screen. The
 daemon also exits by itself after `BACKSTAGE_IDLE_TIMEOUT` seconds (default 1800) once no
 session has managed apps (only with Auto-Hide When Idle on; the timeout starts over when it's
-turned on), or when no physical display is left.
+turned on).
+
+**No monitor attached** (switched off, unplugged, a headless Mac, a Parsec, VNC or Screen
+Sharing session, SSH): the daemon puts up a **stand-in screen**, a virtual display of its own
+that counts as one of the user's screens, and makes it the main display, with the hidden
+displays parked at its corner. Without it, macOS would make the hidden display the main one,
+move the user's windows onto it, and stream it to remote viewers; macOS's own fallback screen
+only appears when no display exists at all. Windows of apps backstage doesn't run that macOS
+moved onto a hidden display go back to the stand-in within seconds (as in `recover`). Once a real
+display has been back for 3 s, the daemon makes it the main display again and removes the
+stand-in. A daemon started with no monitor attached puts one up before parking its display. The
+stand-in lives in a display host like the hidden display, so a restart keeps it; there's at most
+one per user, whichever home's daemon put it up. Only if it can't be created does the daemon shut
+down, as it used to.
 
 **Restarts don't touch your monitor.** Each display lives in a small helper process, the display
 host (`backstage __display-host`), not in the daemon, because adding or removing a display makes
@@ -712,6 +725,8 @@ calibration, gamma or color (Redlight, f.lux, Lunar, BetterDisplay…) can recog
 - **Name:** always contains `Backstage` (today exactly `Backstage`; `Backstage (agent display)` up to 1.3.2).
 - **Vendor / model:** `0xB57A` / `0x0001` (`CGDisplayVendorNumber` / `CGDisplayModelNumber`).
 - **Serials:** `0x42530001`–`0x42530008` (displays 1–8).
+- **The stand-in screen** (while no real display is attached) is a user screen, not a hidden one:
+  vendor `0xB57A`, model `0x0002`, serial `0x42530100`, named `Stand-in Display`.
 
 Creating or removing one is a normal display reconfiguration
 (`CGDisplayRegisterReconfigurationCallback` fires, and ColorSync registers the display). Backstage
