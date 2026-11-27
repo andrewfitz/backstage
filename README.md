@@ -424,7 +424,7 @@ your main display's size), `BACKSTAGE_SCALE` (2, Retina; `1` for 1x), `BACKSTAGE
   clipboard (put text in with `set` or `type`, not ⌘C/⌘V).
 - **No monitor: switched off, unplugged, headless, remote.** With no real display, macOS would
   make the hidden display your main screen and stream it to Parsec, VNC or Screen Sharing, agents'
-  apps and all. backstage puts up a stand-in screen instead (named "Stand-in Display"): it becomes
+  apps and all. backstage puts up a stand-in screen instead (named "Backstage Stand-in"): it becomes
   your main screen, remote sessions show a normal desktop, the hidden display stays hidden, and
   everything keeps running. Windows of yours that macOS moved meanwhile come back to it within
   seconds. When a real display has been back for 3 s, it's made the main screen again and the

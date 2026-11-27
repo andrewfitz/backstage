@@ -722,11 +722,11 @@ waiting up to 5 s (a display that just stopped can linger a moment).
 Backstage's displays are virtual displays with stable identifiers, so tools that manage
 calibration, gamma or color (Redlight, f.lux, Lunar, BetterDisplay…) can recognise and skip them:
 
-- **Name:** always contains `Backstage` (today exactly `Backstage`; `Backstage (agent display)` up to 1.3.2).
+- **Name:** `Backstage` (`Backstage (agent display)` up to 1.3.2). Match the vendor and model rather than a name containing "Backstage": the stand-in below has one too.
 - **Vendor / model:** `0xB57A` / `0x0001` (`CGDisplayVendorNumber` / `CGDisplayModelNumber`).
 - **Serials:** `0x42530001`–`0x42530008` (displays 1–8).
 - **The stand-in screen** (while no real display is attached) is a user screen, not a hidden one:
-  vendor `0xB57A`, model `0x0002`, serial `0x42530100`, named `Stand-in Display`.
+  vendor `0xB57A`, model `0x0002`, serial `0x42530100`, named `Backstage Stand-in`.
 
 Creating or removing one is a normal display reconfiguration
 (`CGDisplayRegisterReconfigurationCallback` fires, and ColorSync registers the display). Backstage

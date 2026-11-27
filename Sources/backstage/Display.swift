@@ -28,7 +28,7 @@ func isOurDisplay(_ id: CGDirectDisplayID) -> Bool {
 /// and remote viewers see a normal desktop instead of the hidden display. One fixed identity.
 let kStandInProduct: UInt32 = 0x0002
 let standInSerial: UInt32 = 0x4253_0100
-let standInName = "Stand-in Display"
+let standInName = "Backstage Stand-in"
 func isStandInDisplay(_ id: CGDirectDisplayID) -> Bool {
     CGDisplayVendorNumber(id) == kVendor && CGDisplayModelNumber(id) == kStandInProduct
 }
