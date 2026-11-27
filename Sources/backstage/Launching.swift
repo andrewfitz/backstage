@@ -59,6 +59,13 @@ enum Launching {
         return names.filter { $0.hasSuffix(".json") }.compactMap { readJSON(dir.appendingPathComponent($0), LaunchRecord.self) }
     }
 
+    /// Launches still under way, or handed to the daemon to finish: they hold their display. One
+    /// whose command already ended (its app exited and it reported the error) doesn't; its record
+    /// only waits for the daemon's cleanup.
+    static func live() -> [LaunchRecord] {
+        records().filter { $0.handedOver == true || processBirth($0.cliPID) == $0.cliStart }
+    }
+
     /// How long the daemon keeps a handed-over record whose app hasn't appeared, from the
     /// launch's start. LaunchServices has been seen to start an app long after it was asked to
     /// during a WindowServer stall.

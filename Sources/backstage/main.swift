@@ -844,6 +844,8 @@ func run() throws {
 do {
     try run()
 } catch {
-    emit(["ok": false, "error": "\(error)"])
+    var result: [String: Any] = ["ok": false, "error": "\(error)"]
+    if let e = error as? CLIError { result.merge(e.fields) { kept, _ in kept } }
+    emit(result)
     exit(1)
 }

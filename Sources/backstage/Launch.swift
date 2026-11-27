@@ -111,6 +111,24 @@ private func usesQt(_ app: URL, executable: URL?) -> Bool {
     return head.range(of: Data("QtCore".utf8)) != nil
 }
 
+/// An app that exited by itself before `launch` finished. Often that's a test runner or
+/// command-line tool that simply completed: say so, with its test summary or the end of its
+/// output and the log, so an agent reads the result rather than launching again (or on a new
+/// display, which can't help).
+func launchExitError(name: String, pid: pid_t, when: String, log: URL) -> CLIError {
+    let text = (try? String(contentsOf: log, encoding: .utf8)) ?? ""
+    let lines = text.split(whereSeparator: \.isNewline).map { $0.trimmingCharacters(in: .whitespaces) }.filter { !$0.isEmpty }
+    var fields: [String: Any] = ["exited": true, "pid": Int(pid), "log": log.path,
+                                 "outputTail": lines.suffix(5).map { String($0.prefix(300)) }]
+    let summary = lines.last { $0.hasPrefix("Executed ") && $0.contains(" test") }
+    if let summary { fields["testSummary"] = summary }
+    let what = summary.map { "and its tests finished: \($0)" }
+        ?? lines.last.map { "and its output ends: \($0.prefix(200))" } ?? "without printing anything"
+    return CLIError("\(name) (pid \(pid)) exited by itself \(when), \(what). A test runner or command-line tool "
+        + "that finishes this fast has simply completed: its full output is in `log`. Launching it again, or on a "
+        + "new display, won't change this.", fields: fields)
+}
+
 func launch(_ args: Args) throws -> [String: Any] {
     guard let target = args.pos(0) else { throw CLIError("usage: backstage launch <app|bundle-id|path> [--env K=V] [--timeout S] [--dock] [--audio | --inaudible] [-- app args…]") }
     let timeout: Double
@@ -333,8 +351,12 @@ private func launchResolved(_ url: URL, bareExecutable: URL?, args: Args, info: 
         launchedAt = clock.systemUptime
     }
     func stillRunning() -> Bool { processBirth(pid) == birth }
-    /// The app is gone: say why if the daemon quit it because its audio couldn't be muted.
-    func exited(_ fallback: String) -> CLIError { CLIError(audioFailure(pid, birth) ?? fallback) }
+    /// The app is gone: say why if the daemon quit it because its audio couldn't be muted, else
+    /// that it exited by itself, with the end of its output.
+    func exited(_ when: String) -> CLIError {
+        if let failure = audioFailure(pid, birth) { return CLIError(failure) }
+        return launchExitError(name: name, pid: pid, when: when, log: logURL)
+    }
     func currentApp() -> NSRunningApplication? {
         guard stillRunning() else { return nil }
         let current = app.flatMap { $0.isTerminated ? nil : $0 } ?? NSRunningApplication(processIdentifier: pid)
@@ -373,6 +395,7 @@ private func launchResolved(_ url: URL, bareExecutable: URL?, args: Args, info: 
     } catch {
         terminateUnregisteredApp()
         if let failure = audioFailure(launch: launchID) ?? audioFailure(pid, birth) { throw CLIError(failure) }
+        if !stillRunning() { throw exited("during launch") }
         throw error
     }
     defer { placementLock.release() }
@@ -386,13 +409,13 @@ private func launchResolved(_ url: URL, bareExecutable: URL?, args: Args, info: 
         let windows = accessibility.windows
         return windows.isEmpty ? nil : windows
     } ?? (stillRunning() ? accessibility.windows : [])
-    guard stillRunning() else { throw exited("app exited before window placement") }
+    guard stillRunning() else { throw exited("before opening a window") }
     var gotWindow = !initialWindows.isEmpty
     // The app is still hidden, so its own windows aren't on screen yet: keep them apart too.
     var placedFrames: [CGRect] = []
     var crowded = false
     for w in initialWindows {
-        guard stillRunning() else { throw exited("app exited during window placement") }
+        guard stillRunning() else { throw exited("during window placement") }
         let placement = placeBesideReporting(w, display: vd, avoiding: placedFrames)
         placedFrames.append(placement.frame)
         crowded = crowded || placement.cascaded
@@ -438,10 +461,10 @@ private func launchResolved(_ url: URL, bareExecutable: URL?, args: Args, info: 
                 return nil
             }
         }
-        guard stillRunning() else { throw exited("app exited during launch") }
+        guard stillRunning() else { throw exited("during launch") }
         adoptWindows(pid: pid, display: vd)
     }
-    guard stillRunning() else { throw exited("app exited during launch") }
+    guard stillRunning() else { throw exited("during launch") }
     if let failure = audioFailure(pid, birth) {
         // The daemon is quitting it.
         throw CLIError(failure)
@@ -462,7 +485,7 @@ private func launchResolved(_ url: URL, bareExecutable: URL?, args: Args, info: 
     }
     // An app that makes itself a regular app does so within moments of starting.
     result["dock"] = dockState(pid, requested: hideFromDock, hidden: hidden, until: launchedAt + 1)
-    guard stillRunning() else { throw exited("app exited during launch") }
+    guard stillRunning() else { throw exited("during launch") }
     if !placed { result["warning"] = "window placement could not be verified; backstage skipped unhiding the app" }
     else if gotWindow && canUnhide == nil { result["warning"] = "AppKit did not provide a running application handle for unhiding the windows" }
     else if !gotWindow { result["warning"] = "no window appeared within \(Int(timeout))s (app may be windowless or still loading); new windows will be moved to the agent display automatically" }

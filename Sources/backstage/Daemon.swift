@@ -520,6 +520,23 @@ final class Daemon {
     func grantDisplay(_ want: String, session: String, override: Bool) throws -> Int {
         let wall = Date().timeIntervalSince1970
         if want == "new" {
+            // An empty display this session reserved (a launch on it failed or ended), or one
+            // nobody holds: reuse it rather than add another. Every display added or removed
+            // can blink the user's monitor, and an agent retrying a failed launch with
+            // --display new used to pile them up.
+            let apps = (try? AppStore.read()) ?? registry
+            let pending = Launching.live()
+            if let slot = extras.keys.sorted().first(where: { s in
+                closing[s] == nil
+                    && (reservations[s].map { $0.until <= wall || Session.sameID($0.session, session) } ?? true)
+                    && !apps.contains { $0.display == s } && !pending.contains { $0.display == s }
+            }) {
+                reservations[slot] = (session, wall + reservationSeconds)
+                extraCreated[slot] = ProcessInfo.processInfo.systemUptime
+                log("display \(slot) reused for session \(session) (it was empty)")
+                try? writeInfo()
+                return slot
+            }
             let free = extraSlots.filter { extras[$0] == nil }
             guard !free.isEmpty else { throw CLIError("no free display left: this daemon runs \(allDisplays.count) (\(allDisplays.map { String($0.slot) }.joined(separator: ", ")))") }
             let d = try makeExtraDisplay(.lowestFree(free))
@@ -560,7 +577,7 @@ final class Daemon {
             throw CLIError("display \(slot) isn't running (this daemon runs \(allDisplays.map { String($0.slot) }.joined(separator: ", ")))")
         }
         // A launch that chose this display is still writing its record or placing its window.
-        guard !Launching.records().contains(where: { $0.display == slot }) else {
+        guard !Launching.live().contains(where: { $0.display == slot }) else {
             throw CLIError("a launch is putting an app on display \(slot); try again in a moment")
         }
         let apps = try AppStore.read().filter { $0.display == slot && $0.matchesProcess }

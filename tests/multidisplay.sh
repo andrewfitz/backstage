@@ -167,6 +167,25 @@ echo "$OUT" | jq -e '.ok and (.moved | length) == 1' > /dev/null && pass "--forc
 R=$("$BS" __menu-render --displays 3 --page 0)
 echo "$R" | jq -e '[.previews[].closable] == [false, true]' > /dev/null && pass "menu: ⓧ on extra displays only" || fail "menu closable: $R"
 
+echo "== a launch that ends by itself, and --display new again"
+# A test runner that finishes before opening a window: the error says so, with its summary and
+# log. Asking for a new display again gets the same empty one (this daemon may add only 8, so a
+# second new display would be refused).
+printf '#include <stdio.h>\nint main(void) { puts("Executed 3 tests, with 0 failures (0 unexpected) in 0.010 (0.011) seconds"); return 0; }\n' > "$WORK/quick.c"
+cc -o "$WORK/quick-runner" "$WORK/quick.c" || exit 1
+OUT=$(as D launch "$WORK/quick-runner" --display new 2>&1)
+echo "$OUT" | jq -e '.ok == false and .exited and (.error | test("exited by itself")) and (.testSummary | test("Executed 3 tests")) and (.log | length > 0)' > /dev/null \
+    && pass "an app that ends by itself: $(echo "$OUT" | jq -r .error | cut -c1-110)…" || fail "quick runner: $OUT"
+[[ $(displays) == '[7,8]' ]] || fail "displays after the quick runner: $(displays)"
+OUT=$(as D launch "$WORK/quick-runner" --display new 2>&1)
+echo "$OUT" | jq -e '.exited' > /dev/null && [[ $(displays) == '[7,8]' ]] \
+    && pass "--display new again reuses the empty display 8" || fail "second --display new: $OUT; displays $(displays)"
+grep -q "display 8 reused for session D" "$BACKSTAGE_HOME/daemon.log" && pass "the daemon logs the reuse" || fail "no reuse in the daemon log"
+OUT=$(launch C blue --display new 2>&1)
+echo "$OUT" | jq -e '.ok == false and (.error | test("no free display"))' > /dev/null \
+    && pass "another session can't take D's reserved display" || fail "C's --display new: $OUT"
+as D close-display 8 > /dev/null || fail "D closing 8"
+
 echo "== bad values"
 OUT=$(launch A blue --display 5 2>&1)
 echo "$OUT" | jq -e '.ok == false and (.error | test("isn.t one this daemon runs"))' > /dev/null && pass "a display this daemon can't run is refused" || fail "display 5: $OUT"

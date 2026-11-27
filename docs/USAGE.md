@@ -119,6 +119,11 @@ display, and without it the app goes where your session already has apps, else d
 [Several displays per daemon](#several-displays-per-daemon)). The result says which (`display`), and
 `"crowded": true` (with a `warning`) when its window found no free spot and overlaps others.
 
+An app that exits by itself before `launch` finishes (often a test runner or command-line tool
+that simply completed) gives `"ok": false` with `"exited": true`, its `pid`, its `log`, the last
+lines of its output (`outputTail`) and, for a test runner, `testSummary` (the last "Executed N
+tests" line). Read those: launching again, or on another display, won't change the outcome.
+
 `--timeout` (default 15 s) is how long to wait for the first window. A windowless app still
 launches; you get a `warning`, and any window it opens later is still pulled onto the agent
 display.
@@ -633,7 +638,8 @@ waiting up to 5 s (a display that just stopped can linger a moment).
 ### Several displays per daemon
 
 - `launch --display new` creates a display and **reserves** it for the caller's session for
-  30 minutes: other sessions can't launch on it, `move` onto it, or get it from Send Front Window
+  30 minutes (an empty display the session already reserved, or that nobody holds, is reused
+  instead of adding another): other sessions can't launch on it, `move` onto it, or get it from Send Front Window
   Backstage. The display itself is removed 30 minutes after the last app or pending launch left
   it (`BACKSTAGE_EXTRA_DISPLAY_GRACE`), or right away with [`close-display`](#close-display-n---force)
   (the menu's ⓧ): every display that comes or goes can briefly blip the

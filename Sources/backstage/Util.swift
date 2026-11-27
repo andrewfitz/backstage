@@ -3,7 +3,9 @@ import AppKit
 
 struct CLIError: Error, CustomStringConvertible {
     let description: String
-    init(_ s: String) { description = s }
+    /// More fields for the error's JSON (`log`, say), beside `ok` and `error`.
+    var fields: [String: Any] = [:]
+    init(_ s: String, fields: [String: Any] = [:]) { description = s; self.fields = fields }
 }
 
 func emit(_ obj: Any) {

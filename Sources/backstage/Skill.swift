@@ -79,17 +79,26 @@ backstage quit                          # always clean up; `backstage stop` quit
   capture the user's own screens.
 - **Acting:** `press`/`set`/`menu` are the most reliable. Use coordinate `click`/`drag`/`scroll`
   for custom-drawn views. `hover` is best-effort: tooltips won't appear.
-- **A display of your own:** `launch --display new` puts the app on a fresh hidden display
-  reserved for your session (for 30 minutes; it's removed 30 minutes after its last app leaves). Use it for a
-  clean full-display screenshot or recording, a full-screen app, testing an app's multi-monitor
-  behaviour, or when a launch result says `"crowded": true` (no free spot: windows overlap).
-  Your later launches follow you there; `move --display N` moves an app (`list` shows each
-  app's `display`), and `screenshot --full --display N` captures one display when your apps
-  span several. Coordinates are always relative to the app's own display. Creating a display
-  can briefly flicker the user's monitor, so don't do it routinely: the shared display 1 is
-  the default for a reason. Done with your display? `close-display N` removes it now (your
-  apps on it move to the first display and keep running); otherwise it goes 30 minutes after
-  its last app.
+- **A display of your own needs a reason.** Creating or removing a display can blink the user's
+  monitor, so stay on the shared display 1 unless one of these applies:
+  - you'll capture the whole display: `screenshot --full`, or a recording (both include every
+    window on that display, other sessions' too);
+  - the app goes full screen or covers the display (`window fill`), or you're checking
+    layout that depends on what else is on the screen;
+  - you're testing the app's multi-monitor behaviour (it needs a second screen);
+  - launches keep saying `"crowded": true` (no free spot left: windows overlap).
+  Not reasons: an ordinary launch or UI check, screenshots of your own app (they show only its
+  windows) or input to it (it goes straight to its process), test runners and command-line tools, a
+  second app of yours, keeping away from other agents (sessions are already separate), or a
+  launch that failed: the display is never why an app exits, so read the error and its `log`
+  instead. A test runner that finishes before opening a window makes `launch` say it exited by
+  itself, with its test summary: that's a result, not a failure to retry.
+  `launch --display new` reserves the display for your session for 30 minutes; asking again
+  while it's empty gives you the same one. Your later launches follow you there; `move --display N`
+  moves an app (`list` shows each app's `display`), and `screenshot --full --display N`
+  captures one display when your apps span several. Coordinates are always relative to the
+  app's own display. Done with it? `close-display N` removes it now (your apps on it move to
+  the first display and keep running); otherwise it goes 30 minutes after it was last used.
 - **A window you didn't launch on the display** (one of the user's own apps reopening where it
   last was): the daemon returns it to the user's screen within seconds; `backstage recover`
   does it now. Never `launch` or drive it: it's the user's.

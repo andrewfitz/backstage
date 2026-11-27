@@ -1,5 +1,18 @@
 # Changelog
 
+## 1.3.7
+
+- **A launch that ends by itself says so.** A test runner or tool that finished before opening a
+  window got `"app exited before window placement"` and nothing else, so an agent retried it,
+  even on new displays (one session made four in three minutes, each staying 30 minutes). The
+  error now says the app exited by itself, with its test summary or last output, and the result
+  has `exited`, `log`, `outputTail` and `testSummary`.
+- **`launch --display new` reuses an empty display** the session already reserved (or that
+  nobody holds) instead of adding another: displays coming and going can blink your monitor.
+- **The skill says when a display of your own is worth it** (whole-display captures and
+  recordings, full-screen or display-filling windows, multi-monitor testing, crowding) and when
+  it isn't (ordinary launches, screenshots of your own app, test runners, failed launches).
+
 ## 1.3.6
 
 - **New windows no longer flash on your screen.** A window an agent's dev build or test runner
