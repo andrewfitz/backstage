@@ -68,7 +68,7 @@ struct Args {
     var passthrough: [String] = []
 
     init(_ raw: [String], command: String) throws {
-        let flags: Set<String> = ["help", "json", "force", "double", "right", "raw", "gone", "full", "claude", "codex", "grok", "hooks", "all", "sound", "dock",
+        let flags: Set<String> = ["help", "json", "force", "double", "right", "raw", "gone", "full", "claude", "codex", "grok", "cursor", "opencode", "hooks", "all", "sound", "dock",
                                 "audio", "inaudible", "dry-run"]
         let values: Set<String> = ["pid", "app", "env", "timeout", "lines", "scale", "o", "out",
                                    "window", "depth", "role", "text", "ref", "steps", "dx", "dy", "since", "min-db", "seconds",
@@ -181,8 +181,8 @@ struct Args {
             arity = opt("ref") == nil ? 2...2 : 0...0
         case "hover": allowed = target + ["scale"]; arity = 2...2
         case "show": allowed = target; arity = 0...1
-        case "install": allowed = ["claude", "codex", "grok", "hooks"]; arity = 0...0
-        case "uninstall": allowed = ["claude", "codex", "grok"]; arity = 0...0
+        case "install": allowed = ["claude", "codex", "grok", "cursor", "opencode", "hooks"]; arity = 0...0
+        case "uninstall": allowed = ["claude", "codex", "grok", "cursor", "opencode"]; arity = 0...0
         case "hook": allowed = []; arity = 1...1
         case "skill": allowed = []; arity = 0...0
         case "__dock-restore": allowed = target; arity = 0...0

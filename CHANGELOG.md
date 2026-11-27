@@ -1,5 +1,14 @@
 # Changelog
 
+## 1.3.8
+
+- **Cursor and OpenCode:** `backstage install` now writes the skill for them too
+  (`~/.cursor/skills`, `~/.config/opencode/skills`), and `--hooks` adds their hook: Cursor's
+  `beforeShellExecution` in `~/.cursor/hooks.json` (answered in Cursor's JSON format), and an
+  OpenCode plugin (`~/.config/opencode/plugins/backstage.js`) whose permission hook denies shell
+  commands that would open apps on your screen. `--cursor`/`--opencode` pick them, and
+  `uninstall` removes them.
+
 ## 1.3.7
 
 - **A launch that ends by itself says so.** A test runner or tool that finished before opening a

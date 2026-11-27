@@ -10,6 +10,8 @@ let shellToolNames: Set<String> = ["Bash", "exec_command", "shell", "local_shell
 
 /// Pull the shell command out of a hook payload (snake_case or camelCase; string or argv array).
 func hookCommand(_ payload: [String: Any]) -> String? {
+    // Cursor's beforeShellExecution: `{"hook_event_name": "beforeShellExecution", "command": …}`.
+    if isCursorShellHook(payload) { return payload["command"] as? String }
     let tool = (payload["tool_name"] ?? payload["toolName"]) as? String ?? ""
     guard shellToolNames.contains(tool), let input = (payload["tool_input"] ?? payload["toolInput"]) as? [String: Any] else { return nil }
     for key in ["command", "cmd"] {
@@ -21,6 +23,10 @@ func hookCommand(_ payload: [String: Any]) -> String? {
         }
     }
     return nil
+}
+
+func isCursorShellHook(_ payload: [String: Any]) -> Bool {
+    payload["hook_event_name"] as? String == "beforeShellExecution"
 }
 
 /// Split a shell string into simple-command word lists. Handles quotes, escapes and the
@@ -109,13 +115,31 @@ func hookDenyMessage(_ why: String, _ command: String, env: [String: String] = P
 /// `backstage hook pre-tool-use`: read the agent's hook payload on stdin, and exit 2 with a
 /// reason on stderr to deny. Exit 2 + stderr means "deny" in Claude Code, Codex and Grok alike.
 /// Fails open: unparseable input or other tools are allowed.
+/// Cursor's beforeShellExecution instead reads a JSON decision from stdout, for allow as well as
+/// deny (it treats output that isn't valid JSON as a block).
 func runPreToolUseHook() -> Never {
-    if ProcessInfo.processInfo.environment["BACKSTAGE_HOOK"] == "off" { exit(0) }
     let data = FileHandle.standardInput.readDataToEndOfFile()
-    guard let payload = (try? JSONSerialization.jsonObject(with: data)) as? [String: Any],
-          let command = hookCommand(payload), let why = screenIntrusion(command) else { exit(0) }
-    FileHandle.standardError.write(hookDenyMessage(why, command).data(using: .utf8)!)
+    let payload = (try? JSONSerialization.jsonObject(with: data)) as? [String: Any]
+    let cursor = payload.map(isCursorShellHook) ?? false
+    func allow() -> Never {
+        if cursor { emitCompact(["permission": "allow"]) }
+        exit(0)
+    }
+    if ProcessInfo.processInfo.environment["BACKSTAGE_HOOK"] == "off" { allow() }
+    guard let payload, let command = hookCommand(payload), let why = screenIntrusion(command) else { allow() }
+    let message = hookDenyMessage(why, command)
+    if cursor {
+        emitCompact(["permission": "deny", "user_message": "backstage blocked this: \(why)", "agent_message": message])
+        exit(0)
+    }
+    FileHandle.standardError.write(message.data(using: .utf8)!)
     exit(2)
+}
+
+private func emitCompact(_ object: [String: Any]) {
+    if let d = try? JSONSerialization.data(withJSONObject: object, options: [.withoutEscapingSlashes]) {
+        FileHandle.standardOutput.write(d + Data("\n".utf8))
+    }
 }
 
 // MARK: - show (deliberately put something on the user's screen)
@@ -259,14 +283,19 @@ func homeDir() -> URL {
 }
 
 enum Agent: String, CaseIterable {
-    case claude, codex, grok
-    var root: URL { homeDir().appendingPathComponent("." + rawValue) }
+    case claude, codex, grok, cursor, opencode
+    var root: URL {
+        self == .opencode ? homeDir().appendingPathComponent(".config/opencode") : homeDir().appendingPathComponent("." + rawValue)
+    }
+    /// Every agent reads skills from `<root>/skills/<name>/SKILL.md` (Cursor: ~/.cursor/skills;
+    /// OpenCode: ~/.config/opencode/skills).
     var skillDir: URL { root.appendingPathComponent("skills/backstage") }
     var hookMatcher: String {
         switch self {
         case .claude: return "Bash"
         case .codex: return "Bash|exec_command|shell|local_shell"
         case .grok: return "Bash|run_terminal_command|run_terminal_cmd"
+        case .cursor, .opencode: return ""   // a shell-only event (Cursor) or a plugin (OpenCode)
         }
     }
     var hookFile: URL {
@@ -274,6 +303,8 @@ enum Agent: String, CaseIterable {
         case .claude: return root.appendingPathComponent("settings.json")
         case .codex: return root.appendingPathComponent("hooks.json")
         case .grok: return root.appendingPathComponent("config.toml")
+        case .cursor: return root.appendingPathComponent("hooks.json")
+        case .opencode: return root.appendingPathComponent("plugins/backstage.js")
         }
     }
 }
@@ -388,6 +419,120 @@ private func editJSONHooks(_ url: URL, matcher: String, command: String?) throws
     return command == nil ? "removed hook" : (removed ? "updated hook" : "added hook")
 }
 
+/// Cursor's hooks.json: `{"version": 1, "hooks": {"beforeShellExecution": [{"command": …}]}}`.
+private func editCursorHooks(_ url: URL, command: String?) throws -> String {
+    let target = try configurationTarget(url)
+    var root: [String: Any] = [:]
+    let source = try configurationData(target)
+    if let d = source {
+        guard let obj = try JSONSerialization.jsonObject(with: d) as? [String: Any] else { throw CLIError("\(url.path) is not a JSON object; not touching it") }
+        root = obj
+    }
+    guard var hooks = (root["hooks"] ?? [String: Any]()) as? [String: Any],
+          let previous = (hooks["beforeShellExecution"] ?? [[String: Any]]()) as? [[String: Any]] else {
+        throw CLIError("invalid hooks or beforeShellExecution in \(url.path)")
+    }
+    var entries = previous.filter { entry in
+        guard let cmd = entry["command"] as? String, (entry["type"] as? String ?? "command") == "command" else { return true }
+        return !ownedHook(["type": "command", "command": cmd])
+    }
+    let removed = entries.count != previous.count
+    if let command {
+        entries.append(["command": command, "timeout": 5])
+        if NSArray(array: entries).isEqual(to: previous) { return "hook already installed" }
+    } else if !removed {
+        return "no backstage hook present"
+    }
+    hooks["beforeShellExecution"] = entries.isEmpty ? nil : entries
+    root["hooks"] = hooks.isEmpty ? nil : hooks
+    if root["hooks"] != nil, root["version"] == nil { root["version"] = 1 }
+    if source != nil { try backup(target) }
+    let out = try JSONSerialization.data(withJSONObject: root, options: [.prettyPrinted, .withoutEscapingSlashes])
+    try out.write(to: target, options: .atomic)
+    return command == nil ? "removed hook" : (removed ? "updated hook" : "added hook")
+}
+
+/// Cursor's command, without the trailing shell comment the others carry, in case Cursor runs it
+/// without a shell: a plain absolute path is recognised as ours by `ownedHook` anyway.
+private func cursorHookCommand(_ binary: String) -> String {
+    let plain = binary.hasPrefix("/") && binary.rangeOfCharacter(from: .whitespacesAndNewlines) == nil
+        && binary.rangeOfCharacter(from: CharacterSet(charactersIn: ";&|<>`$()#'\"\n\r")) == nil
+    return plain ? binary + hookSuffix : "'\(binary.replacingOccurrences(of: "'", with: "'\\''"))'" + hookSuffix + ownershipComment
+}
+
+let openCodePluginMarker = "// backstage-managed-plugin"
+
+/// OpenCode's hook is a plugin file of ours: its permission hook asks `backstage hook pre-tool-use`
+/// about every shell command and denies the ones that would put something on the user's screen.
+/// (A plain `{ id, setup }` default export: OpenCode needs no package for it.)
+func openCodePlugin(binary: String) -> String {
+    let path = String(decoding: (try? JSONEncoder().encode(binary)) ?? Data("\"backstage\"".utf8), as: UTF8.self)
+    return """
+    \(openCodePluginMarker): written by `backstage install --hooks`, removed by `backstage uninstall`.
+    // Keeps the agent from opening apps on the user's screen: every shell command is checked by
+    // `backstage hook pre-tool-use`, which denies `open`, app executables and activating AppleScript
+    // (the agent should use `backstage launch` instead). If backstage is missing, nothing is blocked.
+    import { spawnSync } from "node:child_process"
+
+    const BACKSTAGE = \(path)
+
+    function check(command) {
+      const r = spawnSync(BACKSTAGE, ["hook", "pre-tool-use"], {
+        input: JSON.stringify({ tool_name: "Bash", tool_input: { command } }),
+        encoding: "utf8",
+        timeout: 5000,
+      })
+      return r.status === 2 ? r.stderr || "backstage blocked this command" : null
+    }
+
+    export default {
+      id: "backstage-hook",
+      async setup(ctx) {
+        await ctx.permission.hook("evaluate", (event) => {
+          if (event.action !== "shell") return
+          for (const command of event.resources ?? []) {
+            const why = typeof command === "string" ? check(command) : null
+            if (why) {
+              event.effect = "deny"
+              event.message = why
+              return
+            }
+          }
+        })
+      },
+    }
+
+    """
+}
+
+private func editOpenCodePlugin(_ url: URL, binary: String?) throws -> String {
+    let source = try configurationData(url)
+    if let source, !(String(data: source, encoding: .utf8) ?? "").hasPrefix(openCodePluginMarker) {
+        if binary == nil { return "preserved a different plugin at \(url.path)" }
+        throw CLIError("found a different plugin at \(url.path); move it before installing")
+    }
+    guard let binary else {
+        guard source != nil else { return "no backstage hook present" }
+        try FileManager.default.removeItem(at: url)
+        return "removed hook"
+    }
+    let output = Data(openCodePlugin(binary: binary).utf8)
+    if output == source { return "hook already installed" }
+    try FileManager.default.createDirectory(at: url.deletingLastPathComponent(), withIntermediateDirectories: true)
+    try output.write(to: url, options: .atomic)
+    return source == nil ? "added hook" : "updated hook"
+}
+
+/// Adds (`command` non-nil) or removes the agent's hook.
+private func editHook(_ agent: Agent, command: String?, binary: String) throws -> String {
+    switch agent {
+    case .grok: return try editTOMLHooks(agent.hookFile, matcher: agent.hookMatcher, command: command)
+    case .cursor: return try editCursorHooks(agent.hookFile, command: command.map { _ in cursorHookCommand(binary) })
+    case .opencode: return try editOpenCodePlugin(agent.hookFile, binary: command == nil ? nil : binary)
+    case .claude, .codex: return try editJSONHooks(agent.hookFile, matcher: agent.hookMatcher, command: command)
+    }
+}
+
 /// Same for Grok's config.toml, using a marked block so it can be removed cleanly.
 private func editTOMLHooks(_ url: URL, matcher: String, command: String?) throws -> String {
     let target = try configurationTarget(url)
@@ -466,8 +611,11 @@ func isBackstageSkill(_ text: String) -> Bool {
 
 func cmdInstall(_ args: Args) throws -> [String: Any] {
     let agents = selectedAgents(args)
-    guard !agents.isEmpty else { throw CLIError("no agent config dirs found (~/.claude, ~/.codex, ~/.grok); pass --claude/--codex/--grok") }
-    let path = selfCommandPath().replacingOccurrences(of: "'", with: "'\\''")
+    guard !agents.isEmpty else {
+        throw CLIError("no agent config dirs found (~/.claude, ~/.codex, ~/.grok, ~/.cursor, ~/.config/opencode); pass --claude/--codex/--grok/--cursor/--opencode")
+    }
+    let binary = selfCommandPath()
+    let path = binary.replacingOccurrences(of: "'", with: "'\\''")
     let command = "'\(path)'" + hookSuffix + ownershipComment
     var report: [String: Any] = [:]
     for a in agents {
@@ -487,8 +635,7 @@ func cmdInstall(_ args: Args) throws -> [String: Any] {
                 }
             }
             if args.has("hooks") {
-                r["hook"] = a == .grok ? try editTOMLHooks(a.hookFile, matcher: a.hookMatcher, command: command)
-                                       : try editJSONHooks(a.hookFile, matcher: a.hookMatcher, command: command)
+                r["hook"] = try editHook(a, command: command, binary: binary)
                 r["hookFile"] = a.hookFile.path
             }
             if previous != output {
@@ -514,7 +661,8 @@ func cmdInstall(_ args: Args) throws -> [String: Any] {
     var out: [String: Any] = ["ok": true, "installed": report]
     if args.has("hooks") {
         out["hookCommand"] = command
-        out["note"] = "Restart running agent sessions to pick up hooks. Grok only runs hooks it trusts: run /hooks-list in Grok to check."
+        out["note"] = "Restart running agent sessions to pick up hooks. Grok only runs hooks it trusts: run /hooks-list in Grok to check. "
+            + "OpenCode loads its plugin when it starts (`opencode plugin list` shows it)."
     } else {
         out["note"] = "Skills only. Add --hooks to also block agents from opening apps on your screen directly."
     }
@@ -527,8 +675,7 @@ func cmdUninstall(_ args: Args) throws -> [String: Any] {
         report[a.rawValue] = try withAgentLock(a, create: false) {
             var r: [String: Any] = [:]
             let skill = a.skillDir.appendingPathComponent("SKILL.md")
-            r["hook"] = a == .grok ? try editTOMLHooks(a.hookFile, matcher: a.hookMatcher, command: nil)
-                                   : try editJSONHooks(a.hookFile, matcher: a.hookMatcher, command: nil)
+            r["hook"] = try editHook(a, command: nil, binary: selfCommandPath())
             var metadata = stat()
             if lstat(skill.path, &metadata) == 0 {
                 // A custom link may expose a shared skill. It remains under the user's control.

@@ -55,7 +55,7 @@ With [Homebrew](https://brew.sh):
 brew tap andrewfitz/backstage
 brew install backstage
 backstage doctor              # check permissions
-backstage install --hooks     # optional: skill + hook for Claude Code / Codex / Grok
+backstage install --hooks     # optional: skill + hook for Claude Code / Codex / Grok / Cursor / OpenCode
 ```
 
 Prebuilt for macOS 15 and later on Apple Silicon; elsewhere Homebrew builds it from source
@@ -236,10 +236,10 @@ announces "Sent … backstage"; nothing else happens on your screen.
   `~/.backstage` has a shortcut by default; one started with another `BACKSTAGE_HOME` (tests, for
   instance) registers one only if its own settings name it.
 
-## Installing into Claude Code, Codex and Grok
+## Installing into Claude Code, Codex, Grok, Cursor and OpenCode
 
 ```
-backstage install --hooks      # every agent found in ~ (or pick: --claude --codex --grok)
+backstage install --hooks      # every agent found (or pick: --claude --codex --grok --cursor --opencode)
 backstage uninstall
 make dist                      # regenerate dist/skills/backstage/SKILL.md for packaging
 ```

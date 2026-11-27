@@ -64,9 +64,11 @@ Use show only when the user explicitly wants it on their screen.
   show <app|file|url>               open something on the user's screen
 
 AGENT INTEGRATION
-  install [--claude] [--codex] [--grok] [--hooks]   install the skill (and optionally the hook)
-                                    into each agent; default = every agent found in ~
-  uninstall [--claude] [--codex] [--grok]           remove skill + hook
+  install [--claude] [--codex] [--grok] [--cursor] [--opencode] [--hooks]
+                                    install the skill (and optionally the hook) into each
+                                    agent; default = every agent found in ~ (and ~/.config/opencode)
+  uninstall [--claude] [--codex] [--grok] [--cursor] [--opencode]
+                                    remove skill + hook
   skill                             print the skill (SKILL.md)
   hook pre-tool-use                 hook entrypoint: blocks open/osascript-activate/.app binaries
                                     (bypass for a user-requested open: BACKSTAGE_SHOW=1 <cmd>)

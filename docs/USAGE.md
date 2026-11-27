@@ -719,9 +719,11 @@ this from root; `doctor` says when it's worth running (`leftoverDisplays`).
 
 ## Agent integration
 
-### `install [--claude] [--codex] [--grok] [--hooks]`
-Writes the skill to `~/.<agent>/skills/backstage/SKILL.md`. With no agent flags, it installs
-for every agent whose config directory exists.
+### `install [--claude] [--codex] [--grok] [--cursor] [--opencode] [--hooks]`
+Writes the skill to `<agent dir>/skills/backstage/SKILL.md` (`~/.claude`, `~/.codex`, `~/.grok`,
+`~/.cursor`, `~/.config/opencode`). With no agent flags, it installs for every agent whose
+config directory exists. (Cursor and OpenCode also read `~/.claude/skills`, so with Claude
+installed they see the same skill twice; the copies are identical.)
 
 `--hooks` also adds the PreToolUse hook to each agent's config, keeping your existing entries
 and backing the file up to `*.backstage-bak` first:
@@ -731,12 +733,19 @@ and backing the file up to `*.backstage-bak` first:
 | Claude Code | `~/.claude/settings.json` | `Bash` |
 | Codex | `~/.codex/hooks.json` | `Bash`, `exec_command`, `shell`, `local_shell` |
 | Grok | `~/.grok/config.toml` | `Bash`, `run_terminal_command`, `run_terminal_cmd` |
+| Cursor | `~/.cursor/hooks.json` | the `beforeShellExecution` event (every shell command) |
+| OpenCode | `~/.config/opencode/plugins/backstage.js` | a plugin whose permission hook checks each `shell` command |
 
-Running install again is safe. Restart agent sessions afterwards. Grok only runs hooks in
-trusted folders; check with `/hooks-list`.
+Cursor gets its decision as JSON on stdout (`{"permission": "allow"}` or `"deny"` with
+`user_message` and `agent_message`). The OpenCode plugin runs `backstage hook pre-tool-use` for
+each shell command and denies the call with the hook's message; it's a file of backstage's own
+(first line `// backstage-managed-plugin`), and install refuses to replace a different file there.
 
-### `uninstall [--claude] [--codex] [--grok]`
-Removes the skill and only backstage's own hook entries.
+Running install again is safe. Restart agent sessions afterwards (OpenCode loads plugins when it
+starts). Grok only runs hooks in trusted folders; check with `/hooks-list`.
+
+### `uninstall [--claude] [--codex] [--grok] [--cursor] [--opencode]`
+Removes the skill and only backstage's own hook entries (and its OpenCode plugin file).
 
 ### `skill`
 Prints the skill. `make dist` writes it to `dist/skills/backstage/SKILL.md`.

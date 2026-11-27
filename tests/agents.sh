@@ -15,8 +15,19 @@ echo "== hook decisions"
 # expect: 2 = blocked, 0 = allowed
 check() {
     local expect=$1 cmd=$2 code payload
-    for shape in claude codex-cmd codex-argv grok; do
+    for shape in claude codex-cmd codex-argv grok cursor-tool cursor-shell; do
         case $shape in
+            cursor-tool) payload=$(jq -n --arg c "$cmd" '{hook_event_name:"preToolUse",tool_name:"Shell",tool_input:{command:$c,working_directory:"/tmp"}}') ;;
+            cursor-shell)
+                # Cursor's beforeShellExecution answers in JSON on stdout, exit 0, allow or deny.
+                payload=$(jq -n --arg c "$cmd" '{hook_event_name:"beforeShellExecution",command:$c,cwd:"/tmp",sandbox:false}')
+                code=0
+                printf '%s' "$payload" | "$bin" hook pre-tool-use > "$scratch/hook.out" 2>/dev/null || code=$?
+                want=$([ "$expect" = 2 ] && echo deny || echo allow)
+                got=$(jq -r .permission "$scratch/hook.out" 2>/dev/null)
+                if [ "$code" != 0 ] || [ "$got" != "$want" ]; then bad "[$shape] expected $want (exit 0), got '$got' (exit $code): $cmd"; return; fi
+                if [ "$expect" = 2 ] && ! jq -r .agent_message "$scratch/hook.out" | grep -q "backstage launch"; then bad "[$shape] no guidance in agent_message"; return; fi
+                continue ;;
             claude)     payload=$(jq -n --arg c "$cmd" '{tool_name:"Bash",tool_input:{command:$c}}') ;;
             codex-cmd)  payload=$(jq -n --arg c "$cmd" '{tool_name:"exec_command",tool_input:{cmd:$c}}') ;;
             codex-argv) payload=$(jq -n --arg c "$cmd" '{tool_name:"shell",tool_input:{command:["bash","-lc",$c]}}') ;;
@@ -57,6 +68,8 @@ check 0 'python3 -c "import os; print(os.open)"'
 # Non-shell tools and junk input fail open.
 printf '%s' '{"tool_name":"Write","tool_input":{"command":"open -a X"}}' | "$bin" hook pre-tool-use && ok "non-shell tool allowed" || bad "non-shell tool"
 printf 'not json' | "$bin" hook pre-tool-use && ok "garbage input fails open" || bad "garbage input"
+out=$(printf '%s' '{"hook_event_name":"beforeShellExecution","command":"open -a X"}' | BACKSTAGE_HOOK=off "$bin" hook pre-tool-use)
+[ "$(printf '%s' "$out" | jq -r .permission)" = allow ] && ok "BACKSTAGE_HOOK=off still answers Cursor (allow)" || bad "Cursor with BACKSTAGE_HOOK=off: $out"
 printf '%s' '{"tool_name":"Bash","tool_input":{"command":"open -a X"}}' | BACKSTAGE_HOOK=off "$bin" hook pre-tool-use && ok "BACKSTAGE_HOOK=off disables" || bad "BACKSTAGE_HOOK=off"
 
 echo "== hook in computer-use hosts (Claude / Codex desktop apps)"
@@ -87,7 +100,8 @@ done
 
 echo "== install / uninstall (throwaway HOME)"
 H="$scratch/home"
-mkdir -p "$H/.claude" "$H/.codex" "$H/.grok"
+mkdir -p "$H/.claude" "$H/.codex" "$H/.grok" "$H/.cursor" "$H/.config/opencode"
+echo '{"version": 1, "hooks": {"afterFileEdit": [{"command": "./hooks/format.sh"}]}}' > "$H/.cursor/hooks.json"
 # Pre-existing user config that must survive untouched.
 cat > "$H/.claude/settings.json" <<'JSON'
 {"model": "opus", "hooks": {"PreToolUse": [{"matcher": "Bash", "hooks": [{"type": "command", "command": "/usr/local/bin/other-guard"}]}], "Stop": [{"hooks": [{"type": "command", "command": "say done"}]}]}}
@@ -97,9 +111,9 @@ printf 'model = "grok-4"\n\n[ui]\ntheme = "dark"\n' > "$H/.grok/config.toml"
 
 HOME=$H "$bin" install --hooks > "$H/out1.json" || bad "install failed: $(cat "$H/out1.json")"
 HOME=$H "$bin" install --hooks > "$H/out2.json" || bad "second install failed"
-for a in claude codex grok; do
-    [ -s "$H/.$a/skills/backstage/SKILL.md" ] && ok "$a skill installed" || bad "$a skill missing"
-    head -3 "$H/.$a/skills/backstage/SKILL.md" | grep -q '^name: backstage' || bad "$a skill frontmatter"
+for d in .claude .codex .grok .cursor .config/opencode; do
+    [ -s "$H/$d/skills/backstage/SKILL.md" ] && ok "$d skill installed" || bad "$d skill missing"
+    head -3 "$H/$d/skills/backstage/SKILL.md" | grep -q '^name: backstage' || bad "$d skill frontmatter"
 done
 n=$(jq '[.hooks.PreToolUse[].hooks[] | select(.command|test("backstage-managed-hook"))] | length' "$H/.claude/settings.json")
 [ "$n" = 1 ] && ok "claude hook present once after 2 installs" || bad "claude hook count $n"
@@ -112,9 +126,37 @@ n=$(grep -c 'backstage-managed-hook' "$H/.grok/config.toml")
 [ "$n" = 1 ] && ok "grok hook present once" || bad "grok hook count $n"
 grep -q 'theme = "dark"' "$H/.grok/config.toml" && ok "grok config preserved" || bad "grok config damaged"
 [ -f "$H/.claude/settings.json.backstage-bak" ] && ok "backup written" || bad "no backup"
+n=$(jq '[.hooks.beforeShellExecution[] | select(.command|test(" hook pre-tool-use"))] | length' "$H/.cursor/hooks.json")
+[ "$n" = 1 ] && ok "cursor hook present once" || bad "cursor hook count $n"
+jq -e '.version == 1 and .hooks.afterFileEdit[0].command == "./hooks/format.sh"' "$H/.cursor/hooks.json" >/dev/null && ok "cursor hooks preserved" || bad "cursor hooks damaged"
+# The installed Cursor command must work when run as Cursor would: through a shell, from ~/.cursor.
+cursor_cmd=$(jq -r '.hooks.beforeShellExecution[0].command' "$H/.cursor/hooks.json")
+printf '%s' "$cursor_cmd" > "$scratch/cursor-hook.sh"
+printf '%s' '{"hook_event_name":"beforeShellExecution","command":"open -a Safari"}' > "$scratch/cursor-in.json"
+(cd "$H/.cursor" && /bin/sh "$scratch/cursor-hook.sh" < "$scratch/cursor-in.json") | jq -e '.permission == "deny"' > /dev/null \
+    && ok "the installed Cursor command denies open" || bad "installed Cursor command: $cursor_cmd"
+plugin="$H/.config/opencode/plugins/backstage.js"
+head -1 "$plugin" | grep -q '^// backstage-managed-plugin' && ok "opencode plugin installed" || bad "opencode plugin missing"
+if command -v node > /dev/null; then
+    # Run the plugin's permission hook as OpenCode would, with a stand-in context.
+    cp "$plugin" "$scratch/plugin.mjs"
+    cp tests/opencode-plugin-check.mjs "$scratch/check.mjs"
+    r=$(node "$scratch/check.mjs" "$scratch/plugin.mjs" 2>&1)
+    [ "$r" = ok ] && ok "opencode plugin denies open, allows the rest" || bad "opencode plugin: $r"
+else
+    echo "  skip opencode plugin run (no node)"
+fi
 
 HOME=$H "$bin" uninstall > "$H/out3.json" || bad "uninstall failed"
-for a in claude codex grok; do [ ! -e "$H/.$a/skills/backstage" ] || bad "$a skill not removed"; done
+for d in .claude .codex .grok .cursor .config/opencode; do [ ! -e "$H/$d/skills/backstage" ] || bad "$d skill not removed"; done
+[ ! -e "$plugin" ] && ok "opencode plugin removed" || bad "opencode plugin left behind"
+jq -e '(.hooks.beforeShellExecution == null) and .hooks.afterFileEdit[0].command == "./hooks/format.sh"' "$H/.cursor/hooks.json" >/dev/null \
+    && ok "cursor hook removed, the rest kept" || bad "cursor hooks after uninstall: $(cat "$H/.cursor/hooks.json")"
+# A plugin of the user's own at that path is never overwritten or removed.
+echo '// my own plugin' > "$plugin"
+HOME=$H "$bin" install --opencode --hooks > /dev/null 2>&1 && bad "install overwrote a different plugin" || ok "install refuses a different plugin"
+HOME=$H "$bin" uninstall --opencode > /dev/null
+grep -q 'my own plugin' "$plugin" && ok "uninstall keeps a different plugin" || bad "uninstall removed a different plugin"
 grep -rq 'backstage-managed-hook' "$H/.claude/settings.json" "$H/.codex/hooks.json" "$H/.grok/config.toml" && bad "hook left behind" || ok "uninstall removed skills + hooks"
 jq -e '([.hooks.PreToolUse[].hooks[].command] == ["/usr/local/bin/other-guard"]) and .model == "opus"' "$H/.claude/settings.json" >/dev/null \
     && ok "claude settings intact after uninstall" || bad "claude settings after uninstall"
