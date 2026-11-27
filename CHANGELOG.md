@@ -1,6 +1,6 @@
 # Changelog
 
-## Unreleased
+## 1.3.9
 
 - **No monitor? backstage keeps working, and stays hidden.** With the monitor switched off,
   unplugged, or on a headless Mac (Parsec, VNC, Screen Sharing, SSH), macOS made the hidden
