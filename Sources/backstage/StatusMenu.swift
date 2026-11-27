@@ -58,6 +58,8 @@ final class StatusMenu: NSObject, NSMenuDelegate {
     private var captureQueue: [(index: Int, slot: Int)] = []
     /// Each app's row, and what the rows were built from (to notice apps coming and going).
     private var rows: [pid_t: NSMenuItem] = [:]
+    /// The scrolling list of apps (MenuAppList.swift); `rows` keeps each app's item for its actions.
+    private var appList: MenuAppListView?
     private var rowsKey: [String] = []
     private var openedAt = 0.0
     /// When each display's picture last updated (each is checked for freshness on its own).
@@ -316,6 +318,7 @@ final class StatusMenu: NSObject, NSMenuDelegate {
     }
 
     func menuDidClose(_ menu: NSMenu) {
+        appList?.resetHover()
         refreshTimer?.invalidate()
         refreshTimer = nil
         thumbnailGeneration += 1
@@ -338,7 +341,11 @@ final class StatusMenu: NSObject, NSMenuDelegate {
     /// With several displays, only its display's picture; one that's on another page lights the
     /// arrow toward it instead (the menu doesn't page by itself).
     func menu(_ menu: NSMenu, willHighlight item: NSMenuItem?) {
-        let pid = item.flatMap { item in rows.first { $0.value === item }?.key }
+        // Rows live in the list view now (which reports hovering itself); a native item clears it.
+        if item != nil { highlight(pid: nil) }
+    }
+
+    func highlight(pid: pid_t?) {
         let slot = pid.flatMap { p in daemon?.registry.first { $0.pid == p } }.map { $0.display ?? (daemon?.display.slot ?? 1) }
         for (i, preview) in (hero?.previews ?? []).enumerated() {
             preview.highlighted = pid != nil && visibleSlots.indices.contains(i) && visibleSlots[i] == slot ? [pid!] : []
@@ -495,23 +502,47 @@ final class StatusMenu: NSObject, NSMenuDelegate {
 
     /// Everything below the picture. Also run while the menu is open, when apps come or go.
     private func rebuildRows(apps: [ManagedApp]) {
+        rowsKey = Self.key(apps)
         while menu.numberOfItems > 1 { menu.removeItem(at: menu.numberOfItems - 1) }
         rows.removeAll()
-        rowsKey = Self.key(apps)
+        appList = nil
         if apps.isEmpty {
             let none = NSMenuItem(title: "No apps running", action: nil, keyEquivalent: "")
             none.isEnabled = false
             menu.addItem(none)
-        }
-        for group in Self.groups(apps) {
-            menu.addItem(.sectionHeader(title: Self.fitted(group.label, font: .systemFont(ofSize: NSFont.smallSystemFontSize, weight: .semibold),
-                                                            width: MenuHeroView.width(previewWidth: Self.thumbWidth) - 32)))
-            for app in group.apps {
-                let row = self.row(for: app)
-                rows[app.pid] = row
-                menu.addItem(row)
+        } else {
+            let width = MenuHeroView.width(previewWidth: Self.thumbWidth)
+            let list = MenuAppListView(width: width, maxHeight: Self.listMaxHeight(screen: item.button?.window?.screen))
+            var entries: [MenuAppListView.Entry] = []
+            for group in Self.groups(apps) {
+                entries.append(.heading(group.label, count: group.apps.count))
+                for app in group.apps {
+                    let row = self.row(for: app)
+                    rows[app.pid] = row
+                    let actions = row.submenu ?? NSMenu()
+                    row.submenu = nil
+                    entries.append(.app(pid: app.pid, name: row.title, icon: row.image, detail: "", actions: actions))
+                }
             }
+            list.setEntries(entries)
+            list.onHover = { [weak self] pid in self?.highlight(pid: pid) }
+            let listItem = NSMenuItem()
+            listItem.view = list
+            menu.addItem(listItem)
+            appList = list
         }
+        addFixedItems(apps: apps)
+        refreshText(apps: apps)
+    }
+
+    /// The list's most height: 40% of the screen under the menu bar icon, so the whole menu fits
+    /// with room to spare however many apps there are; past that, the list scrolls.
+    static func listMaxHeight(screen: NSScreen?) -> CGFloat {
+        let height = (screen ?? NSScreen.main)?.frame.height ?? 900
+        return max(MenuAppListView.rowHeight * 4, (height * 0.4).rounded())
+    }
+
+    private func addFixedItems(apps: [ManagedApp]) {
         menu.addItem(.separator())
         menu.addItem(sendItem())
         menu.addItem(sendToItem())
@@ -552,19 +583,19 @@ final class StatusMenu: NSObject, NSMenuDelegate {
             NSWorkspace.shared.open(backstageRepoURL)
         }
         menu.addItem(footer)
-        refreshText(apps: apps)
     }
 
     private static func key(_ apps: [ManagedApp]) -> [String] {
         apps.map { "\($0.pid)/\($0.processStart ?? 0)/\($0.owner)" }.sorted()
     }
 
-    private func row(for app: ManagedApp) -> NSMenuItem {
+    private func row(for app: ManagedApp, compact: Bool = false) -> NSMenuItem {
         let name = Self.fitted(app.name, font: .menuFont(ofSize: 0), width: Self.detailWidth)
         let row = NSMenuItem(title: name, action: nil, keyEquivalent: "")
-        // Two lines (name, then what it's doing) where the system has subtitles, with an icon to match.
+        // Two lines (name, then what it's doing) where the system has subtitles, with an icon to
+        // match; one line with a small icon when the menu is short of room.
         var iconSize: CGFloat = 16
-        if #available(macOS 14.4, *) { iconSize = 26 }
+        if #available(macOS 14.4, *), !compact { iconSize = 26 }
         let running = NSRunningApplication(processIdentifier: app.pid)
         if let icon = (running?.icon ?? running?.bundleURL.map { NSWorkspace.shared.icon(forFile: $0.path) })?.copy() as? NSImage {
             icon.size = NSSize(width: iconSize, height: iconSize)
@@ -627,11 +658,8 @@ final class StatusMenu: NSObject, NSMenuDelegate {
             guard let row = rows[app.pid] else { continue }
             let detail = Self.detail(launchedAt: app.launchedAt, now: now, windows: windows[app.pid] ?? 0, playing: playing.contains(app.pid),
                                      sent: Session.isUser(app.session), display: multi ? (app.display ?? d.display.slot) : nil)
-            if #available(macOS 14.4, *) {
-                if row.subtitle != detail { row.subtitle = detail }
-            } else if row.toolTip != detail {
-                row.toolTip = detail
-            }
+            _ = row
+            appList?.setDetail(detail, for: app.pid)
         }
 
         let reduceMotion = meter?.reduceMotion ?? NSWorkspace.shared.accessibilityDisplayShouldReduceMotion
