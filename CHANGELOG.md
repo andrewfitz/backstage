@@ -4,9 +4,10 @@
 
 - **Homebrew:** backstage moved to the `andrewfitz/tap` tap (`brew tap andrewfitz/tap`), shared
   with my other apps. `brew update` moves an install from the old `andrewfitz/backstage` tap.
-- README and USAGE cover Cursor and OpenCode throughout. `install`'s note no longer suggests
-  `opencode plugin list` (it lists package plugins only), and the plugin writes its path
-  without escaped slashes.
+- **Docs:** README and USAGE rewritten for both uses, agents testing apps and you sending your
+  own apps backstage, brought up to date, and covering Cursor and OpenCode throughout.
+- `install`'s note no longer suggests `opencode plugin list` (it lists package plugins only), and
+  the OpenCode plugin writes its path without escaped slashes.
 
 ## 1.3.8
 

@@ -1,26 +1,37 @@
 # backstage usage
 
+The command reference. Agents use most of these commands; for you there's the menu bar, the
+⌃⌥⌘B shortcut and a handful of commands (`start`, `stop --all`, `show --pid`, `list --all`,
+`settings`, `doctor`), described in the [README](../README.md#sending-your-own-apps-backstage)
+and in [Apps you send backstage](#apps-you-send-backstage) below.
+
 Every command prints JSON on stdout, except `help`, `skill`, `logs` and plain `tree`. On
 failure a command prints `{"ok": false, "error": "…"}` and exits with status 1. Error
 messages say what to do next.
 
+[Concepts](#concepts) · [Lifecycle](#lifecycle) · [Hidden or shown](#hidden-or-shown) ·
+[Apps you send backstage](#apps-you-send-backstage) · [See](#see) · [Hear](#hear) ·
+[Recording](#recording-the-hidden-display) · [Act](#act) · [Displays](#displays) ·
+[Agent integration](#agent-integration) · [Environment variables](#environment-variables)
+
 ## Concepts
 
-**Agent display.** A virtual monitor that only backstage's daemon can see. It's created on
-first use and parked touching only the bottom-right corner of your desktop, never along an
-edge, so neither your cursor nor the Dock can drift onto it. Apps launched through backstage
-live there. By default it's the size of your main display in points, so
+**Hidden display.** A virtual monitor that only backstage's daemon can see (the CLI's help
+calls it the agent display). It's created when the daemon starts and parked touching only the
+bottom-right corner of your desktop, never along an edge, so neither your cursor nor the Dock
+can drift onto it. Apps agents launch through backstage live there, and so do apps you send
+backstage. By default it's the size of your main display in points, so
 screenshots have its shape (a 4K monitor at the usual 2x is 1920×1080 points), and it's a
 Retina display, drawn at 2x (3840×2160 pixels for that size), so apps render as they would on
 a Retina screen. The size is read when the daemon starts; changing your displays later doesn't
-resize a running agent display. `BACKSTAGE_WIDTH`/`BACKSTAGE_HEIGHT` set another size, and
-`BACKSTAGE_SCALE=1` gives a 1x display. Normally there's one, display 1, shared by every agent;
-an agent can add a display of its own (`launch --display new`), and the user can too, from the
-menu. See [Displays](#displays).
+resize a running one. `BACKSTAGE_WIDTH`/`BACKSTAGE_HEIGHT` set another size, and
+`BACKSTAGE_SCALE=1` gives a 1x display. Normally there's one, display 1, shared by every agent
+and by your apps; an agent can add a display of its own (`launch --display new`), and you can
+too, from the menu. See [Displays](#displays).
 
-**Coordinates.** All points are agent-display points, with `(0,0)` at the top-left of the
-agent display the app is on. A default `screenshot` is cropped starting at `(0,0)`, so a pixel `(x,y)` in
-the image is exactly the point to pass to `click x y`. If you captured with `--scale S`,
+**Coordinates.** All points are display points, with `(0,0)` at the top-left of the hidden
+display the app is on. A default `screenshot` is cropped starting at `(0,0)`, so a pixel
+`(x,y)` in the image is exactly the point to pass to `click x y`. If you captured with `--scale S`,
 pass the same `--scale S` to `click`/`drag`/`scroll`/`hover`, or divide by S yourself.
 Sizes are in points too, whatever the display's scale: a default screenshot is downsampled to
 1 pixel per point, and `--scale 2` gives the display's native Retina pixels.
@@ -72,14 +83,8 @@ session. They're never a default target and plain `stop` leaves them alone. `lis
 them, `stop --all` quits them, and an explicit `--pid` still reaches them, since no session
 owns them.
 
-**Apps the user sent backstage** (Send Front Window Backstage, ⌃⌥⌘B: see the README's
-[Menu bar indicator](../README.md#send-front-window-backstage)) belong to the `user` session.
-The user hands them to agents on purpose, so any session reaches one with an explicit `--pid`
-or `--app` (`--app` looks in your own apps first). They're never a default target, a session's
-`list` names them only under `sentByUser` (with a note), and plain `stop` leaves them alone.
-`list --all` shows them, and `stop --all`, the menu's Quit All Agent Apps or the app's own Quit
-quit them. `quit --pid P` works too, but they hold the user's work: quit one only when asked.
-Their `audio` is `muted` (they were already running, so they can't be made inaudible).
+**Apps the user sent backstage** belong to the `user` session; see
+[Apps you send backstage](#apps-you-send-backstage).
 
 **App selection.** Commands that act on an app take `--pid P` or `--app NAME` (a managed
 app's name or bundle id), within your session (or an app the user sent backstage). With
@@ -93,14 +98,15 @@ window ref (`w8432`) or a front-to-back index (`0` = frontmost).
 ## Lifecycle
 
 ### `launch <target> [--env K=V]… [--timeout S] [--dock] [--audio | --inaudible] [--display N|new] [-- app args…]`
-Starts the daemon if needed, then launches `target` hidden on the agent display. `target` can
+Starts the daemon if needed, then launches `target` on a hidden display. `target` can
 be an `.app` path, a bundle id (`com.apple.calculator`), an app name (`Calculator`), or a bare
 executable such as a `swift build` product. A bare executable is wrapped in a throwaway
 `.app` so it can launch hidden; it starts in `/` (not its own directory), so give it absolute
 paths. A script (`#!`) that `exec`s the real binary (`exec xctest …`) works too: the process is
 found by its launch token and kept out of the Dock, and `show` can't give it a Dock tile. (A
-script that runs it without `exec` registers the shell, not the app; launch the binary directly.) Every launch is a new instance (like `open -n`), so an existing copy of the app is never
-touched.
+script that runs it without `exec` registers the shell, not the app; launch the binary
+directly.) Every launch is a new instance (like `open -n`), so an existing copy of the app is
+never touched.
 
 ```json
 {"pid": 80562, "name": "Calculator", "bundleID": "com.apple.calculator",
@@ -111,7 +117,7 @@ touched.
 ```
 `dock`: the app has no Dock tile and isn't in ⌘-Tab (`"hidden"`). An app that makes itself a
 regular app at startup gets one anyway: `"visible (app made itself a regular app)"` (it
-still runs hidden on the agent display; only the tile shows). `--dock` launches it with a Dock
+still runs on the hidden display; only the tile shows). `--dock` launches it with a Dock
 tile on purpose: `"visible (--dock)"`. Qt apps are kept out of the Dock with
 `QT_MAC_DISABLE_FOREGROUND_APPLICATION_TRANSFORM=1`, which `launch` adds to their environment.
 `--display new` puts the app on a fresh display reserved for your session, `--display N` on that
@@ -158,16 +164,15 @@ If your session runs `stop` in the meantime, the daemon quits the app instead.
   the app before its own code runs. It sets `kAudioHardwarePropertyProcessIsAudible` to 0 for
   the process, so Core Audio zeroes its output before any tap or capture sees it. `launch`
   waits for the app to acknowledge that Core Audio accepted the change. If the acknowledgement
-  is missing or reports failure, a default launch reports `muted` and includes the reason.
-  A `DYLD_INSERT_LIBRARIES` you pass with `--env` is kept
-  (the library is put first).
+  is missing or reports failure, a default launch reports `muted` and includes the reason. A
+  `DYLD_INSERT_LIBRARIES` you pass with `--env` is kept (the library is put first).
 - **The same library places the app's windows.** Just before AppKit shows a window for the first
   time, it moves the window onto the app's backstage display, keeping its size and its position
   relative to the screen it would have opened on, so a new window never appears on the user's
   screen. (A window the app itself moves onto the user's screen while it's shown is moved back
-  by the daemon's observer, after the fact.) Sheets, popovers, child windows and windows already on a backstage display are left
-  alone. This works for every way of showing a window, including in test bundles that load
-  AppKit late (`xctest`). `--audio` launches of qualifying targets get the library for this
+  by the daemon's observer, after the fact.) Sheets, popovers, child windows and windows already
+  on a backstage display are left alone. This works for every way of showing a window,
+  including in test bundles that load AppKit late (`xctest`). `--audio` launches of qualifying targets get the library for this
   alone (they stay audible). `move`, closing a display and `show --pid` update where new windows
   go before moving anything. Apps that don't qualify (signed, hardened, Apple) rely on the
   daemon's observer, which moves a window after it appeared and can show it on the user's
@@ -254,7 +259,7 @@ within 60 s. The first run is when macOS asks the daemon's host for System Audio
 `doctor` is how to grant it, and `capture` then reflects the answer. Anything but a captured
 probe is reported in `problems`, with where to grant it.
 
-While the daemon runs, `daemon` describes the agent display:
+While the daemon runs, `daemon` describes its hidden display:
 
 ```json
 {"pid": 52426, "displayID": 108, "size": {"w": 1920, "h": 1080}, "sizeSource": "main display",
@@ -262,8 +267,9 @@ While the daemon runs, `daemon` describes the agent display:
  "screencaptureDisplay": 2, "ffmpegScreen": "Capture screen 1"}
 ```
 `size` is in points, and `sizeSource` says where it came from: `main display`, or `env` when
-`BACKSTAGE_WIDTH`/`BACKSTAGE_HEIGHT` set it. `pixels` is the backing store. `screencaptureDisplay` and `ffmpegScreen`
-identify the display to standard recording tools; see [Recording](#recording-the-agent-display).
+`BACKSTAGE_WIDTH`/`BACKSTAGE_HEIGHT` set it. `pixels` is the backing store.
+`screencaptureDisplay` and `ffmpegScreen` identify the display to standard recording tools; see
+[Recording](#recording-the-hidden-display).
 `display` is its slot (1–8, see [Displays](#displays)). With more than one display (or a
 reservation), `displays` lists each: `display`, `displayID`, `primary`, `globalOrigin`, `apps`,
 `reservedBy`/`reservedUntil`, and its own `screencaptureDisplay`/`ffmpegScreen`. `doctor` adds
@@ -283,8 +289,8 @@ included, and stops the daemon. Both forms are safe to run twice. Apps the user 
 are quit gracefully only: one that doesn't quit within 3 s (an unsaved-changes dialog) is given
 back to the user's screen instead of being forced.
 
-With Auto-Hide When Idle off (the default in `~/.backstage`), plain `stop` never stops the daemon (`daemon` says so); `stop --all`
-still does.
+With Auto-Hide When Idle off (the default in `~/.backstage`), plain `stop` never stops the
+daemon (`daemon` says so); `stop --all` still does.
 
 Apps are always quit *before* the display is removed, so nothing falls onto your screen. The
 daemon also exits by itself after `BACKSTAGE_IDLE_TIMEOUT` seconds (default 1800) once no
@@ -375,8 +381,34 @@ can also drive a hidden app. The input guard validates the running helpers' vend
 before letting their input into managed apps
 (`Claude.app/Contents/Helpers/app-cu-helper`, `…/Contents/MacOS/SkyComputerUseService`).
 Name the app unambiguously when the user runs their own copy too. Don't drive one app with
-backstage's input commands and computer-use input at the same time. See the README section
-"Using with computer use".
+backstage's input commands and computer-use input at the same time. See the README's
+[Computer use](../README.md#computer-use-claude-and-codex-desktop-apps).
+
+## Apps you send backstage
+
+**Send Front Window Backstage** (the menu item, or **⌃⌥⌘B**) moves the frontmost app, all of
+its windows, onto a hidden display; **Send Front Window To ▸** picks the display, or a new one.
+The README describes it from your side: [Sending your own apps
+backstage](../README.md#sending-your-own-apps-backstage). For the CLI and for agents:
+
+- **Session `user`.** A sent app belongs to the reserved session `user`. `list --all` shows it
+  there; a session's own `list` names it only under `sentByUser`, with a note.
+- **Agents act on it only when asked.** Any session reaches it with an explicit `--pid` or
+  `--app` (`--app` looks in the session's own apps first), so an agent can screenshot, read and
+  drive it, or `move --display N` it. It's never a default target, and a session's plain `stop`
+  leaves it alone. `quit --pid P` works, but it holds the user's work: quit it only when asked.
+- **Coming back.** `show --pid P` (or the menu's **Show on My Screen**) gives it back: windows on
+  the main display, focused, audible again. `stop --all`, the menu's **Quit All Agent Apps** and
+  the app's own **Quit** quit it, gracefully only: one that doesn't quit within 3 s (an
+  unsaved-changes dialog) is given back instead. Any other shutdown (the last monitor gone, a
+  display that couldn't be parked) gives it back without quitting it.
+- **Sound.** Its `audio` is `muted` (it was already running, so it can't be made inaudible), and
+  its tap is removed when it's given back.
+- **Where it goes.** Plain Send Front Window Backstage goes to the display your sent apps are
+  on, else display 1. A display you create from the menu is reserved for `user`: agents'
+  automatic placement never goes there, and their `launch --display N` or `move --display N`
+  onto it is refused.
+- **The shortcut** is a setting: [`settings hotkey`](#settings).
 
 ## See
 
@@ -385,7 +417,7 @@ backstage's input commands and computer-use input at the same time. See the READ
   display origin, so image pixel = click point.
 - **`--window I`:** one window only. The JSON's `origin` is that window's position:
   `point = origin + pixel / scale`.
-- **`--full`:** the whole agent display, showing every window of all of your session's apps
+- **`--full`:** the whole hidden display, showing every window of all of your session's apps
   and nothing else: other sessions' apps are left out (black), wherever they are. Windows of
   separate system processes, such as the out-of-process open/save panel or a share sheet, are
   left out too (as in the default capture); inspect those with `tree`/`find`.
@@ -406,7 +438,7 @@ The accessibility tree. Plain output is compact text, one element per line:
   [w9184.1] StaticText value="count: 0" @201,142 148x26
   [w9184.2] TextField @59,195 302x28 {confirm} (focused)
 ```
-Each line shows the role, title/value/description, frame (`@x,y wxh` in agent-display
+Each line shows the role, title/value/description, frame (`@x,y wxh` in display
 points), supported actions, and disabled/focused state. `--json` gives the same as structured data.
 
 ### `find [text] [--text T] [--role R] [--window I]`
@@ -418,7 +450,7 @@ The app's windows, with refs, titles and frames.
 
 ### `window fill [--window I]` / `window size <w> <h> [--window I]`
 Resizes one of the app's windows (default: its frontmost) through accessibility, without
-raising or activating anything. `fill` makes it cover the whole agent display below the
+raising or activating anything. `fill` makes it cover the whole display below the
 display's menu bar, for full-display screenshots. `size` sets its size in points, keeping its
 position unless it has to move to stay on the display; a size bigger than the display is an
 error (start the daemon with a larger `BACKSTAGE_WIDTH`/`BACKSTAGE_HEIGHT`). This is not
@@ -567,7 +599,7 @@ app's first sound, `<pid>-<birth>.pcm`: a ring of the last 15 s of the tap (floa
 interleaved, after a 64-byte header; the format is documented in
 `Sources/CBackstageAudio/include/CBackstageAudio.h`). Both are mode 0600 and removed with the tap.
 
-## Recording the agent display
+## Recording the hidden display
 
 backstage doesn't record video itself, but the standard macOS `screencapture` tool can record
 the hidden display, or take stills of it, without any window, prompt or focus change:
@@ -587,7 +619,7 @@ screencapture -x -D "$n" still.png             # one still at native resolution
   right before recording.
 - The video is the display's native pixels (twice its size in points), recorded only when
   something changes, so a still display gives few frames.
-- It records the **whole agent display**: other sessions' windows, and the display's copy of
+- It records the **whole hidden display**: other sessions' windows, and the display's copy of
   the menu bar, which shows the user's frontmost app and their menu bar items. For an image of
   your session's apps only, use `screenshot --full`.
 - `-x` turns off screencapture's sounds. While anything captures the screen (backstage's own
@@ -610,7 +642,7 @@ typing never interleaves. Commands on different apps don't wait for each other.
 | `set <ref> <value>` | Sets an element's value (text fields, sliders, steppers). |
 | `focus <ref>` | Focuses an element and makes its window the app's key window. |
 | `action <ref> <AXAction>` | Any accessibility action: `AXIncrement`, `AXShowMenu`, `AXConfirm`, `AXCancel`, `AXRaise`… |
-| `click <x> <y> [--right] [--double]` | A real mouse click at an agent-display point. Makes the target window key first. |
+| `click <x> <y> [--right] [--double]` | A real mouse click at a display point. Makes the target window key first. |
 | `click --ref <ref> [--right] [--double]` | Clicks an element: AXPress when it supports it, otherwise a mouse click at its centre. `--raw` forces the mouse. |
 | `hover <x> <y>` | Sends mouse-moved events. Best-effort: hover effects and tooltips that use tracking areas won't fire. |
 | `drag <x1> <y1> <x2> <y2> [--steps N]` | Mouse down, move in N steps (default 20), mouse up. |
@@ -627,7 +659,7 @@ slows down as its list grows, so backstage uses only eight fixed displays
 
 | Display | Used by |
 |---|---|
-| 1 | The default home (`~/.backstage`): all agents |
+| 1 | The default home (`~/.backstage`): all agents, and the apps you send |
 | 2–6 | Other homes, and extra displays of a daemon (`launch --display new`) |
 | 7–8 | backstage's own test suites |
 
@@ -639,11 +671,12 @@ waiting up to 5 s (a display that just stopped can linger a moment).
 
 - `launch --display new` creates a display and **reserves** it for the caller's session for
   30 minutes (an empty display the session already reserved, or that nobody holds, is reused
-  instead of adding another): other sessions can't launch on it, `move` onto it, or get it from Send Front Window
-  Backstage. The display itself is removed 30 minutes after the last app or pending launch left
-  it (`BACKSTAGE_EXTRA_DISPLAY_GRACE`), or right away with [`close-display`](#close-display-n---force)
-  (the menu's ⓧ): every display that comes or goes can briefly blip the
-  user's monitor, so an empty one is kept for the next send, move or launch. An empty display
+  instead of adding another): other sessions can't launch on it, `move` onto it, or get it from
+  Send Front Window Backstage. The display itself is removed 30 minutes after the last app or
+  pending launch left it (`BACKSTAGE_EXTRA_DISPLAY_GRACE`), or right away with
+  [`close-display`](#close-display-n---force) (the menu's ⓧ): every display that comes or goes
+  can briefly blink the user's monitor, so an empty one is kept for the next send, move or
+  launch. An empty display
   costs memory (its framebuffer, roughly 33–100 MB at 3840×2160) but no CPU or GPU.
 - `launch --display N` uses display N, creating it if this daemon may run it (2–6 for the
   default home), refused if another session reserved it.
@@ -676,12 +709,13 @@ calibration, gamma or color (Redlight, f.lux, Lunar, BetterDisplay…) can recog
 - **Vendor / model:** `0xB57A` / `0x0001` (`CGDisplayVendorNumber` / `CGDisplayModelNumber`).
 - **Serials:** `0x42530001`–`0x42530008` (displays 1–8).
 
-Creating or removing one is a normal display reconfiguration (`CGDisplayRegisterReconfigurationCallback`
-fires, and ColorSync registers the display). Backstage keeps churn low: a daemon's primary display
-lives as long as the daemon (which stays up 30 minutes after its last app, or always with Keep in
-Menu Bar), and an extra display (`launch --display new`) is removed only after it has been empty for
-30 minutes, or when someone closes it. Its size is the main display's in points at 2x; `BACKSTAGE_WIDTH`, `BACKSTAGE_HEIGHT`
-and `BACKSTAGE_SCALE=1` make it smaller.
+Creating or removing one is a normal display reconfiguration
+(`CGDisplayRegisterReconfigurationCallback` fires, and ColorSync registers the display). Backstage
+keeps churn low: a daemon's primary display lives as long as the daemon (which keeps running
+while its menu bar icon does; with Auto-Hide When Idle on, until 30 minutes after its last app)
+and survives daemon restarts, and an extra display (`launch --display new`) is removed only after
+it has been empty for 30 minutes, or when someone closes it. Its size is the main display's in
+points at 2x; `BACKSTAGE_WIDTH`, `BACKSTAGE_HEIGHT` and `BACKSTAGE_SCALE=1` make it smaller.
 
 ### `move --display N|new [--pid P]`
 Moves one of your apps, with its windows, to another of the daemon's displays (`new`: a fresh one,
@@ -708,8 +742,9 @@ sat on one of its displays for 3 s (`BACKSTAGE_STRAY_GRACE`), only moving it, ne
 it; an app a `backstage launch` opened (an agent's app, even one handed over with `show`) is left
 to an explicit `recover`, so an agent's app never lands on the user's screen by itself. `recover`
 does it now, for every display of this daemon (`BACKSTAGE_HOME`). Managed apps, their helpers
-(child processes, XPC services) and apps a launch is still opening are never touched. Returns `recovered` (and `failed`, if any window couldn't be moved); `--dry-run` lists
-them as `stray` without moving anything. The menu's **Recover Lost Windows** does the same and
+(child processes, XPC services) and apps a launch is still opening are never touched. Returns
+`recovered` (and `failed`, if any window couldn't be moved); `--dry-run` lists them as `stray`
+without moving anything. The menu's **Recover Lost Windows** does the same and
 brings the app forward.
 
 ### `cleanup-displays`
@@ -783,10 +818,10 @@ variables only reorder the advice: nothing extra is allowed.
 | `BACKSTAGE_RESERVATION_SECONDS` | 1800 | How long `launch --display new` reserves a display (set before the daemon starts; at most a day) |
 | `BACKSTAGE_EXTRA_DISPLAY_GRACE` | 1800 | Seconds an empty extra display waits before it's removed (set before the daemon starts) |
 | `BACKSTAGE_STRAY_GRACE` | 3 | Seconds an unmanaged app's window may sit on a backstage display before the daemon returns it to the user's screen (see [`recover`](#recover---dry-run)) |
-| `BACKSTAGE_HOME` | `~/.backstage` | State, logs, screenshots. Each home has its own daemon and agent display; daemons of different homes run side by side, their displays chained diagonally off the corner, each touching the next only at a corner point |
+| `BACKSTAGE_HOME` | `~/.backstage` | State, logs, screenshots. Each home has its own daemon and hidden display; daemons of different homes run side by side, their displays chained diagonally off the corner, each touching the next only at a corner point |
 | `BACKSTAGE_SESSION` | derived | The session this command belongs to (see Sessions); `legacy` and `user` are reserved |
-| `BACKSTAGE_WIDTH` / `BACKSTAGE_HEIGHT` | main display's size | Agent display size in points (set before the daemon starts) |
-| `BACKSTAGE_SCALE` | 2 | Agent display backing scale: `2` is Retina, `1` gives a 1x display (set before the daemon starts) |
+| `BACKSTAGE_WIDTH` / `BACKSTAGE_HEIGHT` | main display's size | Hidden display size in points (set before the daemon starts) |
+| `BACKSTAGE_SCALE` | 2 | Hidden display backing scale: `2` is Retina, `1` gives a 1x display (set before the daemon starts) |
 | `BACKSTAGE_IDLE_TIMEOUT` | 1800 | Seconds with no managed apps before the daemon exits (only with Auto-Hide When Idle on) |
 | `BACKSTAGE_DISPLAY_LINGER` | 15 in `~/.backstage`, else 0 | Seconds the primary display outlives a stopped daemon, for the next one to take over without a display change (at most 300) |
 | `BACKSTAGE_MENUBAR` | on | `off` hides the menu bar indicator, and with it the hotkey and Auto-Hide When Idle (set before the daemon starts) |
@@ -800,4 +835,6 @@ variables only reorder the advice: nothing extra is allowed.
 | `BACKSTAGE_TEST_AUDIO` | — | Tests only (set before the daemon starts): `mute-fail`, `tap-fail` or `no-capture` simulate those failures |
 | `BACKSTAGE_INAUDIBLE_DYLIB` | next to the binary, else `../lib/backstage/` | Path of `libbackstage-inaudible.dylib` for `launch`; empty means none (tests: the fallback to muted) |
 
-`BACKSTAGE_LAUNCH_ID`, `BACKSTAGE_INAUDIBLE_ACK`, `BACKSTAGE_AUDIBLE`, `BACKSTAGE_PLACEMENT` and `BACKSTAGE_CAPTURE_RETRY` are internal (set by backstage for the processes it starts); `launch` refuses all but the last in `--env`.
+`BACKSTAGE_LAUNCH_ID`, `BACKSTAGE_INAUDIBLE_ACK`, `BACKSTAGE_AUDIBLE`, `BACKSTAGE_PLACEMENT` and
+`BACKSTAGE_CAPTURE_RETRY` are internal (set by backstage for the processes it starts); `launch`
+refuses all but the last in `--env`.

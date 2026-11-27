@@ -1,51 +1,64 @@
 # backstage
 
-**Let coding agents run, test, screenshot and click through macOS apps without taking over your screen.**
+**A hidden display for your Mac. Coding agents run, test and click through apps there without
+taking over your screen, and you can send your own apps there to keep them running out of the
+way.**
 
-When an agent builds a Mac app and wants to check it works, the window normally pops up in
-front of you, steals keyboard focus, and fights you for the mouse. `backstage` runs those apps
-on an invisible virtual display instead. The agent can still see them (screenshots and the
-accessibility tree) and use them (clicks, typing, menus, drags) while you keep working.
-Input goes directly to the managed app. If an app activates itself or opens a later window
-on your display, it can briefly take focus or appear before Backstage moves it back.
+backstage adds an invisible virtual display that only it can see, and keeps it out of reach of
+your cursor, your keyboard focus and your speakers. Two kinds of apps live there:
 
-It ships with an [agent skill](dist/skills/backstage/SKILL.md) and an optional hook for
-**Claude Code, Codex, Grok, Cursor and OpenCode**. They teach the agent to keep its own testing hidden and to
-put things on your screen only when you ask to see them.
+- **Apps an agent launches.** When an agent builds a Mac app and wants to check it works, the
+  window normally pops up in front of you, steals focus and fights you for the mouse. With
+  backstage the app opens on the hidden display instead. The agent still sees it (screenshots,
+  the accessibility tree) and uses it (clicks, typing, menus, drags) while you keep working, and
+  hands it to you when you ask to see it.
+- **Apps you send there.** Press **⌃⌥⌘B** and the app in front of you moves backstage: still
+  running, out of sight, muted, and out of your way when you type. Bring it back from the menu
+  bar whenever you like. While it's there, an agent can work in it for you, with your documents
+  and logged-in state intact.
 
 ```bash
-backstage launch build/MyApp.app      # hidden; nothing appears on your screen
-backstage screenshot                  # agent looks at it
+backstage launch build/MyApp.app      # an agent: hidden; nothing appears on your screen
+backstage screenshot                  # it looks at the app
 backstage find --role button --text Export
-backstage press w8432.0.3             # agent uses it
-backstage show                        # you asked to see it: hand it over, state intact
+backstage press w8432.0.3             # and uses it
+backstage show                        # you asked to see it: handed over, state intact
 ```
+
+It ships with an [agent skill](dist/skills/backstage/SKILL.md) and an optional hook for
+**Claude Code, Codex, Grok, Cursor and OpenCode**, which teach agents to keep their own testing
+hidden and to put things on your screen only when you ask.
 
 <p align="center">
   <img src="docs/images/menu-bar.png" width="345"
        alt="The backstage menu: a live picture of the hidden display, then the apps each agent session is running (Claude, Codex and Grok), with the version and a GitHub link at the bottom">
   <br>
-  <sub>The <a href="#menu-bar-indicator">menu bar indicator</a> while three agents test apps out of sight.</sub>
+  <sub>The <a href="#menu-bar">menu bar menu</a> while three agents test apps out of sight.</sub>
 </p>
+
+## Contents
+
+[Requirements](#requirements) · [Install](#install) · [Quick start](#quick-start) ·
+[Menu bar](#menu-bar) · [Sending your own apps backstage](#sending-your-own-apps-backstage) ·
+[Agents](#agents) · [How it works](#how-it-works) · [Sound](#sound) ·
+[Cheat sheet](#cheat-sheet) · [Limits](#limits) · [Development](#development) ·
+[Command reference](docs/USAGE.md) · [Changelog](CHANGELOG.md)
 
 ## Requirements
 
-- macOS 14.2 or later (tested on macOS 27.0.1, Apple Silicon). Agent apps are always muted,
-  which needs 14.2's audio taps: on 14.0 and 14.1, `launch` refuses.
-- Xcode or Command Line Tools with Swift 5.9+
-- **Permissions** for whatever runs the CLI (your terminal or agent host), in System Settings ›
-  Privacy & Security: **Accessibility** and **Screen & System Audio Recording** (Screen
-  Recording). For agents to check what an app plays (`launch --audio`, then `backstage audio`,
-  `wait --sound`, `audio record`), the host also needs **System Audio Recording Only**: a
-  separate switch from Screen Recording, in the same Settings pane. Muting works without it,
-  helper processes included.
-  - **Which host.** The audio grant is checked against the app that started the backstage
-    daemon (the terminal or agent host that ran the first `backstage` command), not the
-    `backstage` binary. If agents run from several hosts, the one that started the running
-    daemon is the one that needs it; `backstage doctor` names it (`audio.host`). The grant is
-    keyed to that host's binary path, so updating the host may need it granted again.
-  - `backstage doctor` checks all of them. Its audio self-test is what makes macOS ask for
-    System Audio Recording the first time.
+- **macOS 14.2 or later** (tested on macOS 27.0.1, Apple Silicon). Every app backstage runs is
+  muted, which needs 14.2's audio taps; on 14.0 and 14.1, `launch` refuses.
+- **Permissions** for whatever runs backstage (your terminal or agent host), in System Settings ›
+  Privacy & Security: **Accessibility** and **Screen & System Audio Recording**. For agents to
+  check what an app plays (`launch --audio`), the host also needs **System Audio Recording
+  Only**, a separate switch in the same pane; muting works without it.
+  - The audio grant belongs to the app that started the backstage daemon (the terminal or agent
+    host that ran the first `backstage` command), not to `backstage` itself, and it's keyed to
+    that host's binary path, so updating the host may need it granted again. `backstage doctor`
+    names the host (`audio.host`).
+  - `backstage doctor` checks everything. Its audio self-test is what makes macOS ask for System
+    Audio Recording the first time.
+- Building from source needs Xcode or the Command Line Tools (Swift 5.9 or later).
 
 ## Install
 
@@ -55,207 +68,150 @@ With [Homebrew](https://brew.sh):
 brew tap andrewfitz/tap
 brew install backstage
 backstage doctor              # check permissions
-backstage install --hooks     # optional: skill + hook for Claude Code / Codex / Grok / Cursor / OpenCode
+backstage start               # the menu bar icon and ⌃⌥⌘B
+backstage install --hooks     # optional: skill + hook for your coding agents
 ```
 
-Prebuilt for macOS 15 and later on Apple Silicon; elsewhere Homebrew builds it from source
-(needs Xcode). If you installed from the old `andrewfitz/backstage` tap, `brew update` moves it
-to `andrewfitz/tap`. After
-`brew upgrade backstage`, run `backstage stop --all && backstage start` so the daemon runs the
-new version (this quits the apps agents have open backstage).
+Bottles cover macOS 15 and later on Apple Silicon; other Macs build from source (needs Xcode).
+If you installed from the old `andrewfitz/backstage` tap, `brew update` moves backstage to
+`andrewfitz/tap`.
+
+After `brew upgrade backstage`, run `backstage stop --all && backstage start` so the daemon runs
+the new version. This quits the apps backstage runs (yours are given back if they don't quit),
+and your monitor doesn't blink: the hidden display is kept for the new daemon.
 
 From source:
 
 ```bash
 git clone https://github.com/andrewfitz/backstage.git
 cd backstage
-make install                  # builds and copies $(PREFIX)/bin/backstage (PREFIX=/opt/homebrew)
-                              # and $(PREFIX)/lib/backstage/libbackstage-inaudible.dylib
+make install    # $(PREFIX)/bin/backstage and $(PREFIX)/lib/backstage/libbackstage-inaudible.dylib
+                # (PREFIX=/opt/homebrew by default; `make install PREFIX=/usr/local` elsewhere)
 ```
 
-`make install PREFIX=/usr/local` installs elsewhere. `make uninstall` stops the daemon and
-removes both. Use one or the other: a `make install` copy in `/opt/homebrew/bin` stops
-Homebrew from linking its own.
+`make uninstall` stops the daemon and removes both. Use Homebrew or `make install`, not both: a
+`make install` copy in `/opt/homebrew/bin` stops Homebrew from linking its own.
 
 ## Quick start
+
+**Send one of your own apps backstage:** run `backstage start` once, then press **⌃⌥⌘B** in any
+app. Its windows leave your screen and the menu bar icon counts one more app. To get it back,
+open the menu, pick the app, and choose **Show on My Screen**.
+
+**Let an agent test an app hidden:** run `backstage install` (add `--hooks` for the hook), then
+ask your agent to build and check your app as usual. It uses commands like these:
 
 ```bash
 backstage launch Calculator           # a .app path, bundle id, app name, or bare executable
 backstage type "12+30="
-backstage screenshot                  # {"path": "~/.backstage/shots/shot-….png", ...}
+backstage screenshot                  # {"path": "~/.backstage/shots/…/shot-….png", ...}
 backstage tree                        # accessibility tree with refs
-backstage click 127 215               # screenshot pixel == click point
-backstage quit                        # or `backstage stop` to quit all of this session's apps
+backstage click 127 215               # a screenshot pixel is a click point
+backstage quit                        # or `backstage stop` for all of this session's apps
 ```
 
-The full command reference is in **[docs/USAGE.md](docs/USAGE.md)**, or run `backstage help`.
-What changed in each version: [CHANGELOG.md](CHANGELOG.md).
+Every command is described in **[docs/USAGE.md](docs/USAGE.md)**, or run `backstage help`.
 
-## How it works
-
-| Piece | Mechanism |
-|---|---|
-| Invisible screen | A background daemon creates a private Retina (2x) `CGVirtualDisplay` (the API DeskPad/BetterDisplay use), the same size in points as your main display, and parks it touching only the bottom-right corner of your desktop (never along an edge, so neither your cursor nor the Dock can drift onto it). If the cursor ever gets onto it, the cursor is warped back. |
-| Launch without popping up | LaunchServices' own open call (the one behind `open -g -j -n`): background, hidden, fresh instance. The windows are moved to the virtual display while still hidden, then unhidden there. |
-| No Dock tile | The same call passes a private LaunchServices option that starts the app as a UIElement, the way menu bar apps run: no Dock tile, not in ⌘-Tab, no change to the app's bundle. `launch` reports `"dock": "hidden"`, or `"visible (app made itself a regular app)"` for an app that undoes it (see [Limits](#limits-read-these)). `show` makes the app a regular app again before handing it over. |
-| Windows the app opens later | Dev builds and test runners place their own: the injected library (below) moves each window onto the virtual display just before AppKit first shows it, so a new window never appears on your screen. For other apps, and for a window an app itself moves onto your screen while it's shown, an AX observer (with 50 ms polling as backup) moves it back as soon as it's seen, which can show it on your screen for a moment. |
-| Your windows that wander backstage | An app you relaunch can reopen a window where it last was, which may be a hidden display (macOS remembers backstage's fixed displays like any monitor). The daemon returns windows of apps it doesn't run to your main screen after 3 s, moving them without taking focus; **Recover Lost Windows** and `backstage recover` do it at once. Apps an agent launched are never put on your screen this way. |
-| Focus stealing | The app is never activated. If it activates itself, the daemon hands focus back to your app. |
-| Screenshots | ScreenCaptureKit, filtered to that app's windows (menus, sheets and popovers included). Captures take turns across all sessions: on macOS 27, two processes capturing at once both hang. Each takes about 0.1–0.2 s. |
-| Input | AX actions (press/set/focus/menus), plus keyboard and mouse events posted straight to the app's process (`CGEventPostToPid`). Mouse events get window-local coordinates. A private "you are active" event goes to the app only, so AppKit doesn't swallow the click as a focus click. Nothing goes through the HID system, so your real cursor and keyboard are never touched. Every event backstage posts is tagged (event source user data). |
-| Your input stays yours | An app with an open menu (a context menu, a menu bar menu, a pop-up button's list) takes macOS's keyboard focus, even in the background, so your typing would go to the hidden app. The daemon runs an event tap on its own thread that sees every key, click and scroll after macOS has picked the receiving app: untagged input headed for a managed app is yours, so keys are handed to your frontmost app instead and clicks and scrolls are dropped. It costs a few microseconds per event. If macOS disables the tap, it is re-enabled at once; if the tap can't be installed, input commands refuse to run and `backstage status` says why. |
-| Silence | Every agent app is muted the moment it first uses Core Audio: a private, muted process tap per app (helper processes included), inside a private tap-only aggregate device. Nothing reaches your speakers, whatever device the app picks; your apps, output device and volume aren't touched. If an app can't be muted, it isn't launched, or is quit. Dev builds and test runners are also made inaudible from inside (a small injected library), so they're silent in screen sharing, remote desktop and recordings too. Only apps launched with `--audio` are measured (`backstage audio`, `wait --sound`). |
-| Teardown | `backstage stop` quits the calling session's apps, and stops the daemon when no session has apps left. `backstage stop --all` (or the daemon getting SIGTERM/SIGINT/SIGHUP) quits every app *before* removing the display, so nothing lands on your screen. After 30 min with no managed apps in any session, the daemon exits by itself, but only with Auto-Hide When Idle on (off by default in `~/.backstage`). |
-| Several agents | Each agent session owns the apps it launches, so concurrent agents never pick up, type into, screenshot or stop each other's apps. Commands on one app are serialized with a per-app lock. See [Sessions](docs/USAGE.md#concepts). |
-| More room | An agent can take a hidden display of its own with `launch --display new` when it needs one: whole-display screenshots or recordings, full-screen apps, multi-monitor testing, or launches that keep saying `"crowded": true` (no free spot). The skill tells agents not to for anything else, since a display coming or going can blink your monitor. It's reserved for the session for 30 minutes, and asking again while it's empty gives back the same one; it's removed 30 minutes after it was last used, or right away with `close-display` or the menu's ⓧ. Backstage only ever uses eight fixed display identities, so macOS's display registry doesn't grow. See [Displays](docs/USAGE.md#displays). |
-
-## Sound
-
-Every app an agent launches is silent for you from the moment it first uses Core Audio, so an
-agent can test a media player, a game or a notification sound while you hear nothing. How
-silent depends on the app, and on whether the agent asked to inspect its sound:
-
-| `launch` | Apps | Your speakers | Screen sharing, remote desktop (Parsec), recordings | `audio`, `wait --sound` |
-|---|---|---|---|---|
-| default | dev builds and test runners: `xctest`, ad-hoc signed, unsigned or development-signed builds, bare executables | silent | **silent** | refused |
-| default | everything else: signed, hardened or Apple apps | silent | can hear it | refused |
-| `--audio` | any | silent | can hear it | measured |
-
-- **Inaudible (the default for dev builds and test runners).** Before the app's own code runs,
-  an injected library (`libbackstage-inaudible.dylib`, through `DYLD_INSERT_LIBRARIES`) makes
-  the app tell Core Audio it's inaudible. Core Audio then zeroes its sound before anything can
-  capture it, so it's absent from your screen-sharing or remote-desktop stream, from
-  recordings and from every other system-wide capture. Only the app itself can do this, so it
-  only works for apps that accept the library: not hardened-runtime apps (unless they allow
-  DYLD variables and other libraries), not Apple's apps. `launch` reports `"audio":
-  "inaudible"`. Children of the app inherit it when they accept it too.
-- **Muted (the default for everything else).** A muted process tap keeps the app off your
-  Mac's outputs, but macOS hands its sound to system-wide captures before that point, so
-  someone listening through screen sharing or a remote-desktop session can hear it. `launch`
-  reports `"audio": "muted"` and why it couldn't be inaudible (`audioReason`).
-- **`--audio`: inspect the sound.** Muted the same way, and measured. Use it only when the
-  agent needs to check sound; remote and capture listeners can hear the app. `--inaudible`
-  forces the inaudible mode and fails for an app that won't accept it.
-
-With `--audio`, the agent gets facts from the muted output:
-
-```bash
-backstage audio                        # playing? peakDb/rmsDb (dBFS), hz, recent sounds, time
-backstage wait --sound --since 81234.5 # it played (even a short sound that's already over)
-backstage wait --sound --gone          # it stopped
-backstage audio record --seconds 5     # a WAV of the last 5 s (max 15), for any other tool
-```
-
-The usual check: read `time` from `audio`, click Play, `wait --sound --since T`, check
-`audio` (`playing`, `peakDb`, `hz`), click Stop, `wait --sound --gone`. `audio record` writes
-what the app played (float32, as tapped) for deeper checks such as speech-to-text or a
-spectrum. `backstage show` hands an app to you unmuted, except an inaudible one, which stays
-silent until it's relaunched. Measuring needs System Audio Recording (see
-[Requirements](#requirements)); muting doesn't. Reference: [docs/USAGE.md](docs/USAGE.md#hear).
-
-## Menu bar indicator
+## Menu bar
 
 While backstage runs, an icon sits in the menu bar: a display behind a faded, dashed one, with
-the number of running apps beside it. It stays with nothing running (unless you turn on
-**Auto-Hide When Idle**), and goes away entirely when the daemon exits. Its tooltip says who is using how many apps. While an app
-launched with `--audio` is making sound (muted, so you don't hear it), the icon turns into a
-small level meter, four bars of the loudest app's recent level, no wider than the icon; with Reduce Motion on, it shows
-a still waveform instead. The icon's box never changes size. The menu shows:
+the number of running apps beside it. Its tooltip says who is using how many apps. While an app
+an agent launched with `--audio` makes sound (muted, so you don't hear it), the icon turns into a
+small four-bar level meter (a still waveform with Reduce Motion on). The menu shows:
 
-- a **live picture** of the hidden agent display, refreshed every second while the menu is open.
-  Point at an app's row and its windows are picked out in the picture. With several displays
-  (`launch --display new`), two pictures sit side by side, each labelled, with ‹ › to page through more,
-  and an ⓧ on every display but the first closes it (its apps move to the first display and keep running)
-- **each app**, grouped by the agent session that launched it ("Claude — myproject": the agent,
-  then the name given with `BACKSTAGE_SESSION` or the folder the agent works in), with how long
-  it has been running, and a note if it has no windows or is playing sound (apps launched with
-  `--audio`). Its submenu has **Show on My Screen** (the same as `backstage show`), **Move to ▸**
-  (another hidden display, or a new one), **Quit** (hold Option for **Force Quit**), and its
-  bundle ID and process ID
-- **Send Front Window Backstage** (⌃⌥⌘B), described below; **Send Front Window To ▸**, the same
-  onto a display you pick (say, a display of your own while agents work on display 1: later sends
-  follow it there); **Recover Lost Windows**, which brings back windows of your own apps that
-  ended up on a hidden display (an app reopening where it was while backstage; the daemon also
-  does this by itself after 3 s, and `backstage recover` from a terminal); and **Open
-  Screenshots & Logs Folder**
-- **Quit All Agent Apps**: every app running here, including ones you sent backstage
-- **Auto-Hide When Idle**, described below
-- a quiet footer with the version and a link to this repository
+- a **live picture** of the hidden display, refreshed every second while the menu is open.
+  Point at an app's row and its windows are picked out. With several displays, two pictures sit
+  side by side, labelled, with ‹ › to page through more, and an ⓧ on every display but the
+  first closes it (its apps move to the first display and keep running).
+- **each app**, grouped by who runs it, oldest first: **Sent by you**, or an agent session
+  ("Claude — myproject": the agent, then the name given with `BACKSTAGE_SESSION` or the folder
+  the agent works in), with how long it has run and a note if it has no windows or is playing
+  sound. Its
+  submenu has **Show on My Screen** (the same as `backstage show`), **Move to ▸** (another
+  hidden display, or a new one), **Quit** (hold Option for **Force Quit**), and its bundle ID
+  and process ID.
+- **Send Front Window Backstage** (⌃⌥⌘B) and **Send Front Window To ▸** (the same, onto a display
+  you pick), described [below](#sending-your-own-apps-backstage).
+- **Recover Lost Windows**, which brings back windows of your own apps that ended up on a hidden
+  display (an app reopening a window where it was while backstage). The daemon also does this by
+  itself after 3 s.
+- **Open Screenshots & Logs Folder**.
+- **Quit All Agent Apps**: every app running here, including ones you sent.
+- **Auto-Hide When Idle** (off by default): with it on, the icon leaves the menu bar when
+  nothing is running and the daemon exits after 30 idle minutes. With it off, the icon and the
+  shortcut stay, so sending an app is always one keystroke away. `backstage settings auto-hide
+  on|off` sets it too.
+- a quiet footer with the version and a link to this repository.
 
-Long app and session names are shortened in the middle, so nothing widens the menu.
+Long names are shortened in the middle, so nothing widens the menu. The daemon runs as a
+menu-bar-only app: no Dock icon, and it never takes focus. Nothing starts at login yet: after a
+restart, `backstage start` brings the icon back. `BACKSTAGE_MENUBAR=off` runs it without the
+icon (and so without the shortcut and Auto-Hide When Idle).
 
-The daemon runs as a menu-bar-only app: no Dock icon, and it never takes focus. Set
-`BACKSTAGE_MENUBAR=off` to run without the icon (and without the hotkey and Auto-Hide When Idle).
+## Sending your own apps backstage
 
-### Auto-Hide When Idle
+Press **⌃⌥⌘B** (Control-Option-Command-B), or choose **Send Front Window Backstage** from the
+menu, and the app you're using moves to the hidden display. backstage manages whole processes, so
+all of the app's windows go, not just the front one. Keyboard focus returns to the app you used
+before it, the icon blinks twice, and VoiceOver announces "Sent … backstage". Nothing else
+changes on your screen.
 
-Off by default: the icon stays with nothing running (icon only, no count, and the menu says
-"No apps running" above the live picture of the empty display), so Send Front Window Backstage
-and its shortcut are always at hand. The daemon doesn't exit when idle, and a session's plain
-`backstage stop` leaves it running (`stop --all` still stops it). **Quit All Agent Apps** quits
-the apps but keeps the icon. Check **Auto-Hide When Idle** (or run `backstage settings auto-hide on`)
-and the icon leaves the menu bar when no apps are running, and the daemon exits after the usual
-idle timeout. Daemons in another `BACKSTAGE_HOME` (tests, other logins' agents) auto-hide unless
-their own settings say otherwise. The setting lives in `~/.backstage/settings.json`. It doesn't start anything at
-login: after a restart, `backstage start` brings the icon back (a login item may come later).
+Good uses: an app that has to keep running but that you don't need to watch (a long export, a
+render, a sync, a dashboard), an app that keeps stealing your attention, or an app you want an
+agent to work in while you carry on.
 
-### Send Front Window Backstage
-
-The reverse of **Show on My Screen**: press **⌃⌥⌘B** (Control-Option-Command-B), or choose
-**Send Front Window Backstage** from the menu, and the app you're using moves to the hidden
-display. backstage manages whole processes, so all of the app's windows go, not just the front
-one. Keyboard focus goes back to the app you used before it. The icon blinks twice and VoiceOver
-announces "Sent … backstage"; nothing else happens on your screen.
-- **Your agents can use it.** It shows in the menu under **Sent by you**. Any agent session can
-  drive it with an explicit `--pid` (or `--app`) after finding it with `backstage list --all`
-  (session `user`). It's never a session's default target, and a session's plain `stop` leaves it
-  alone. Only `stop --all`, **Quit All Agent Apps** or its own **Quit** quit it. If it doesn't
-  quit when the daemon stops (an unsaved-changes dialog), or its sound can't be muted, it comes
-  back to your screen instead: backstage never force-quits your app by itself.
-- **Bring it back** with **Show on My Screen** (or `backstage show --pid P`): its windows come
-  back to your screen, it's focused, and you hear it again.
-- **Muted, not inaudible.** It was already running, so it can only be muted with a tap (see
-  [Sound](#sound)): screen sharing and recordings can still hear it.
-- **Its Dock tile stays**, because you opened it normally. Clicking the tile or ⌘-Tabbing to it
-  doesn't bring it forward: the daemon hands focus straight back, and the input guard keeps your
-  typing out of it. Use Show on My Screen.
-- **Never sent** (the icon gives a small shake instead, and the reason goes to
+- **Bring it back** with **Show on My Screen** in the app's submenu (or `backstage show --pid
+  P`). Its windows return to your main screen, it comes to the front, and you hear it again.
+- **It stays out of your way.** It's muted while backstage (with a tap, since it was already
+  running: screen sharing and recordings can still hear it). Its Dock tile stays, because you
+  opened it yourself, but clicking the tile or ⌘-Tabbing to it doesn't bring it forward: the
+  daemon hands focus straight back, and your typing never lands in it. Use Show on My Screen.
+- **Choose where it goes.** **Send Front Window To ▸** sends it to a display you pick, or a new
+  one. A display you create is kept for you: agents' apps never go there, and later sends follow
+  your apps to it.
+- **Agents can work in it**, but only when you ask. It's listed under session `user` (`backstage
+  list --all`), any agent session can drive it with an explicit `--pid` or `--app`, and it's
+  never an agent's default target. A session's plain `stop` leaves it alone; only `stop --all`,
+  **Quit All Agent Apps** or its own **Quit** quit it.
+- **Your work is safe.** If it doesn't quit when the daemon stops (an unsaved-changes dialog), or
+  its sound can't be muted, it comes back to your screen instead: backstage never force-quits an
+  app you sent.
+- **Some apps can't be sent** (the icon gives a small shake, and the reason goes to
   `~/.backstage/daemon.log`): Finder, the Dock, Control Center, Notification Center, Spotlight,
   loginwindow and anything else in `/System/Library`; menu bar and background apps; backstage
-  itself; an app that's already backstage; an app in full screen; an app with no open window; and
-  apps you need in front of you to stay in control: Terminal, Ghostty, iTerm, Warp, kitty,
-  Alacritty, WezTerm, herdr, Claude, ChatGPT/Codex, Parsec, and the terminal or agent host the
-  daemon runs under. The menu item is disabled, with the reason in its tooltip, when the
-  frontmost app is one of these.
-- **The shortcut** works whenever the daemon runs, so it pairs with Auto-Hide When Idle off. Change it
-  with `backstage settings hotkey <combo>` (two or more modifiers, one of them ⌘ or ⌃, and a
-  letter, digit or F1–F12; keys are named by their place on a US keyboard), or turn it off with
-  `backstage settings hotkey off`. The running daemon picks the change up at once. The menu shows
-  the current shortcut beside the item; if it couldn't be registered (it's a macOS keyboard
-  shortcut), the item shows none, and `backstage status` and the daemon log say why. A shortcut
-  another app registered the same way can't be detected (macOS accepts both). Only the daemon in
-  `~/.backstage` has a shortcut by default; one started with another `BACKSTAGE_HOME` (tests, for
-  instance) registers one only if its own settings name it.
+  itself; an app that's already backstage, in full screen, or with no open window; and apps you
+  need in front of you to stay in control: Terminal, Ghostty, iTerm, Warp, kitty, Alacritty,
+  WezTerm, herdr, Claude, ChatGPT/Codex, Parsec, and the terminal or agent host the daemon runs
+  under. The menu item is disabled, with the reason in its tooltip, when the front app is one of
+  these.
+- **The shortcut** works whenever the daemon runs. Change it with `backstage settings hotkey
+  <combo>` (two or more modifiers, one of them ⌘ or ⌃, and a letter, digit or F1–F12, named by
+  their place on a US keyboard), or turn it off with `backstage settings hotkey off`; the running
+  daemon picks it up at once. The menu shows the current shortcut. If it couldn't be registered
+  (it's one of macOS's own keyboard shortcuts), the menu shows none, and `backstage status` and
+  the daemon log say why. A shortcut another app registered the same way can't be detected, since
+  macOS accepts both. Only the daemon in `~/.backstage` has a shortcut unless another home's
+  settings name one.
 
-## Installing into Claude Code, Codex, Grok, Cursor and OpenCode
+## Agents
 
-```
-backstage install --hooks      # every agent found (or pick: --claude --codex --grok --cursor --opencode)
+### Installing the skill and hook
+
+```bash
+backstage install --hooks     # every agent found (or pick: --claude --codex --grok --cursor --opencode)
 backstage uninstall
-make dist                      # regenerate dist/skills/backstage/SKILL.md for packaging
 ```
 
-- **Skill:** written to `skills/backstage/` in `~/.claude`, `~/.codex`, `~/.grok`, `~/.cursor`
-  and `~/.config/opencode`. All of them read the standard `SKILL.md` format. (Cursor and
-  OpenCode also read `~/.claude/skills`, so with Claude installed they see the same skill twice.)
-  The source of truth is `Sources/backstage/Skill.swift`; `dist/skills/backstage/SKILL.md` is
-  generated from it.
-- **Hook (`--hooks`):** a shell hook, merged into Claude's `settings.json`, Codex's
-  `hooks.json` and Grok's `config.toml` (`PreToolUse`), and Cursor's `hooks.json`
+- **Skill:** written to `skills/backstage/SKILL.md` in `~/.claude`, `~/.codex`, `~/.grok`,
+  `~/.cursor` and `~/.config/opencode`. Cursor and OpenCode also read `~/.claude/skills`, so
+  with Claude installed they see the skill twice (the copies are identical). After upgrading
+  backstage, run `backstage install` again to refresh it.
+- **Hook (`--hooks`):** a shell hook, merged into Claude Code's `settings.json`, Codex's
+  `hooks.json` and Grok's `config.toml` (`PreToolUse`) and Cursor's `hooks.json`
   (`beforeShellExecution`). For OpenCode it's a plugin, `~/.config/opencode/plugins/backstage.js`,
-  whose permission hook runs the same check. Your existing entries are kept, a `.backstage-bak`
-  backup is made, and running install twice is safe. Restart agent sessions afterwards; Grok
-  only runs hooks for folders you've trusted.
+  that runs the same check. Your existing entries are kept, a `.backstage-bak` backup is made,
+  and running install again is safe. Restart agent sessions afterwards; Grok only runs hooks for
+  folders you've trusted.
 
 ### Your work or mine?
 
@@ -265,58 +221,116 @@ The agent decides, because it knows what you asked for. The hook makes sure it d
 |---|---|
 | Its own work: building then checking it launches, tests, reproducing a bug, screenshots for itself, exploring an app, or being unsure | `backstage launch …`, hidden |
 | You asked to see it: "open it", "show me", "let me see", "launch it for me", "I want to try it" | `backstage show <app\|file\|url>` |
-| It tested hidden and you now want to see the result | `backstage show --pid P`: the same running instance moves to your screen with its state, and backstage stops managing it |
+| It tested hidden and you now want to see the result | `backstage show --pid P`: the same running app moves to your screen with its state, and backstage stops managing it |
 | It finished hidden work you might want to see | It asks: "Want me to open it on your screen?" |
+| You sent an app backstage and asked it to work in it | Drives it with `--pid P`, and leaves it running when done |
 
-The hook blocks the raw ways of popping things onto your screen and points the agent to
-`launch` or `show`. Those are `open …`, running `Foo.app/Contents/MacOS/Foo`, and `osascript`
-that activates or opens an app, including inside `bash -c`. It reads the input formats of
-Claude (`Bash`), Codex (`exec_command`/`shell`, string or argv), Grok (`run_terminal_command`)
-and Cursor (`beforeShellExecution`, or `Shell` in `preToolUse`). Blocking means exit code 2 with
-a reason, which Claude, Codex and Grok treat as "deny and tell the model"; Cursor gets
-`{"permission": "deny"}` with the reason as JSON, and OpenCode's plugin denies the permission
-with it.
+The hook blocks the raw ways of popping things onto your screen and points the agent to `launch`
+or `show`: `open …`, running `Foo.app/Contents/MacOS/Foo`, and `osascript` that activates or
+opens an app, also inside `bash -c` and past `sudo`/`env`. Claude Code, Codex and Grok get exit
+code 2 with the reason ("deny and tell the model"); Cursor gets `{"permission": "deny"}` with the
+reason; OpenCode's plugin denies the permission with it.
+
 - To get past the hook for something you asked for: `BACKSTAGE_SHOW=1 <command>`.
 - To turn it off: `BACKSTAGE_HOOK=off`.
 - Everything `show` does is logged to `~/.backstage/shown.log`.
 
-## Using with computer use (Claude/Codex desktop apps)
+### A display of its own
 
-The Claude desktop app and Codex (its desktop app, and Codex sessions that have the Computer
-Use plugin) give agents computer-use tools. They come in two kinds, and backstage works with
-each differently:
+Normally every agent shares display 1; each session sees only its own apps, screenshots show only
+its own windows, and input goes straight to its app, so they don't get in each other's way. An
+agent takes a display of its own (`launch --display new`) only when it needs one: a whole-display
+screenshot or recording, a full-screen or display-filling app, multi-monitor testing, or launches
+that keep saying `"crowded": true`. The skill says so, because a display coming or going can
+blink your monitor. The display is reserved for that session for 30 minutes (asking again while
+it's empty gives back the same one) and removed 30 minutes after it was last used, or at once
+with `close-display` or the menu's ⓧ. See [Displays](docs/USAGE.md#displays).
+
+### Computer use (Claude and Codex desktop apps)
+
+The Claude desktop app and Codex (its desktop app, and sessions with the Computer Use plugin)
+give agents computer-use tools of two kinds:
 
 | Tools | How they see and act | With backstage |
 |---|---|---|
-| **Screen tools**: Claude's full-screen control (`screenshot`, `left_click`, `type`, `key`, `switch_display`…) | Screenshots of a whole display; input posted to the HID system from Claude.app's own process, so the real pointer moves and keys go to the focused app | Can't see the hidden display. The app must be on your screen: the agent runs `backstage show <app>`, or `backstage show --pid P` to hand over an app it launched hidden. If it picks the monitor "Backstage", its clicks are dropped and your pointer is pulled back |
-| **Per-app background tools**: Claude's `app_*` tools (`app_screenshot`, `app_click`, `app_type`, `app_key`, `app_menu`…), Codex's `get_app_state`, `click`, `type_text`, `press_key`… | Capture one app's window wherever it is (ScreenCaptureKit, per window); accessibility actions, and input posted straight to the app's process (Claude: `Claude.app/Contents/Helpers/app-cu-helper`; Codex: `Codex Computer Use.app`'s `SkyComputerUseService`) | Also work on an app backstage launched, which stays hidden: the input guard lets these helpers' input into managed apps |
+| **Screen tools**: Claude's full-screen control (`screenshot`, `left_click`, `type`, `key`, `switch_display`…) | Screenshots of a whole display; input through the HID system, so the real pointer moves and keys go to the focused app | Can't see the hidden display. The app must be on your screen: the agent runs `backstage show <app>`, or `backstage show --pid P` for an app it launched hidden. On the monitor "Backstage", its clicks are dropped and your pointer is pulled back |
+| **Per-app tools**: Claude's `app_*` tools (`app_screenshot`, `app_click`, `app_type`, `app_key`, `app_menu`…), Codex's `get_app_state`, `click`, `type_text`, `press_key`… | Capture one app's window wherever it is; accessibility actions and input posted straight to the app (Claude: `Claude.app/Contents/Helpers/app-cu-helper`; Codex: `Codex Computer Use.app`'s `SkyComputerUseService`) | Work on hidden apps too: the input guard lets these helpers' input into apps backstage manages, after checking their vendor signatures |
 
-- **The hook** still blocks `open` and friends inside these apps, because most sessions there
-  never use computer use. Its message adds: driving the app with screen tools means
-  `backstage show` (or the computer-use tool's own open-application action). In the Claude
-  desktop app (`CLAUDE_CODE_ENTRYPOINT` `claude-desktop`, `claude-desktop-3p`, `local-agent`)
-  and the Codex desktop app (`CODEX_INTERNAL_ORIGINATOR_OVERRIDE` set) that advice comes first.
-- **The input guard** only ever touches input headed for apps backstage manages. Once an app is
-  handed over with `show --pid`, it's yours and computer use drives it like any other app.
-  Into a managed app it lets through, besides backstage's own tagged input, untagged input
-  posted by the two helpers above. Before this, Claude's helper posted keys from an HID-state
-  source, so the guard would have handed an agent's `app_key`/raw `app_type` keys for a hidden
-  app to your frontmost app. Input from your keyboard and mouse, from remote tools such as
-  Parsec, and from Claude's full-screen tools (which follow the real pointer and focus) is still
-  redirected or dropped.
-- **Naming the app:** if you also run your own copy of an app the agent launched hidden, a name
-  or bundle id matches both instances (Codex's tool reports "Multiple apps share this bundle
-  identifier"). A build at its own path is unambiguous (Codex accepts a full path).
+- **The hook** still blocks `open` and friends in these apps, since most sessions there never use
+  computer use; its message adds that driving an app with screen tools means `backstage show` (or
+  the tool's own open-application action), and in the Claude and Codex desktop apps that advice
+  comes first.
+- **The input guard** only touches input headed for apps backstage manages. Your keyboard and
+  mouse, remote tools such as Parsec, and Claude's full-screen tools (which follow the real
+  pointer and focus) are still redirected or dropped there.
+- **Name the app unambiguously** if you also run your own copy: a name or bundle id matches both
+  (Codex reports "Multiple apps share this bundle identifier"); a full path doesn't.
 - **Don't mix** backstage's input commands and computer-use input on one app at once: they share
-  its keyboard focus and menus. Claude's computer-use runtime watches key-downs, probably for Esc
-  to cancel, so a backstage `key esc` may stop it (not verified).
-- **Not verified end to end:** nobody ran Claude's or Codex's computer-use tools against a
-  hidden app. The capture APIs they import are the ones `backstage screenshot` uses for the
-  agent display. `tests/computer-use.sh` checks the vendor signatures of installed helpers,
-  rejects vendor-unsigned fixtures, and exercises the input classifier. How Codex's service
-  posts its input isn't known: it resolves those functions at run time under names it builds
-  then. If it posted to the HID system rather than to the app, its keys could land in a hidden
-  app while that app's open menu holds the keyboard focus.
+  its keyboard focus and menus.
+- **Not verified end to end:** nobody has run Claude's or Codex's computer-use tools against a
+  hidden app. Their capture APIs are the ones `backstage screenshot` uses, and
+  `tests/computer-use.sh` checks the helpers' signatures and the input classifier. How Codex's
+  service posts input isn't known; if it posted through the HID system, its keys could land in a
+  hidden app whose open menu holds the keyboard focus.
+
+## How it works
+
+| Piece | Mechanism |
+|---|---|
+| The hidden display | A background daemon creates a private Retina (2x) `CGVirtualDisplay` (the API DeskPad and BetterDisplay use), the same size in points as your main display, and parks it touching only the bottom-right corner of your desktop, never along an edge, so neither your cursor nor the Dock drifts onto it. If the cursor gets there anyway, it's warped back. The display lives in a small helper process, so restarting or upgrading the daemon doesn't add or remove a display (which can blink some monitors). |
+| Launching without popping up | LaunchServices' own open call (the one behind `open -g -j -n`): in the background, hidden, a fresh instance. Windows are moved to the hidden display while the app is still hidden, then it's unhidden there. |
+| No Dock tile | The same call passes a private option that starts the app as a UIElement, the way menu bar apps run: no Dock tile, not in ⌘-Tab, no change to the app's bundle. `show` makes it a regular app again before handing it over. |
+| Windows opened later | Dev builds and test runners place their own: the library backstage injects moves each window onto the hidden display just before it's first shown, so it never appears on your screen. Other apps' windows, and a window an app moves onto your screen itself, are moved back by an accessibility observer (with 50 ms polling as backup) as soon as they're seen. |
+| Your windows that wander backstage | An app you relaunch may reopen a window where it last was, which can be a hidden display (macOS remembers backstage's fixed displays like any monitor). The daemon returns windows of apps it doesn't run to your main screen after 3 s, without taking focus. |
+| Focus | Apps backstage runs are never activated. If one activates itself, or you click its Dock tile, the daemon hands focus back to your app. |
+| Screenshots | ScreenCaptureKit, filtered to the app's windows (menus, sheets and popovers included), about 0.1–0.2 s each. Captures take turns across sessions: on macOS 27, two processes capturing at once both hang. |
+| Agent input | Accessibility actions (press, set, focus, menus), plus keyboard and mouse events posted straight to the app's process (`CGEventPostToPid`) with window-local coordinates. A private "you are active" event goes to the app only, so AppKit doesn't swallow the first click. Nothing goes through the HID system, so your cursor and keyboard are never touched. Every event backstage posts is tagged. |
+| Your input stays yours | An app with an open menu takes macOS's keyboard focus, even in the background. An event tap on its own thread sees every key, click and scroll after macOS picks the receiving app: untagged input headed for an app backstage manages is yours, so keys go to your frontmost app instead, and clicks and scrolls are dropped. It costs a few microseconds per event; if the tap can't be installed, agents' input commands refuse to run. |
+| Silence | Every app backstage runs is muted the moment it first uses Core Audio: a private, muted process tap per app (helper processes included). Nothing reaches your speakers, whatever device the app picks; your apps, output device and volume aren't touched. An app that can't be muted isn't launched, or is quit (an app you sent is given back to you). Agents' dev builds and test runners are also made inaudible from inside, so they're silent in screen sharing and recordings too. |
+| Teardown | `backstage stop` quits the calling session's apps. `stop --all` (or the daemon getting SIGTERM, SIGINT or SIGHUP) quits every app *before* the display goes, so nothing lands on your screen; apps you sent that don't quit are given back. With Auto-Hide When Idle on, the daemon also exits after 30 minutes with no apps. |
+| Several agents | Each agent session owns the apps it launches, so concurrent agents never pick up, type into, screenshot or stop each other's apps, and commands on one app are serialized. See [Sessions](docs/USAGE.md#concepts). |
+| Fixed displays | backstage only ever uses eight display identities, so macOS's display registry doesn't grow. See [Displays](docs/USAGE.md#displays). |
+
+## Sound
+
+Every app on the hidden display is silent for you. For apps an agent launches, how silent depends
+on the app and on whether the agent asked to inspect its sound:
+
+| `launch` | Apps | Your speakers | Screen sharing, remote desktop (Parsec), recordings | `audio`, `wait --sound` |
+|---|---|---|---|---|
+| default | dev builds and test runners: `xctest`, ad-hoc signed, unsigned or development-signed builds, bare executables | silent | **silent** | refused |
+| default | everything else: signed, hardened or Apple apps | silent | can hear it | refused |
+| `--audio` | any | silent | can hear it | measured |
+
+Apps you send backstage are muted like the second row: silent on your Mac, audible to screen
+sharing and recordings.
+
+- **Inaudible** (the default for dev builds and test runners). Before the app's own code runs, an
+  injected library (`libbackstage-inaudible.dylib`, through `DYLD_INSERT_LIBRARIES`) makes the app
+  tell Core Audio it's inaudible, so its sound is zeroed before anything can capture it. Only the
+  app itself can do that, so it only works for apps that accept the library: not hardened-runtime
+  apps (unless they allow it), not Apple's apps. `launch` reports `"audio": "inaudible"`.
+- **Muted** (everything else). A muted process tap keeps the app off your Mac's outputs, but macOS
+  hands its sound to system-wide captures first, so screen sharing or a remote-desktop session can
+  hear it. `launch` reports `"audio": "muted"` and why it couldn't be inaudible (`audioReason`).
+- **`--audio`: inspect the sound.** Muted the same way, and measured; use it only when the agent
+  needs to check sound. `--inaudible` insists on the inaudible mode and fails for an app that
+  won't accept it.
+
+With `--audio`, an agent checks sound from the muted output:
+
+```bash
+backstage audio                        # playing? peakDb/rmsDb (dBFS), hz, recent sounds, time
+backstage wait --sound --since 81234.5 # it played (even a short sound that's already over)
+backstage wait --sound --gone          # it stopped
+backstage audio record --seconds 5     # a WAV of the last 5 s (max 15), for any other tool
+```
+
+The usual check: read `time` from `audio`, click Play, `wait --sound --since T`, check `audio`
+(`playing`, `peakDb`, `hz`), click Stop, `wait --sound --gone`. `show` hands an app over unmuted,
+except an inaudible one, which stays silent until it's relaunched. Measuring needs System Audio
+Recording (see [Requirements](#requirements)); muting doesn't. Reference:
+[docs/USAGE.md](docs/USAGE.md#hear).
 
 ## Cheat sheet
 
@@ -326,182 +340,148 @@ backstage screenshot                       # -> {"path": ".../shot-….png", ...
 backstage tree                             # accessibility tree with refs like w8432.0.3
 backstage find --role button --text Save   # search the tree
 backstage press w8432.0.3                  # AXPress
-backstage click 120 157                    # real mouse click at screenshot coordinates
+backstage click 120 157                    # a real mouse click at screenshot coordinates
 backstage click --ref w8432.0.3            # click an element
 backstage type "hello" --ref w8432.0.2     # focus a field, then type
 backstage key cmd+s
 backstage menu "File > Save As…"
 backstage wait --text "Saved" --timeout 10
-backstage audio                            # muted app's sound: playing, peakDb, hz, sounds, time
-backstage wait --sound --since 81234.5     # did it play (since `time`)? --gone: has it stopped?
-backstage audio record --seconds 5         # -> {"path": ".../audio-….wav", ...}: the last 5 s it played
 backstage logs                             # the app's stdout/stderr
-backstage window fill                      # window covers the whole agent display (or: window size 1280 800)
-backstage launch MyApp.app --display new   # a hidden display of your own (clean recordings, full screen)
-backstage move --display 1                 # move your app to another display
-backstage close-display 2                  # remove display 2 (its apps move to display 1)
-backstage recover                          # bring stray windows back to the user's screen
-backstage screenshot --full --display 2    # one whole display, your session's windows only
+backstage window fill                      # the window covers its display (or: window size 1280 800)
+backstage show                             # hand it to the user, state intact
 backstage quit
+
+backstage list --all                       # every session's apps, including ones you sent (session `user`)
+backstage show --pid P                     # bring an app back to your screen
+backstage recover                          # bring stray windows of your own apps back
+backstage settings hotkey ctrl+opt+cmd+b   # the Send Front Window Backstage shortcut (or `off`)
+backstage settings auto-hide on|off
+backstage status                           # permissions, daemon, displays, session; `doctor` also tests audio
+backstage stop --all                       # quit everything and stop the daemon
 ```
 
-- Commands return JSON. Plain `tree` prints indented text, `logs` streams the requested lines, and `help` prints usage. Use `tree --json` for structured output.
-- Coordinates are agent-display points, with (0,0) at the top-left of the app's virtual display. A
-  default `screenshot` is cropped starting at (0,0), so a pixel in the image is the same as
-  the point you click. `--scale 0.5` gives smaller images; divide the pixel by the scale before clicking.
-- The agent display has your main display's size in points and is Retina (2x), so apps render as on a Retina screen. A default screenshot
-  is still 1 pixel per point; `--scale 2` gives the native pixels.
-- To record the agent display, use `screencapture` with the index from `status`:
-  `screencapture -x -v -V 10 -D "$(backstage status | jq .daemon.screencaptureDisplay)" run.mov`.
-  It records the whole display, including other sessions' windows. See [docs/USAGE.md](docs/USAGE.md#recording-the-agent-display).
-- Each agent session sees only the apps it launched. With no `--pid` or `--app`, commands target your session's most recently launched app. An explicit PID must belong to a live managed launch of your session.
-- The session comes from the agent automatically (Claude Code's session ID, Codex's thread ID, or the agent process; for a person, the terminal tab). Subagents of one Claude Code session share it, so give each its own with a prefix: `BACKSTAGE_SESSION=sub1 backstage launch …`; Codex subagents get their own. Details in [docs/USAGE.md](docs/USAGE.md#concepts).
-- `screenshot --full` shows the whole agent display with all of your session's apps and nothing from other sessions.
-- Screenshots use PNG by default. Choose a `.jpg` or `.jpeg` output path for JPEG. The maximum output area is 67,108,864 pixels.
-- Element refs (`w<windowID>.<child>.<child>…`) survive window reordering. Re-run `tree`/`find`
-  after the UI changes.
-- Run `backstage help` for everything: `drag`, `scroll`, `hover`, `set`, `action`, `list`,
-  `windows`, `status`, `stop`, `stop --all`.
+- Commands print JSON, except `help`, `skill`, `logs` and plain `tree` (`tree --json` for
+  structured output).
+- Coordinates are points, with (0,0) at the top-left of the app's hidden display. A default
+  `screenshot` is cropped from (0,0) at 1 pixel per point, so a pixel is the point you click;
+  `--scale 2` gives Retina pixels (pass the same `--scale` to `click`, or divide by it).
+- Each agent session sees only its own apps; with no `--pid` or `--app`, commands target the
+  session's most recent launch. The session comes from the agent automatically. Claude Code
+  subagents share their parent's, so give each its own with a prefix:
+  `BACKSTAGE_SESSION=sub1 backstage launch …`. Details: [Sessions](docs/USAGE.md#concepts).
+- `screenshot --full` shows a whole display with your session's windows only. To record video,
+  use macOS's `screencapture` with the index from `status` (it records everything on the
+  display): see [Recording](docs/USAGE.md#recording-the-hidden-display).
+- Element refs (`w<windowID>.<child>…`) survive window reordering; re-run `tree`/`find` after the
+  UI changes.
 
-Settings (environment for the daemon): `BACKSTAGE_WIDTH`/`BACKSTAGE_HEIGHT` (points, default: your main display's size),
-`BACKSTAGE_SCALE` (default 2, Retina; `1` for a 1x display),
-`BACKSTAGE_IDLE_TIMEOUT` (seconds, default 1800), `BACKSTAGE_DISPLAY_LINGER` (seconds the display
-outlives a stopped daemon so a restart doesn't blink your monitor, default 15), `BACKSTAGE_HOME` (default `~/.backstage`),
-`BACKSTAGE_MENUBAR=off` (no menu bar icon). Per command: `BACKSTAGE_SESSION=<name>` picks the session.
-Your settings: `backstage settings auto-hide on|off` and `backstage settings hotkey <combo|off>`
-(see [Menu bar indicator](#menu-bar-indicator)); `backstage settings` and `status` show them.
+Daemon settings (set before it starts): `BACKSTAGE_WIDTH`/`BACKSTAGE_HEIGHT` (points, default:
+your main display's size), `BACKSTAGE_SCALE` (2, Retina; `1` for 1x), `BACKSTAGE_IDLE_TIMEOUT`
+(seconds, 1800), `BACKSTAGE_DISPLAY_LINGER` (seconds the display outlives a stopped daemon, 15),
+`BACKSTAGE_HOME` (`~/.backstage`), `BACKSTAGE_MENUBAR=off`. All of them:
+[Environment variables](docs/USAGE.md#environment-variables).
 
-## Limits (read these)
+## Limits
 
-- **Dock and ⌘-Tab.** Launched apps get no Dock tile and stay out of ⌘-Tab, except apps that
-  make themselves regular apps at startup (`setActivationPolicy(.regular)` or
-  `TransformProcessType`: Keka, apps built on Qt and other cross-platform toolkits, and some
-  `swift build` products). Those get a Dock tile within half a second, and nothing outside the
-  app can take it away again; `launch` then returns `"dock": "visible (app made itself a regular
-  app)"`. For Qt apps backstage sets `QT_MAC_DISABLE_FOREGROUND_APPLICATION_TRANSFORM=1`, which
-  stops it. In your own app, skip `setActivationPolicy(.regular)` when it runs from a bundle
-  (it's the default there). Injecting a library that blocks the call was tried and left out: it
-  only works for unsigned, non-hardened builds, and needs a launch shim that itself brings the
-  Dock tile back. `launch --dock` launches with a Dock tile on purpose.
-- **Bare executables start in `/`.** LaunchServices runs them directly (a shim that `cd`s first
-  makes them regular apps again), so their working directory is `/`, as for any app opened from
-  Finder. Pass absolute paths. `Bundle.main`, `@executable_path` and `@rpath` still resolve to
-  the executable's own directory.
-- **Windows an app opens later** (not at launch) can exist on your screen for a few
-  milliseconds before the AX observer moves them. The watchdog measures this during the GUI test. Actual timing depends on the app,
-  system load, and how quickly macOS delivers the accessibility notification. At launch the CLI
-  checks window placement before asking macOS to unhide the app.
-- **Self-activating apps.** macOS 14+ refuses `activate()` from a regular background app, but
-  an app running without a Dock tile (a UIElement) may activate itself. The daemon hands focus
-  straight back: in the end-to-end test the fixture's `activate()` held the keyboard focus for
-  10–20 ms. `launch --dock` apps are refused as before.
-- **The app thinks it's active.** Before the first input, the app is sent one private
-  "you're active" event; without it AppKit eats clicks. The app sees a single
-  `didBecomeActive`, like a human switching to it once. Apps without a Dock tile get it at
-  launch, because they keep their windows hidden until then. Nothing changes for your real
-  frontmost app.
-- **Open menus and your typing.** While an agent app's menu is open it holds the keyboard
-  focus. The input guard hands keys from your keyboard (or a remote-desktop tool posting HID
-  events) to your frontmost app, so they arrive as usual. Some edges remain:
-  - Keys another program posts to that app without going through the HID system are dropped,
-    not handed over. Computer-use helpers driving the app are let through (see
-    [Using with computer use](#using-with-computer-use-claudecodex-desktop-apps)).
-  - Your clicks and scrolls can't be aimed at a hidden app (the cursor is kept off its
-    display). Any that the system routes there anyway are dropped.
-  - In testing, a click of yours closed the agent's open menu; your click still reached your
-    own app. The agent has to open the menu again.
-  - The guard is fed the set of managed apps and your frontmost app by the daemon's main
-    loop, so a just-launched app or an app switch is covered after a short delay, typically
-    under 50 ms.
-  - Not verified: keys under Secure Input (a password field has focus) may skip event taps
-    altogether.
-- **Hover is best-effort.** Tracking-area hover effects and tooltips follow the real cursor,
-  so `hover` generally won't trigger them.
-- **Custom-drawn UI** (canvases, games, video timelines) has no accessibility tree. Use
-  screenshot + coordinate `click`/`drag`/`scroll`; those are tested on a custom NSView. Apps that
-  poll the *real* mouse position or button state, rather than reading events, won't see them.
-- **Second copies of apps you're already running.** Apps launch with `-n`, a new instance, so
-  your copy is never touched. Single-instance apps that hand off to an existing instance
-  (Safari, Mail…) aren't suitable.
-- **Instances of one app share preferences and app data.** Every copy of an app, yours and
-  each agent's, reads and writes the same preferences and Application Support files, so one
-  instance's settings changes show up in the others. Don't rely on per-instance settings.
-  (`CFFIXED_USER_HOME` doesn't isolate preferences on macOS 27.) The clipboard is shared
-  too: put text in with `set` or `type` rather than ⌘C/⌘V.
-- **Monitor unplugged or powered off.** If no real display is left, the daemon shuts down,
-  quitting agent apps, so your windows don't get stranded on the invisible display.
-- **Private APIs.** `CGVirtualDisplay`, `CGEventSetWindowLocation`, `_AXUIElementGetWindow`,
-  and LaunchServices' `_LSOpenURLsWithCompletionHandler` with `_kLSOpenOptionUIElementLaunchKey`
-  (no Dock tile) and `_LSSetApplicationInformationItem` (`show` restoring it). If an update drops
-  the LaunchServices pieces, apps get a Dock tile again and nothing else changes.
-  These are stable for years but undocumented, and a macOS update could break them. Tested on macOS 27.0.1.
-- **Screen Recording prompts.** macOS may periodically ask you to re-confirm Screen Recording
-  for the host terminal.
-- **Daemon killed with `kill -9`.** The display vanishes and its windows migrate to your main
-  screen. Normal stops and crashes caught by signals quit the apps first.
-- **A real "Backstage" monitor** appears in System Settings › Displays while the
-  daemon runs.
-- **Sound limits.** Details in [docs/USAGE.md](docs/USAGE.md#audio-limits).
-  - **Muted isn't inaudible.** A muted app (a signed, hardened or Apple app, or any app
-    launched with `--audio`) is silent on your Mac's outputs, but screen sharing, remote desktop
-    (Parsec), screen recordings and other system-wide captures still carry its sound. Only dev
-    builds and test runners can be made inaudible everywhere.
-  - **Inaudible apps can't be measured**, by anyone: `audio`, `wait --sound` and `audio record`
-    refuse them. An app made inaudible stays so after `show`.
-  - **Children of an inaudible app** load the library too, if they accept it (macOS's own
-    tools drop it). Each one connects to Core Audio as it starts (about 30 ms) and gets tapped.
-    An app that runs scripts through `/bin/sh` loses it for everything those scripts start,
-    and sound played by services macOS starts for the app (WKWebView's WebKit GPU process) is
-    only muted.
-  - **System sounds stay audible.** Alert sounds and beeps (`NSBeep`,
-    `AudioServicesPlaySystemSound`) are played by macOS's shared `systemsoundserverd`, not the
-    app. Muting it would mute your own alerts too, so they're neither muted nor measured.
-    AppKit beeps on an unhandled keystroke, so an agent's typing can cause one.
-  - **Shared playback daemons** may work the same way: speech (`AVSpeechSynthesizer`, `say`)
-    probably plays outside the app, and is unmeasured.
-  - **`kill -9` of the daemon** unmutes its apps within milliseconds (a crash it can catch
-    quits them first). A `coreaudiod` restart probably does too, until the daemon rebuilds the
-    taps.
-  - **macOS 14.0 and 14.1** have no audio taps: `launch` refuses there.
-  - **The permission belongs to the daemon's host** (the terminal or agent host that started
-    it), keyed to its binary path, so a host upgrade may need it granted again. macOS's
-    audio-recording indicator names that host while an agent app plays.
-  - **Apps may ask for the Microphone** the first time they play to an audio device that has
-    input streams (an audio interface, a loopback): macOS 27 asks that even for output only.
-    The prompt appears on your screen in the app's name.
+- **Dock and ⌘-Tab.** Apps an agent launches get no Dock tile, except apps that make themselves
+  regular apps at startup (`setActivationPolicy(.regular)` or `TransformProcessType`: Keka,
+  cross-platform toolkits, some `swift build` products). Those get a tile within half a second
+  that nothing outside the app can take away; `launch` reports `"dock": "visible (app made itself
+  a regular app)"`. For Qt apps backstage sets `QT_MAC_DISABLE_FOREGROUND_APPLICATION_TRANSFORM=1`,
+  which stops it. In your own app, skip `setActivationPolicy(.regular)` when it runs from a
+  bundle (it's the default there). `launch --dock` gives a Dock tile on purpose.
+- **Bare executables start in `/`**, as any app opened from Finder does, so pass them absolute
+  paths. `Bundle.main`, `@executable_path` and `@rpath` still resolve to the executable's own
+  directory.
+- **Windows of signed apps.** Apps that can't take the injected library (signed, hardened, Apple)
+  have windows they open later moved by the observer, so such a window can show on your screen
+  for a few milliseconds. The same goes for a window any app moves onto your screen itself.
+- **Self-activating apps.** An app without a Dock tile may activate itself; the daemon hands focus
+  straight back (in testing, it held the keyboard focus for 10–20 ms).
+- **The app thinks it's active.** Before an agent's first input, the app gets one private "you're
+  active" event, without which AppKit eats clicks. It sees a single `didBecomeActive`, like a
+  person switching to it once. Your frontmost app is unaffected.
+- **Open menus and your typing.** While a hidden app's menu is open it holds the keyboard focus;
+  the input guard hands your keys to your frontmost app, so they arrive as usual. Edges remain:
+  - Keys another program posts to that app without going through the HID system are dropped
+    (computer-use helpers are let through).
+  - Your clicks and scrolls can't reach a hidden app (the cursor is kept off its display); any
+    that macOS routes there anyway are dropped. In testing, a click of yours closed the agent's
+    open menu (it reopens it); your click still reached your own app.
+  - A just-launched app or an app switch is covered after a short delay, typically under 50 ms.
+  - Not verified: keys under Secure Input (a password field has focus) may skip event taps.
+- **Hover is best-effort.** Hover effects and tooltips follow the real cursor, so `hover` usually
+  won't trigger them.
+- **Custom-drawn UI** (canvases, games, video timelines) has no accessibility tree; use screenshots
+  and coordinate `click`/`drag`/`scroll`. Apps that poll the real mouse position, rather than
+  reading events, won't see them.
+- **Second copies of apps you run.** Agents' launches are new instances, so your copy is never
+  touched, but single-instance apps that hand off to an existing instance (Safari, Mail…) aren't
+  suitable. All copies of an app share its preferences, Application Support files and the
+  clipboard (put text in with `set` or `type`, not ⌘C/⌘V).
+- **Monitor unplugged or asleep.** If no real display is left, the daemon shuts down, quitting the
+  apps it runs (yours are given back), so nothing is stranded on the hidden display.
+- **Private APIs.** `CGVirtualDisplay`, `CGEventSetWindowLocation`, `_AXUIElementGetWindow`, and
+  LaunchServices' `_LSOpenURLsWithCompletionHandler` (with `_kLSOpenOptionUIElementLaunchKey`)
+  and `_LSSetApplicationInformationItem`. They've been stable for years but are undocumented, so
+  a macOS update could break them; if the LaunchServices ones go, apps simply get a Dock tile.
+- **Screen Recording prompts.** macOS may ask you now and then to re-confirm Screen Recording for
+  your terminal.
+- **Daemon killed with `kill -9`.** The display vanishes and its windows move to your main screen.
+  Normal stops, and crashes caught by signals, quit the apps first.
+- **A "Backstage" monitor** shows in System Settings › Displays while the daemon runs.
+- **Sound** ([details](docs/USAGE.md#audio-limits)):
+  - **Muted isn't inaudible.** A muted app is silent on your Mac, but screen sharing, remote
+    desktop, recordings and other system-wide captures still carry its sound. Only dev builds
+    and test runners can be made inaudible everywhere.
+  - **Inaudible apps can't be measured**, and stay inaudible after `show`.
+  - **Alert sounds and beeps** (`NSBeep`, system sounds) are played by macOS, not the app, so
+    they stay audible; AppKit beeps on an unhandled keystroke, so typing can cause one. Speech
+    (`AVSpeechSynthesizer`, `say`) probably plays outside the app too.
+  - **Children of an inaudible app** load the library too when they accept it; services macOS
+    starts for the app (WKWebView's GPU process) are only muted.
+  - **`kill -9` of the daemon** unmutes its apps within milliseconds; a `coreaudiod` restart may
+    too, until the taps are rebuilt.
+  - **Apps may ask for the Microphone** the first time they play to a device with inputs (an audio
+    interface, a loopback): macOS 27 asks that even for output. The prompt shows on your screen.
 
 ## Development
 
 ```bash
 make build          # swift build -c release, plus the injected library (universal)
-make test-cli       # offline CLI / process-ownership regression tests
-make test-agents    # hook decisions + install/uninstall in a throwaway HOME + dist skill sync
-make test           # all of the above, then a GUI fixture app driven through every command
-                    # while a watchdog (~1.5 ms sampling) checks nothing reaches your screen,
-                    # then the two-session test (tests/multi.sh; also `make test-multi`)
-                    # and the shared-display test: overlapping windows, menus, sheets,
-                    # popovers, and a slow launch (tests/concurrency.sh; `make test-concurrency`),
-                    # computer-use helper signing and input classification
-                    # (tests/computer-use.sh; `make test-computer-use`), then audio: muting, levels, sounds, show, refusals, and `audio record`'s
-                    # WAVs checked by tests/wavcheck.swift (tests/audio.sh; `make test-audio`;
-                    # leak checks run when a loopback device exists), then Send Front Window
-                    # Backstage and Auto-Hide When Idle (tests/send.sh; `make test-send`), then
-                    # the fixed display serials (tests/displays.sh; `make test-displays`),
-                    # several displays per daemon: --display new, reservations, move,
-                    # close-display, the menu's layouts (tests/multidisplay.sh;
-                    # `make test-multidisplay`), and stray windows coming back
-                    # (tests/strays.sh; `make test-strays`), and restarts that keep the
-                    # display: zero display reconfigurations (tests/restart.sh;
-                    # `make test-restart`), and windows placed before they're shown
-                    # (tests/placement.sh; `make test-placement`). GUI suites use displays 7-8 only
-tests/audio-leak.sh --dedicated   # audio leak suite: dedicated Mac with a loopback as default output
+make install        # build, then copy into $(PREFIX)
 make dist           # regenerate dist/skills/backstage/SKILL.md from Sources/backstage/Skill.swift
-make load           # load harness, 2-session smoke (not in `make test`); full runs need a
-                    # separate account or Mac: see docs/LOAD_TESTING.md
+make test-cli       # offline CLI and process-ownership checks
+make test-agents    # hook decisions, install/uninstall in a throwaway HOME, dist skill sync
+make test           # everything below, in order
 ```
 
-Layout: `Sources/backstage/` (CLI and daemon), `Sources/CVirtualDisplay/` (private API header),
-`Sources/CBackstageAudio/` (the audio taps' IOProc and the crash handler, in C),
-`Sources/BackstageInaudible/` (the library injected into inaudible launches, in C),
-`dist/skills/` (the skill for packaging), `tests/` (fixture app, watchdog, test scripts),
-`docs/USAGE.md` (reference).
+The GUI suites drive a fixture app on displays 7–8 (never the ones you use), each with its own
+`make` target, while a watchdog sampling every ~1.5 ms checks nothing reaches your screen. They
+add test displays, which can blink your monitor:
+
+| Suite | Covers |
+|---|---|
+| `tests/e2e.sh` | every command against the fixture app |
+| `tests/launch.sh` (`test-launch`) | launches LaunchServices answers late or never, and scripts that `exec` a binary |
+| `tests/placement.sh` (`test-placement`) | windows placed before they're shown, every AppKit route |
+| `tests/multi.sh` (`test-multi`) | two sessions side by side |
+| `tests/concurrency.sh` (`test-concurrency`) | the shared display: overlapping windows, menus, sheets, popovers, slow launches |
+| `tests/focus.sh` (`test-focus`) | the input guard: your typing kept out of a hidden app whose menu holds the keyboard focus |
+| `tests/computer-use.sh` (`test-computer-use`) | computer-use helper signatures and input classification |
+| `tests/audio.sh` (`test-audio`) | muting, levels, sounds, `show`, refusals, `audio record` |
+| `tests/dock.sh` (`test-dock`) | no Dock tile, and `show` restoring it |
+| `tests/send.sh` (`test-send`) | Send Front Window Backstage and Auto-Hide When Idle |
+| `tests/displays.sh` (`test-displays`) | the fixed display identities |
+| `tests/multidisplay.sh` (`test-multidisplay`) | several displays: `--display new`, reservations, `move`, `close-display`, the menu |
+| `tests/strays.sh` (`test-strays`) | stray windows returned to your screen |
+| `tests/restart.sh` (`test-restart`) | restarts that keep the display (zero display reconfigurations) |
+
+`tests/audio-leak.sh --dedicated` checks for audio leaks on a Mac with a loopback as the default
+output. `make load` runs a two-session load smoke test; full load runs need a separate account or
+Mac ([docs/LOAD_TESTING.md](docs/LOAD_TESTING.md)).
+
+Layout: `Sources/backstage/` (CLI and daemon), `Sources/BackstageInaudible/` (the injected
+library, in C), `Sources/CBackstageAudio/` (the audio taps' IOProc and crash handler, in C),
+`Sources/CVirtualDisplay/` (private API header), `dist/skills/` (the skill, for packaging),
+`tests/`, and `docs/` (the [command reference](docs/USAGE.md) and design notes).
