@@ -1,5 +1,13 @@
 # Changelog
 
+## 1.4.1
+
+- **Fix: the menu's app rows** couldn't be highlighted (the highlight jumped to another row) and
+  their submenus didn't open. Rows are regular menu items again, with hover submenus and
+  keyboard navigation. A list longer than 40% of the screen shows ▲/▼ rows that scroll it while
+  you point at them; the picture and the actions stay put, and each session heading keeps its
+  app count.
+
 ## 1.4.0
 
 - **The menu handles any number of agents and apps.** The app list is now a scrolling list of
