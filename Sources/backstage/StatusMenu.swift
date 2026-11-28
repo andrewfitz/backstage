@@ -58,8 +58,17 @@ final class StatusMenu: NSObject, NSMenuDelegate {
     private var captureQueue: [(index: Int, slot: Int)] = []
     /// Each app's row, and what the rows were built from (to notice apps coming and going).
     private var rows: [pid_t: NSMenuItem] = [:]
-    /// The scrolling list of apps (MenuAppList.swift); `rows` keeps each app's item for its actions.
-    private var appList: MenuAppListView?
+    /// The app list scrolls in place when it's longer than its share of the screen: only a window
+    /// of its entries (session headings and app rows, all native items with real submenus) is in
+    /// the menu, between ▲ and ▼ items that move the window while pointed at, as a long menu's
+    /// own arrows do, but within the list, so the picture and the actions stay put.
+    private enum ListEntry { case heading(String, Int), app(ManagedApp) }
+    private var listEntries: [ListEntry] = []
+    private var listOffset = 0
+    private var listItems: [NSMenuItem] = []
+    private let listUp = NSMenuItem(title: "", action: #selector(scrollListUp), keyEquivalent: "")
+    private let listDown = NSMenuItem(title: "", action: #selector(scrollListDown), keyEquivalent: "")
+    private var listScrollTimer: Timer?
     private var rowsKey: [String] = []
     private var openedAt = 0.0
     /// When each display's picture last updated (each is checked for freshness on its own).
@@ -318,7 +327,8 @@ final class StatusMenu: NSObject, NSMenuDelegate {
     }
 
     func menuDidClose(_ menu: NSMenu) {
-        appList?.resetHover()
+        stopListScroll()
+        listOffset = 0
         refreshTimer?.invalidate()
         refreshTimer = nil
         thumbnailGeneration += 1
@@ -341,8 +351,10 @@ final class StatusMenu: NSObject, NSMenuDelegate {
     /// With several displays, only its display's picture; one that's on another page lights the
     /// arrow toward it instead (the menu doesn't page by itself).
     func menu(_ menu: NSMenu, willHighlight item: NSMenuItem?) {
-        // Rows live in the list view now (which reports hovering itself); a native item clears it.
-        if item != nil { highlight(pid: nil) }
+        if item === listUp, listUp.isEnabled { startListScroll(-1) }
+        else if item === listDown, listDown.isEnabled { startListScroll(1) }
+        else { stopListScroll() }
+        highlight(pid: item.flatMap { item in rows.first { $0.value === item }?.key })
     }
 
     func highlight(pid: pid_t?) {
@@ -505,41 +517,127 @@ final class StatusMenu: NSObject, NSMenuDelegate {
         rowsKey = Self.key(apps)
         while menu.numberOfItems > 1 { menu.removeItem(at: menu.numberOfItems - 1) }
         rows.removeAll()
-        appList = nil
+        listItems = []
+        listEntries = []
         if apps.isEmpty {
             let none = NSMenuItem(title: "No apps running", action: nil, keyEquivalent: "")
             none.isEnabled = false
             menu.addItem(none)
         } else {
-            let width = MenuHeroView.width(previewWidth: Self.thumbWidth)
-            let list = MenuAppListView(width: width, maxHeight: Self.listMaxHeight(screen: item.button?.window?.screen))
-            var entries: [MenuAppListView.Entry] = []
             for group in Self.groups(apps) {
-                entries.append(.heading(group.label, count: group.apps.count))
-                for app in group.apps {
-                    let row = self.row(for: app)
-                    rows[app.pid] = row
-                    let actions = row.submenu ?? NSMenu()
-                    row.submenu = nil
-                    entries.append(.app(pid: app.pid, name: row.title, icon: row.image, detail: "", actions: actions))
-                }
+                listEntries.append(.heading(group.label, group.apps.count))
+                for app in group.apps { listEntries.append(.app(app)) }
             }
-            list.setEntries(entries)
-            list.onHover = { [weak self] pid in self?.highlight(pid: pid) }
-            let listItem = NSMenuItem()
-            listItem.view = list
-            menu.addItem(listItem)
-            appList = list
+            listOffset = min(listOffset, max(0, listEntries.count - 1))
+            layOutList()
         }
         addFixedItems(apps: apps)
         refreshText(apps: apps)
     }
 
+    /// Approximate heights of the list's items, in points, to fit its share of the screen.
+    private static let rowPoints: CGFloat = 38, headingPoints: CGFloat = 24, arrowPoints: CGFloat = 20
+
     /// The list's most height: 40% of the screen under the menu bar icon, so the whole menu fits
-    /// with room to spare however many apps there are; past that, the list scrolls.
+    /// with room to spare however many apps there are.
     static func listMaxHeight(screen: NSScreen?) -> CGFloat {
         let height = (screen ?? NSScreen.main)?.frame.height ?? 900
-        return max(MenuAppListView.rowHeight * 4, (height * 0.4).rounded())
+        return max(rowPoints * 4, (height * 0.4).rounded())
+    }
+
+    private func entryPoints(_ entry: ListEntry) -> CGFloat {
+        if case .heading = entry { return Self.headingPoints }
+        return Self.rowPoints
+    }
+
+    /// Put the window of entries starting at `listOffset` into the menu (just after the picture),
+    /// with ▲/▼ when there's more above or below.
+    private func layOutList() {
+        for item in listItems { menu.removeItem(item) }
+        listItems = []
+        let budget = Self.listMaxHeight(screen: item.button?.window?.screen)
+        let total = listEntries.reduce(CGFloat(0)) { $0 + entryPoints($1) }
+        var window: [ListEntry] = []
+        if total <= budget {
+            listOffset = 0
+            window = listEntries
+        } else {
+            // Keep a full window: don't scroll past the point where the last entry is at the bottom.
+            var room = budget - 2 * Self.arrowPoints
+            var lastStart = listEntries.count
+            while lastStart > 0, room - entryPoints(listEntries[lastStart - 1]) >= 0 {
+                lastStart -= 1
+                room -= entryPoints(listEntries[lastStart])
+            }
+            listOffset = min(max(listOffset, 0), lastStart)
+            room = budget - 2 * Self.arrowPoints
+            // A window that starts inside a session repeats its heading on top, for context.
+            if case .app = listEntries[listOffset],
+               let heading = listEntries[..<listOffset].lastIndex(where: { if case .heading = $0 { return true }; return false }) {
+                window.append(listEntries[heading])
+                room -= Self.headingPoints
+            }
+            var index = listOffset
+            while index < listEntries.count, room - entryPoints(listEntries[index]) >= 0 {
+                window.append(listEntries[index])
+                room -= entryPoints(listEntries[index])
+                index += 1
+            }
+            let above = listOffset, below = listEntries.count - index
+            configureArrow(listUp, symbol: "chevron.up", more: listEntries[..<above], enabled: above > 0)
+            configureArrow(listDown, symbol: "chevron.down", more: listEntries[index...], enabled: below > 0)
+            listItems.append(listUp)
+        }
+        for entry in window {
+            switch entry {
+            case let .heading(label, count):
+                let heading = NSMenuItem.sectionHeader(title: Self.fitted(label, font: .systemFont(ofSize: NSFont.smallSystemFontSize, weight: .semibold),
+                                                                          width: MenuHeroView.width(previewWidth: Self.thumbWidth) - 72))
+                heading.badge = NSMenuItemBadge(count: count)
+                listItems.append(heading)
+            case let .app(app):
+                let row = rows[app.pid] ?? self.row(for: app)
+                rows[app.pid] = row
+                listItems.append(row)
+            }
+        }
+        if total > budget { listItems.append(listDown) }
+        for (i, item) in listItems.enumerated() { menu.insertItem(item, at: 1 + i) }
+    }
+
+    private func configureArrow(_ arrow: NSMenuItem, symbol: String, more: ArraySlice<ListEntry>, enabled: Bool) {
+        let apps = more.filter { if case .app = $0 { return true }; return false }.count
+        arrow.target = self
+        arrow.image = NSImage(systemSymbolName: symbol, accessibilityDescription: nil)?
+            .withSymbolConfiguration(.init(pointSize: 11, weight: .semibold))
+        arrow.title = enabled ? "\(apps) more" : ""
+        arrow.isEnabled = enabled
+        arrow.toolTip = enabled ? "Point here to scroll the list" : nil
+        arrow.setAccessibilityLabel(enabled ? "Scroll the app list, \(apps) more" : "Top of the app list")
+    }
+
+    @objc private func scrollListUp() { scrollList(by: -1) }
+    @objc private func scrollListDown() { scrollList(by: 1) }
+
+    private func scrollList(by delta: Int) {
+        let before = listOffset
+        listOffset = max(0, listOffset + delta)
+        layOutList()
+        if listOffset == before { stopListScroll() }
+        refreshText()
+    }
+
+    /// While ▲ or ▼ is highlighted, the list moves an entry every 0.12 s.
+    private func startListScroll(_ delta: Int) {
+        stopListScroll()
+        let timer = Timer(timeInterval: 0.12, repeats: true) { [weak self] _ in self?.scrollList(by: delta) }
+        RunLoop.main.add(timer, forMode: .common)
+        listScrollTimer = timer
+    }
+
+    private func stopListScroll() {
+        listScrollTimer?.invalidate()
+        listScrollTimer = nil
     }
 
     private func addFixedItems(apps: [ManagedApp]) {
@@ -658,8 +756,11 @@ final class StatusMenu: NSObject, NSMenuDelegate {
             guard let row = rows[app.pid] else { continue }
             let detail = Self.detail(launchedAt: app.launchedAt, now: now, windows: windows[app.pid] ?? 0, playing: playing.contains(app.pid),
                                      sent: Session.isUser(app.session), display: multi ? (app.display ?? d.display.slot) : nil)
-            _ = row
-            appList?.setDetail(detail, for: app.pid)
+            if #available(macOS 14.4, *) {
+                if row.subtitle != detail { row.subtitle = detail }
+            } else if row.toolTip != detail {
+                row.toolTip = detail
+            }
         }
 
         let reduceMotion = meter?.reduceMotion ?? NSWorkspace.shared.accessibilityDisplayShouldReduceMotion
